@@ -758,23 +758,42 @@ export class OmniCanvas {
     this.setPaperStyle(page.paperStyle || "plain");
 
     if (page.pendingDecomposedData) {
-      await this.loadDecomposedPdf(page.pendingDecomposedData);
+      const decomposed = page.pendingDecomposedData;
+      await this.loadDecomposedPdf(decomposed);
+      // Canva-like: hide fallback only if decomposition actually produced objects
+      const hasObjects = (decomposed.textObjects?.length || 0) +
+                         (decomposed.pathObjects?.length || 0) +
+                         (decomposed.imageObjects?.length || 0) > 0;
+      if (hasObjects) {
+        this.backgroundVisible = false;
+        // Don't load the fallback background at all when we have editable objects
+        this.backgroundImage = null;
+        // Remember it so reopening this page from its saved JSON does not paint
+        // the imported raster underneath the editable objects as well.
+        page.decomposedObjects = true;
+      } else {
+        // No objects extracted - keep the fallback background
+        if (page.backgroundAssetId) {
+          await this.loadBackgroundAsset(page.backgroundAssetId);
+        } else {
+          this.applyBackground();
+        }
+      }
       delete page.pendingDecomposedData;
-      // Canva-like: when decomposition succeeds, hide the fallback background
-      // so only editable objects are visible
-      this.backgroundVisible = false;
-      this.applyBackground();
     } else if (page.canvasJson) {
       await this.canvas.loadFromJSON(page.canvasJson.canvasData || page.canvasJson);
       this.canvas.requestRenderAll();
-    }
-
-    // Re-attach after loading, since clear()/loadFromJSON() drop the background.
-    // Only load background for pages WITHOUT decomposed data (pure Level A fallback)
-    if (!page.pendingDecomposedData && page.backgroundAssetId) {
-      await this.loadBackgroundAsset(page.backgroundAssetId);
-    } else if (!page.pendingDecomposedData) {
-      this.applyBackground();
+      // For saved pages, load background if it exists — unless this page was
+      // successfully decomposed, in which case the raster would only double up
+      // underneath the editable objects that are already there.
+      if (page.decomposedObjects) {
+        this.backgroundVisible = false;
+        this.applyBackground();
+      } else if (page.backgroundAssetId) {
+        await this.loadBackgroundAsset(page.backgroundAssetId);
+      } else {
+        this.applyBackground();
+      }
     }
 
     // Honour the current zoom so it carries across pages. Always applied, not
@@ -822,10 +841,25 @@ export class OmniCanvas {
     if (pageData.pathObjects) {
       for (const p of pageData.pathObjects) {
         try {
+          // Ensure strokes are visible: if fill is used without stroke, or stroke is white/transparent, default to dark
+          let stroke = p.stroke;
+          let fill = p.fill || "transparent";
+          const isStroked = stroke && stroke !== "transparent" && stroke !== "#ffffff" && stroke !== "#fff";
+          const isFilled = fill && fill !== "transparent" && fill !== "#ffffff" && fill !== "#fff";
+          
+          if (!isStroked && !isFilled) {
+            // Path has no visible color - default to dark stroke for handwriting
+            stroke = "#1e1e1e";
+            fill = "transparent";
+          } else if (isFilled && !isStroked) {
+            // Filled path (shapes) - keep fill, no stroke
+            stroke = null;
+          }
+          
           const path = new Path(p.pathData, {
-            stroke: p.stroke || null,
-            strokeWidth: p.strokeWidth || 1,
-            fill: p.fill || "transparent",
+            stroke,
+            strokeWidth: p.strokeWidth || (isStroked ? 2 : 0),
+            fill,
             strokeLineCap: "round",
             strokeLineJoin: "round",
             originX: "left",
@@ -871,7 +905,6 @@ export class OmniCanvas {
     }
 
     this.isHistoryProcessing = false;
-    this.applyBackground();
     this.canvas.requestRenderAll();
   }
 

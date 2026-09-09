@@ -236,6 +236,16 @@ export async function decomposePage(page, scale = 1.333333) {
   if (opList) {
     try {
       const OPS = pdfjs.OPS;
+      // pdf.js packs sub-path commands into a compact DrawOPS enum that is
+      // deliberately distinct from OPS: moveTo is 13 in OPS but 0 in DrawOPS.
+      // Comparing sub-path commands against OPS silently matches nothing.
+      const DRAW = {
+        moveTo: 0,
+        lineTo: 1,
+        curveTo: 2,
+        quadraticCurveTo: 3,
+        closePath: 4,
+      };
       let matrixStack = [];
       let currentMatrix = [1, 0, 0, 1, 0, 0];
       let strokeColor = "#000000";
@@ -248,184 +258,314 @@ export async function decomposePage(page, scale = 1.333333) {
         return viewport.convertToViewportPoint(px, py);
       };
 
+      /**
+       * Turns sub-path commands into SVG path data.
+       *
+       * pdf.js >= 5 already hands us a flat DrawOPS array; older versions used a
+       * pair of arrays (`[ops[], coords[]]`). Both are normalised to the flat
+       * form so there is only one parser to keep correct.
+       */
+      const buildPathData = (flat) => {
+        const svgParts = [];
+        const f = (n) => Number(n).toFixed(1);
+        let k = 0;
+
+        while (k < flat.length) {
+          const sub = flat[k++];
+          if (sub === DRAW.moveTo) {
+            const [vx, vy] = toViewport(flat[k], flat[k + 1]);
+            k += 2;
+            svgParts.push(`M ${f(vx)} ${f(vy)}`);
+          } else if (sub === DRAW.lineTo) {
+            const [vx, vy] = toViewport(flat[k], flat[k + 1]);
+            k += 2;
+            svgParts.push(`L ${f(vx)} ${f(vy)}`);
+          } else if (sub === DRAW.curveTo) {
+            const [c1x, c1y] = toViewport(flat[k], flat[k + 1]);
+            const [c2x, c2y] = toViewport(flat[k + 2], flat[k + 3]);
+            const [vx, vy] = toViewport(flat[k + 4], flat[k + 5]);
+            k += 6;
+            svgParts.push(
+              `C ${f(c1x)} ${f(c1y)}, ${f(c2x)} ${f(c2y)}, ${f(vx)} ${f(vy)}`
+            );
+          } else if (sub === DRAW.quadraticCurveTo) {
+            const [cx, cy] = toViewport(flat[k], flat[k + 1]);
+            const [vx, vy] = toViewport(flat[k + 2], flat[k + 3]);
+            k += 4;
+            svgParts.push(`Q ${f(cx)} ${f(cy)}, ${f(vx)} ${f(vy)}`);
+          } else if (sub === DRAW.closePath) {
+            svgParts.push("Z");
+          } else {
+            // An unknown command would desync the coordinate cursor, so stop.
+            break;
+          }
+        }
+
+        return svgParts.length > 0 ? svgParts.join(" ") : null;
+      };
+
+      /** Normalises either pdf.js args shape into a flat DrawOPS array. */
+      const toFlatDrawOps = (args) => {
+        if (typeof args[0] === "number") {
+          // pdf.js >= 5: [paintOp, drawOps, minMax?]. The command buffer is not
+          // stable in shape — it is sometimes a plain array and sometimes a
+          // typed array wrapped in an array — so unwrap until we reach a plain
+          // sequence of numbers.
+          let cur = args[1];
+          for (let depth = 0; depth < 3; depth++) {
+            if (!cur || typeof cur !== "object") return null;
+            if (typeof cur[0] === "number") return cur;
+            cur = cur[0];
+          }
+          return null;
+        }
+        // pdf.js < 5: [ops[], coords[]]
+        if (!Array.isArray(args[0])) return null;
+
+        const ops = args[0];
+        const coords = Array.isArray(args[1]) ? args[1] : [];
+        const flat = [];
+        let c = 0;
+
+        for (const subOp of ops) {
+          if (subOp === OPS.moveTo) {
+            flat.push(DRAW.moveTo, coords[c], coords[c + 1]);
+            c += 2;
+          } else if (subOp === OPS.lineTo) {
+            flat.push(DRAW.lineTo, coords[c], coords[c + 1]);
+            c += 2;
+          } else if (subOp === OPS.curveTo) {
+            flat.push(
+              DRAW.curveTo,
+              coords[c], coords[c + 1],
+              coords[c + 2], coords[c + 3],
+              coords[c + 4], coords[c + 5]
+            );
+            c += 6;
+          } else if (subOp === OPS.curveTo2 || subOp === OPS.curveTo3) {
+            // `v` and `y` are both quadratics: one control point, one endpoint.
+            flat.push(
+              DRAW.quadraticCurveTo,
+              coords[c], coords[c + 1],
+              coords[c + 2], coords[c + 3]
+            );
+            c += 4;
+          } else if (subOp === OPS.closePath) {
+            flat.push(DRAW.closePath);
+          } else if (subOp === OPS.rectangle) {
+            const [rx, ry, rw, rh] = [
+              coords[c], coords[c + 1], coords[c + 2], coords[c + 3],
+            ];
+            c += 4;
+            flat.push(
+              DRAW.moveTo, rx, ry,
+              DRAW.lineTo, rx + rw, ry,
+              DRAW.lineTo, rx + rw, ry + rh,
+              DRAW.lineTo, rx, ry + rh,
+              DRAW.closePath
+            );
+          } else {
+            break;
+          }
+        }
+
+        return flat;
+      };
+
+      /**
+       * Emits a path object, or defers it when the operator did not say how to
+       * paint (older pdf.js emitted a separate stroke/fill operator afterwards).
+       */
+      const emitPath = (pathData, paintOp) => {
+        if (!pathData) return;
+
+        const isStrokeOp =
+          paintOp === OPS.stroke ||
+          paintOp === OPS.closeStroke ||
+          paintOp === OPS.fillStroke ||
+          paintOp === OPS.eoFillStroke ||
+          paintOp === OPS.closeFillStroke ||
+          paintOp === OPS.closeEOFillStroke;
+
+        const isFillOp =
+          paintOp === OPS.fill ||
+          paintOp === OPS.eoFill ||
+          paintOp === OPS.fillStroke ||
+          paintOp === OPS.eoFillStroke ||
+          paintOp === OPS.closeFillStroke ||
+          paintOp === OPS.closeEOFillStroke;
+
+        if (!isStrokeOp && !isFillOp) {
+          // Modern pdf.js carries the paint op inside constructPath, so any
+          // other op here is a clipping path — it must not leak into a later
+          // stroke. Only defer when the op genuinely did not say how to paint.
+          if (paintOp === null) pendingPathSegments.push(pathData);
+          return;
+        }
+
+        pathObjects.push({
+          type: "path",
+          pathData,
+          stroke: isStrokeOp ? strokeColor : null,
+          strokeWidth: isStrokeOp ? lineWidth : 0,
+          fill: isFillOp ? fillColor : "transparent",
+        });
+      };
+
       for (let i = 0; i < opList.fnArray.length; i++) {
         const fn = opList.fnArray[i];
         const args = opList.argsArray[i];
 
-        switch (fn) {
-          case OPS.save:
-            matrixStack.push([...currentMatrix]);
-            break;
+        // One malformed operator must never abort extraction for the rest of
+        // the page — that is how images used to vanish along with the strokes.
+        try {
+          switch (fn) {
+            case OPS.save:
+              matrixStack.push([...currentMatrix]);
+              break;
 
-          case OPS.restore:
-            if (matrixStack.length > 0) currentMatrix = matrixStack.pop();
-            break;
+            case OPS.restore:
+              if (matrixStack.length > 0) currentMatrix = matrixStack.pop();
+              break;
 
-          case OPS.transform:
-            currentMatrix = multiplyTransform(currentMatrix, args);
-            break;
+            case OPS.transform:
+              // PDF `cm` concatenates as CTM_new = M * CTM_old. pdf.js may emit
+              // one `cm` per component (a translate op then a scale op), so the
+              // order matters: multiplying the other way round scales the
+              // translation too and throws images far off the page.
+              currentMatrix = multiplyTransform(args, currentMatrix);
+              break;
 
-          case OPS.setLineWidth:
-            lineWidth = Math.max(1, Math.round(args[0] * scale));
-            break;
+            case OPS.setLineWidth:
+              lineWidth = Math.max(1, Math.round(args[0] * scale));
+              break;
 
-          case OPS.setStrokeRGBColor:
-            strokeColor = rgbToHex(args[0], args[1], args[2]);
-            break;
+            case OPS.setStrokeRGBColor:
+              strokeColor = rgbToHex(args[0], args[1], args[2]);
+              break;
 
-          case OPS.setFillRGBColor:
-            fillColor = rgbToHex(args[0], args[1], args[2]);
-            break;
+            case OPS.setFillRGBColor:
+              fillColor = rgbToHex(args[0], args[1], args[2]);
+              break;
 
-          case OPS.constructPath: {
-            const ops = args[0];
-            const coords = args[1];
-            let coordIdx = 0;
-            const svgParts = [];
+            case OPS.constructPath: {
+              // pdf.js >= 5: [paintOp, drawOps, minMax?]  — paintOp is a NUMBER.
+              // pdf.js <  5: [ops[], coords[]]            — args[0] is an array.
+              // Reading args[0] as the sub-path list throws "ops is not iterable"
+              // on modern pdf.js, which used to kill every stroke and image.
+              const flat = toFlatDrawOps(args);
+              if (!flat) break;
 
-            for (const subOp of ops) {
-              if (subOp === OPS.moveTo) {
-                const [vx, vy] = toViewport(coords[coordIdx], coords[coordIdx + 1]);
-                svgParts.push(`M ${vx.toFixed(1)} ${vy.toFixed(1)}`);
-                coordIdx += 2;
-              } else if (subOp === OPS.lineTo) {
-                const [vx, vy] = toViewport(coords[coordIdx], coords[coordIdx + 1]);
-                svgParts.push(`L ${vx.toFixed(1)} ${vy.toFixed(1)}`);
-                coordIdx += 2;
-              } else if (subOp === OPS.curveTo) {
-                const [cp1x, cp1y] = toViewport(coords[coordIdx], coords[coordIdx + 1]);
-                const [cp2x, cp2y] = toViewport(coords[coordIdx + 2], coords[coordIdx + 3]);
-                const [vx, vy] = toViewport(coords[coordIdx + 4], coords[coordIdx + 5]);
-                svgParts.push(
-                  `C ${cp1x.toFixed(1)} ${cp1y.toFixed(1)}, ${cp2x.toFixed(1)} ${cp2y.toFixed(1)}, ${vx.toFixed(1)} ${vy.toFixed(1)}`
-                );
-                coordIdx += 6;
-              } else if (subOp === OPS.closePath) {
-                svgParts.push("Z");
-              } else if (subOp === OPS.rectangle) {
-                const rx = coords[coordIdx];
-                const ry = coords[coordIdx + 1];
-                const rw = coords[coordIdx + 2];
-                const rh = coords[coordIdx + 3];
-                const [p1x, p1y] = toViewport(rx, ry);
-                const [p2x, p2y] = toViewport(rx + rw, ry);
-                const [p3x, p3y] = toViewport(rx + rw, ry + rh);
-                const [p4x, p4y] = toViewport(rx, ry + rh);
-                svgParts.push(
-                  `M ${p1x.toFixed(1)} ${p1y.toFixed(1)} L ${p2x.toFixed(1)} ${p2y.toFixed(1)} L ${p3x.toFixed(1)} ${p3y.toFixed(1)} L ${p4x.toFixed(1)} ${p4y.toFixed(1)} Z`
-                );
-                coordIdx += 4;
+              const paintOp = typeof args[0] === "number" ? args[0] : null;
+              emitPath(buildPathData(flat), paintOp);
+              break;
+            }
+
+            case OPS.stroke:
+            case OPS.closeStroke: {
+              if (pendingPathSegments.length > 0) {
+                const pathData = pendingPathSegments.join(" ");
+                pathObjects.push({
+                  type: "path",
+                  pathData,
+                  stroke: strokeColor,
+                  strokeWidth: lineWidth,
+                  fill: "transparent",
+                });
+                pendingPathSegments = [];
               }
+              break;
             }
 
-            if (svgParts.length > 0) {
-              pendingPathSegments.push(svgParts.join(" "));
-            }
-            break;
-          }
-
-          case OPS.stroke:
-          case OPS.closeStroke: {
-            if (pendingPathSegments.length > 0) {
-              const pathData = pendingPathSegments.join(" ");
-              pathObjects.push({
-                type: "path",
-                pathData,
-                stroke: strokeColor,
-                strokeWidth: lineWidth,
-                fill: "transparent",
-              });
-              pendingPathSegments = [];
-            }
-            break;
-          }
-
-          case OPS.fill:
-          case OPS.eoFill: {
-            if (pendingPathSegments.length > 0) {
-              const pathData = pendingPathSegments.join(" ");
-              pathObjects.push({
-                type: "path",
-                pathData,
-                stroke: null,
-                strokeWidth: 0,
-                fill: fillColor,
-              });
-              pendingPathSegments = [];
-            }
-            break;
-          }
-
-          case OPS.paintImageXObject: {
-            const imgId = args[0];
-            try {
-              let imgObj = null;
-              if (page.objs && page.objs.has(imgId)) {
-                imgObj = page.objs.get(imgId);
-              } else if (page.commonObjs && page.commonObjs.has(imgId)) {
-                imgObj = page.commonObjs.get(imgId);
+            case OPS.fill:
+            case OPS.eoFill: {
+              if (pendingPathSegments.length > 0) {
+                const pathData = pendingPathSegments.join(" ");
+                pathObjects.push({
+                  type: "path",
+                  pathData,
+                  stroke: null,
+                  strokeWidth: 0,
+                  fill: fillColor,
+                });
+                pendingPathSegments = [];
               }
+              break;
+            }
 
-              if (imgObj && (imgObj.data || imgObj.src || imgObj.bitmap)) {
-                const [p0x, p0y] = toViewport(0, 1);
-                const [p1x, p1y] = toViewport(1, 0);
-                const imgLeft = Math.round(Math.min(p0x, p1x));
-                const imgTop = Math.round(Math.min(p0y, p1y));
-                const imgWidth = Math.round(Math.abs(p1x - p0x));
-                const imgHeight = Math.round(Math.abs(p1y - p0y));
+            case OPS.paintImageXObject: {
+              const imgId = args[0];
+              try {
+                let imgObj = null;
+                if (page.objs && page.objs.has(imgId)) {
+                  imgObj = page.objs.get(imgId);
+                } else if (page.commonObjs && page.commonObjs.has(imgId)) {
+                  imgObj = page.commonObjs.get(imgId);
+                }
 
-                let imgSrc = null;
-                if (imgObj.src) {
-                  imgSrc = imgObj.src;
-                } else if (imgObj.bitmap && typeof document !== "undefined") {
-                  const canvas = document.createElement("canvas");
-                  canvas.width = imgObj.width;
-                  canvas.height = imgObj.height;
-                  const ctx = canvas.getContext("2d");
-                  ctx.drawImage(imgObj.bitmap, 0, 0);
-                  imgSrc = canvas.toDataURL("image/png");
-                } else if (imgObj.data && typeof document !== "undefined") {
-                  const canvas = document.createElement("canvas");
-                  canvas.width = imgObj.width;
-                  canvas.height = imgObj.height;
-                  const ctx = canvas.getContext("2d");
-                  const imgData = ctx.createImageData(imgObj.width, imgObj.height);
-                  const src = imgObj.data;
-                  const dst = imgData.data;
+                if (imgObj && (imgObj.data || imgObj.src || imgObj.bitmap)) {
+                  const [p0x, p0y] = toViewport(0, 1);
+                  const [p1x, p1y] = toViewport(1, 0);
+                  const imgLeft = Math.round(Math.min(p0x, p1x));
+                  const imgTop = Math.round(Math.min(p0y, p1y));
+                  const imgWidth = Math.round(Math.abs(p1x - p0x));
+                  const imgHeight = Math.round(Math.abs(p1y - p0y));
 
-                  if (src.length === imgObj.width * imgObj.height * 3) {
-                    let s = 0, d = 0;
-                    while (s < src.length) {
-                      dst[d] = src[s];
-                      dst[d + 1] = src[s + 1];
-                      dst[d + 2] = src[s + 2];
-                      dst[d + 3] = 255;
-                      s += 3;
-                      d += 4;
+                  let imgSrc = null;
+                  if (imgObj.src) {
+                    imgSrc = imgObj.src;
+                  } else if (imgObj.bitmap && typeof document !== "undefined") {
+                    const canvas = document.createElement("canvas");
+                    canvas.width = imgObj.width;
+                    canvas.height = imgObj.height;
+                    const ctx = canvas.getContext("2d");
+                    ctx.drawImage(imgObj.bitmap, 0, 0);
+                    imgSrc = canvas.toDataURL("image/png");
+                  } else if (imgObj.data && typeof document !== "undefined") {
+                    const canvas = document.createElement("canvas");
+                    canvas.width = imgObj.width;
+                    canvas.height = imgObj.height;
+                    const ctx = canvas.getContext("2d");
+                    const imgData = ctx.createImageData(imgObj.width, imgObj.height);
+                    const src = imgObj.data;
+                    const dst = imgData.data;
+
+                    if (src.length === imgObj.width * imgObj.height * 3) {
+                      let s = 0, d = 0;
+                      while (s < src.length) {
+                        dst[d] = src[s];
+                        dst[d + 1] = src[s + 1];
+                        dst[d + 2] = src[s + 2];
+                        dst[d + 3] = 255;
+                        s += 3;
+                        d += 4;
+                      }
+                    } else if (src.length === imgObj.width * imgObj.height * 4) {
+                      dst.set(src);
                     }
-                  } else if (src.length === imgObj.width * imgObj.height * 4) {
-                    dst.set(src);
+                    ctx.putImageData(imgData, 0, 0);
+                    imgSrc = canvas.toDataURL("image/png");
                   }
-                  ctx.putImageData(imgData, 0, 0);
-                  imgSrc = canvas.toDataURL("image/png");
-                }
 
-                if (imgSrc) {
-                  imageObjects.push({
-                    type: "image",
-                    src: imgSrc,
-                    left: imgLeft,
-                    top: imgTop,
-                    width: imgWidth,
-                    height: imgHeight,
-                  });
+                  if (imgSrc) {
+                    imageObjects.push({
+                      type: "image",
+                      src: imgSrc,
+                      left: imgLeft,
+                      top: imgTop,
+                      width: imgWidth,
+                      height: imgHeight,
+                    });
+                  }
                 }
+              } catch (imgErr) {
+                console.warn("Could not extract image XObject:", imgErr);
               }
-            } catch (imgErr) {
-              console.warn("Could not extract image XObject:", imgErr);
+              break;
             }
-            break;
           }
+        } catch (opErr) {
+          console.warn("Skipping unparsable PDF operator:", fn, opErr);
         }
       }
     } catch (err) {
