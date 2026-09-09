@@ -88,10 +88,40 @@ function transformPoint(p, m) {
  */
 function rgbToHex(r, g, b) {
   const toHex = (c) => {
-    const val = Math.max(0, Math.min(255, Math.round(c <= 1 ? c * 255 : c)));
+    const numeric = Number(c);
+    if (!Number.isFinite(numeric)) return "00";
+    const val = Math.max(
+      0,
+      Math.min(255, Math.round(numeric <= 1 ? numeric * 255 : numeric)),
+    );
     return val.toString(16).padStart(2, "0");
   };
   return `#${toHex(r)}${toHex(g)}${toHex(b)}`;
+}
+
+/**
+ * pdf.js <= 4 exposed RGB channels as three numeric arguments. pdf.js >= 5
+ * resolves the colour in the worker and exposes one CSS colour string instead
+ * (for example `["#1a1a1a"]`). Accept both representations; never allow an
+ * invalid `#NaNNaNNaN` stroke to reach Fabric.
+ */
+function readPdfColor(args, fallback = "#000000") {
+  if (!args) return fallback;
+
+  const first = args[0];
+  if (typeof first === "string" && first.trim()) return first.trim();
+
+  if (Array.isArray(first) || ArrayBuffer.isView(first)) {
+    return first.length >= 3
+      ? rgbToHex(first[0], first[1], first[2])
+      : fallback;
+  }
+
+  return [args[0], args[1], args[2]].every((value) =>
+    Number.isFinite(Number(value)),
+  )
+    ? rgbToHex(args[0], args[1], args[2])
+    : fallback;
 }
 
 let webpSupport = null;
@@ -421,12 +451,24 @@ export async function decomposePage(page, scale = 1.333333) {
         try {
           switch (fn) {
             case OPS.save:
-              matrixStack.push([...currentMatrix]);
+              matrixStack.push({
+                matrix: [...currentMatrix],
+                strokeColor,
+                fillColor,
+                lineWidth,
+              });
               break;
 
-            case OPS.restore:
-              if (matrixStack.length > 0) currentMatrix = matrixStack.pop();
+            case OPS.restore: {
+              const state = matrixStack.pop();
+              if (state) {
+                currentMatrix = state.matrix;
+                strokeColor = state.strokeColor;
+                fillColor = state.fillColor;
+                lineWidth = state.lineWidth;
+              }
               break;
+            }
 
             case OPS.transform:
               // PDF `cm` concatenates as CTM_new = M * CTM_old. pdf.js may emit
@@ -441,11 +483,19 @@ export async function decomposePage(page, scale = 1.333333) {
               break;
 
             case OPS.setStrokeRGBColor:
-              strokeColor = rgbToHex(args[0], args[1], args[2]);
+              strokeColor = readPdfColor(args, strokeColor);
               break;
 
             case OPS.setFillRGBColor:
-              fillColor = rgbToHex(args[0], args[1], args[2]);
+              fillColor = readPdfColor(args, fillColor);
+              break;
+
+            case OPS.setStrokeTransparent:
+              strokeColor = "transparent";
+              break;
+
+            case OPS.setFillTransparent:
+              fillColor = "transparent";
               break;
 
             case OPS.constructPath: {
