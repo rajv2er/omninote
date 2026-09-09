@@ -180,7 +180,7 @@ function drawImageToContext(ctx, dataUrl, width, height) {
  * at roughly `targetWidth` CSS pixels. Used by the Page Manager grid, which is
  * independent of the live Fabric engines so it stays correct even mid-edit.
  */
-export async function renderPageThumbnail(page, targetWidth = 260) {
+export async function renderPageThumbnail(page, targetWidth = 320) {
   const width = page.width || 800;
   const height = page.height || 1130;
   const paperStyle = page.paperStyle || "plain";

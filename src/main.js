@@ -1028,12 +1028,14 @@ function pageManagerTilesHtml(note) {
         ? `<span class="pm-tags">${p.tags.map((t) => `<span class="pm-tag">${escapeHtml(t)}</span>`).join("")}</span>`
         : "";
       return `
-        <button class="pm-tile ${selected ? "selected" : ""}" data-index="${i}" title="Page ${i + 1} — click to toggle, shift-click to range-select">
-          <span class="pm-check">✓</span>
-          ${thumbEl}
-          <span class="pm-num">${i + 1}</span>
-          ${tags}
-        </button>`;
+        <div class="pm-cell">
+          <span class="pm-num">Page ${i + 1}</span>
+          <button class="pm-tile ${selected ? "selected" : ""}" data-index="${i}" title="Page ${i + 1} — click to toggle, shift-click to range-select">
+            <span class="pm-check">✓</span>
+            ${thumbEl}
+            ${tags}
+          </button>
+        </div>`;
     })
     .join("");
 }
