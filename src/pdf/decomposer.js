@@ -94,6 +94,37 @@ function rgbToHex(r, g, b) {
   return `#${toHex(r)}${toHex(g)}${toHex(b)}`;
 }
 
+let webpSupport = null;
+
+function supportsWebp() {
+  if (webpSupport !== null) return webpSupport;
+  try {
+    const probe = document.createElement("canvas");
+    probe.width = 1;
+    probe.height = 1;
+    webpSupport = probe.toDataURL("image/webp").indexOf("data:image/webp") === 0;
+  } catch {
+    webpSupport = false;
+  }
+  return webpSupport;
+}
+
+/** Longest edge for the fallback background. Keeps a full page legible without huge files. */
+const BACKGROUND_MAX_EDGE = 1600;
+/** Longest edge for the library thumbnail. */
+const THUMBNAIL_MAX_EDGE = 320;
+
+function canvasToBlob(canvas, quality) {
+  const type = supportsWebp() ? "image/webp" : "image/jpeg";
+  return new Promise((resolve) => {
+    try {
+      canvas.toBlob((blob) => resolve(blob), type, quality);
+    } catch {
+      resolve(null);
+    }
+  });
+}
+
 /**
  * Decomposes a single PDF page into editable text, image, and vector path objects.
  * Scale 1.333333 converts PDF 72 DPI points to standard 96 DPI CSS pixels.
@@ -402,19 +433,36 @@ export async function decomposePage(page, scale = 1.333333) {
     }
   }
 
-  // 4. Fallback background snapshot
-  let backgroundDataUrl = null;
+  // 4. Fallback background snapshot + library thumbnail, both as compact blobs.
+  // These stay binary all the way to IndexedDB; they are never base64 in localStorage.
+  let backgroundBlob = null;
+  let thumbnailBlob = null;
+
   try {
     if (typeof document !== "undefined") {
-      const canvas = document.createElement("canvas");
-      canvas.width = width;
-      canvas.height = height;
-      const ctx = canvas.getContext("2d");
+      const bgFactor = Math.min(1, BACKGROUND_MAX_EDGE / Math.max(width, height));
+      const bgViewport = page.getViewport({ scale: scale * bgFactor });
+
+      const bgCanvas = document.createElement("canvas");
+      bgCanvas.width = Math.max(1, Math.round(bgViewport.width));
+      bgCanvas.height = Math.max(1, Math.round(bgViewport.height));
+
       await page.render({
-        canvasContext: ctx,
-        viewport,
+        canvasContext: bgCanvas.getContext("2d"),
+        viewport: bgViewport,
       }).promise;
-      backgroundDataUrl = canvas.toDataURL("image/jpeg", 0.65);
+
+      backgroundBlob = await canvasToBlob(bgCanvas, 0.8);
+
+      const thumbFactor = Math.min(1, THUMBNAIL_MAX_EDGE / bgCanvas.width);
+      const thumbCanvas = document.createElement("canvas");
+      thumbCanvas.width = Math.max(1, Math.round(bgCanvas.width * thumbFactor));
+      thumbCanvas.height = Math.max(1, Math.round(bgCanvas.height * thumbFactor));
+      const thumbCtx = thumbCanvas.getContext("2d");
+      thumbCtx.imageSmoothingQuality = "high";
+      thumbCtx.drawImage(bgCanvas, 0, 0, thumbCanvas.width, thumbCanvas.height);
+
+      thumbnailBlob = await canvasToBlob(thumbCanvas, 0.7);
     }
   } catch (err) {
     console.warn("Failed to render background snapshot:", err);
@@ -426,7 +474,8 @@ export async function decomposePage(page, scale = 1.333333) {
     textObjects,
     pathObjects,
     imageObjects,
-    backgroundDataUrl,
+    backgroundBlob,
+    thumbnailBlob,
     detectedFonts,
     mostUsedFont,
     fontUsage,
@@ -436,8 +485,13 @@ export async function decomposePage(page, scale = 1.333333) {
 /**
  * Decomposes an entire PDF file into pages of editable elements.
  * Preserves exact page dimensions and aggregates font usage.
+ *
+ * `onPage` is invoked after each page is decomposed so the caller can persist
+ * that page's binary assets immediately and drop the blob references, instead of
+ * holding every page's background in memory until the whole document finishes.
+ * Whatever it returns replaces the page record.
  */
-export async function decomposePdf(arrayBuffer, scale = 1.333333) {
+export async function decomposePdf(arrayBuffer, scale = 1.333333, onPage) {
   const bytes = new Uint8Array(arrayBuffer);
   const pdf = await pdfjs.getDocument({ data: bytes }).promise;
   const pages = [];
@@ -446,10 +500,12 @@ export async function decomposePdf(arrayBuffer, scale = 1.333333) {
   for (let num = 1; num <= pdf.numPages; num++) {
     const page = await pdf.getPage(num);
     const decomposed = await decomposePage(page, scale);
-    pages.push({
-      pageNumber: num,
-      ...decomposed,
-    });
+
+    let record = { pageNumber: num, ...decomposed };
+    if (typeof onPage === "function") {
+      record = (await onPage(record, num - 1)) || record;
+    }
+    pages.push(record);
 
     if (decomposed.fontUsage) {
       for (const [font, count] of Object.entries(decomposed.fontUsage)) {

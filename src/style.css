@@ -526,15 +526,136 @@ nav {
   color: white;
 }
 
+.zoom-controls {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border-subtle);
+  border-radius: 6px;
+  padding: 1px;
+}
+
+.zoom-controls .zoom-btn {
+  position: relative;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  color: #cbd5e1;
+}
+
+.zoom-controls .zoom-slider {
+  width: 84px;
+  height: 26px;
+  margin: 0 2px;
+  background: transparent;
+  accent-color: var(--accent-primary);
+  cursor: pointer;
+}
+
+.zoom-controls .zoom-slider:focus-visible {
+  outline: 2px solid var(--accent-primary);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+.zoom-controls .zoom-btn.is-locked {
+  color: #a5b4fc;
+  background: var(--accent-soft);
+}
+
+/* Separate the fit buttons from the zoom in/out pair. */
+.zoom-controls #zoom-fit-width-btn {
+  margin-left: 4px;
+}
+
+.zoom-controls #zoom-fit-width-btn::before {
+  content: "";
+  position: absolute;
+  left: -3px;
+  top: 5px;
+  bottom: 5px;
+  width: 1px;
+  background: var(--border-subtle);
+}
+
+.zoom-controls .zoom-label-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 1px;
+  min-width: 46px;
+  height: 26px;
+  padding: 0 4px 0 6px;
+  background: transparent;
+  border: none;
+  color: #cbd5e1;
+  font-size: 11px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  cursor: pointer;
+  border-radius: 4px;
+}
+
+/* Editable zoom percentage. */
+.zoom-controls .zoom-value {
+  width: 30px;
+  padding: 0;
+  background: transparent;
+  border: none;
+  color: inherit;
+  font: inherit;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  cursor: text;
+  outline: none;
+}
+
+.zoom-controls .zoom-value:focus {
+  color: white;
+  border-bottom: 1px solid var(--accent-primary, #6366f1);
+}
+
+.zoom-controls .zoom-pct {
+  cursor: pointer;
+  opacity: 0.65;
+}
+
+.zoom-controls .zoom-label-btn:hover .zoom-pct {
+  opacity: 1;
+}
+
+.zoom-controls .zoom-label-btn:hover {
+  background: var(--bg-hover);
+  color: white;
+}
+
 /* Font Controls Bar */
 .font-controls-bar {
-  display: flex;
+  display: none;
   align-items: center;
   gap: 6px;
   background: var(--bg-surface);
   border: 1px solid var(--border-subtle);
   padding: 3px 8px;
   border-radius: 6px;
+  transition: opacity 0.15s ease, transform 0.15s ease;
+}
+
+.font-controls-bar.visible {
+  display: flex;
+  animation: fadeInDown 0.15s ease;
+}
+
+@keyframes fadeInDown {
+  from {
+    opacity: 0;
+    transform: translateY(-4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
 }
 
 .font-family-select {
@@ -779,6 +900,50 @@ nav {
   cursor: pointer;
 }
 
+/* Swatch Context Menu */
+.swatch-context-menu {
+  position: fixed;
+  background: #181920;
+  border: 1px solid var(--border-subtle);
+  border-radius: 8px;
+  padding: 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.6);
+  z-index: 100;
+  min-width: 90px;
+  animation: fadeInDown 0.1s ease;
+}
+
+.swatch-menu-btn {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  background: transparent;
+  border: none;
+  border-radius: 4px;
+  color: #cbd5e1;
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.12s ease;
+  white-space: nowrap;
+  text-align: left;
+  width: 100%;
+}
+
+.swatch-menu-btn:hover {
+  background: rgba(255, 255, 255, 0.08);
+  color: white;
+}
+
+.swatch-menu-btn.swatch-delete-btn:hover {
+  background: rgba(239, 68, 68, 0.15);
+  color: #ef4444;
+}
+
 /* ==========================================================================
    CANVAS VIEWPORT & PAPER
    ========================================================================== */
@@ -789,7 +954,14 @@ nav {
   background: var(--bg-workspace);
   display: flex;
   flex-direction: column;
-  align-items: center;
+  /*
+   * `safe` keeps a zoomed-in page reachable: plain `center` on an over-wide
+   * item pushes half of it past the left edge, and the scroll container cannot
+   * scroll to negative offsets — so the left of the page becomes unreachable
+   * and zoom-anchoring silently clamps. `safe` falls back to start alignment
+   * the moment the page outgrows the viewport.
+   */
+  align-items: safe center;
   gap: 32px;
   position: relative;
   scroll-behavior: smooth;
@@ -800,10 +972,92 @@ nav {
   border-radius: 4px;
   transition: background 0.15s ease;
   flex-shrink: 0;
+  /*
+   * Belt and braces for browsers without `safe center`: auto margins resolve
+   * to zero when free space goes negative, which centres while it fits and
+   * pins to the start edge once it does not.
+   */
+  margin: 0 auto;
 }
 
 .canvas-container {
   margin: 0 auto;
+}
+
+/* Zoom window — Noteful-style magnified writing strip */
+.zoom-window {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  display: flex;
+  align-items: stretch;
+  gap: 8px;
+  padding: 10px 16px;
+  background: var(--bg-topbar);
+  border-top: 1px solid var(--border-subtle);
+  z-index: 20;
+}
+
+.zoom-window[hidden] {
+  display: none;
+}
+
+.zoom-window-strip {
+  flex: 1;
+  height: 132px;
+  min-width: 0;
+  border-radius: 8px;
+  background: #ffffff;
+  border: 1px solid var(--border-subtle);
+  cursor: crosshair;
+  touch-action: none;
+}
+
+.zoom-window-controls {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 4px;
+}
+
+.zw-btn {
+  width: 28px;
+  height: 28px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--bg-surface);
+  border: 1px solid var(--border-subtle);
+  border-radius: 6px;
+  color: #cbd5e1;
+}
+
+.zw-btn:hover {
+  background: var(--bg-hover);
+  color: #fff;
+}
+
+.zw-toggle.is-active {
+  color: #a5b4fc;
+  background: var(--accent-soft);
+}
+
+.zw-target-box {
+  position: absolute;
+  border: 2px solid var(--accent-primary);
+  background: rgba(99, 102, 241, 0.1);
+  border-radius: 3px;
+  cursor: grab;
+  z-index: 5;
+}
+
+.zw-target-box[hidden] {
+  display: none;
+}
+
+.page-container {
+  position: relative;
 }
 
 /* Paper Textures */
@@ -926,8 +1180,6 @@ nav {
    ========================================================================== */
 .shapes-flyout {
   position: absolute;
-  left: 54px;
-  top: 156px;
   background: #181920;
   border: 1px solid var(--border-subtle);
   border-radius: 10px;
@@ -965,8 +1217,6 @@ nav {
 
 .pen-styles-flyout {
   position: absolute;
-  left: 50px;
-  top: 0;
   background: #181920;
   border: 1px solid var(--border-subtle);
   border-radius: 10px;
@@ -1143,4 +1393,216 @@ nav {
   to {
     transform: rotate(360deg);
   }
+}
+
+/* ==========================================================================
+   PAGE MANAGER (Noteful-style "Select" page grid)
+   ========================================================================== */
+.page-manager-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-shell);
+  color: var(--text-primary, #f1f5f9);
+}
+
+.pm-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 20px;
+  background: var(--bg-topbar);
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.pm-title {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+}
+
+.pm-title strong {
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+
+.pm-sub {
+  font-size: 12px;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.pm-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.pm-text-btn {
+  background: transparent;
+  color: var(--accent-primary);
+  border: 1px solid transparent;
+  border-radius: 7px;
+  padding: 6px 10px;
+  font-size: 13px;
+  font-weight: 500;
+  transition: background 0.12s ease;
+}
+
+.pm-text-btn:hover {
+  background: var(--accent-soft);
+}
+
+.pm-grid {
+  flex: 1;
+  overflow-y: auto;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(168px, 1fr));
+  gap: 18px;
+  padding: 24px;
+  align-content: start;
+}
+
+.pm-tile {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  padding: 10px;
+  background: var(--bg-surface);
+  border: 2px solid var(--border-subtle);
+  border-radius: 12px;
+  cursor: pointer;
+  transition: border-color 0.12s ease, transform 0.12s ease, box-shadow 0.12s ease;
+}
+
+.pm-tile:hover {
+  border-color: #3a3e4d;
+  transform: translateY(-2px);
+}
+
+.pm-tile.selected {
+  border-color: var(--accent-primary);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+.pm-thumb {
+  width: 100%;
+  aspect-ratio: 800 / 1130;
+  object-fit: contain;
+  background: #ffffff;
+  border-radius: 6px;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.4);
+  pointer-events: none;
+}
+
+.pm-thumb-empty {
+  background: #ffffff;
+}
+
+.pm-num {
+  font-size: 12px;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.pm-check {
+  position: absolute;
+  top: 14px;
+  left: 14px;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  font-size: 13px;
+  color: #fff;
+  background: var(--accent-primary);
+  opacity: 0;
+  transform: scale(0.6);
+  transition: opacity 0.12s ease, transform 0.12s ease;
+}
+
+.pm-tile.selected .pm-check {
+  opacity: 1;
+  transform: scale(1);
+}
+
+.pm-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 20px;
+  background: var(--bg-topbar);
+  border-top: 1px solid var(--border-subtle);
+}
+
+.pm-spacer {
+  flex: 1;
+}
+
+.pm-op {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: var(--bg-surface);
+  color: var(--text-primary, #f1f5f9);
+  border: 1px solid var(--border-subtle);
+  border-radius: 9px;
+  padding: 8px 14px;
+  font-size: 13px;
+  font-weight: 500;
+  transition: background 0.12s ease, border-color 0.12s ease, opacity 0.12s ease;
+}
+
+.pm-op:hover:not(:disabled) {
+  background: var(--bg-hover);
+  border-color: #3a3e4d;
+}
+
+.pm-op:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+
+.pm-op.pm-danger:hover:not(:disabled) {
+  background: rgba(239, 68, 68, 0.18);
+  border-color: #ef4444;
+  color: #fca5a5;
+}
+
+.pm-sep {
+  width: 1px;
+  align-self: stretch;
+  margin: 4px 2px;
+  background: var(--border-subtle);
+}
+
+.pm-tags {
+  position: absolute;
+  left: 6px;
+  bottom: 6px;
+  right: 6px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  pointer-events: none;
+}
+
+.pm-tag {
+  font-size: 10px;
+  line-height: 1.4;
+  font-weight: 600;
+  padding: 1px 6px;
+  border-radius: 999px;
+  color: #0b1220;
+  background: var(--accent-primary, #4f9d9d);
+  white-space: nowrap;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }

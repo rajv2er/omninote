@@ -9,6 +9,30 @@ import {
   Line,
   PencilBrush,
 } from "fabric";
+import { getAssetUrl } from "../storage/assets.js";
+import { renderPdfPageBlob } from "../pdf/raster.js";
+
+// Zoom bounds. The ceiling matters: 400% is a viewing cap, but handwriting
+// needs real magnification, and the note apps this competes with go past it.
+export const MIN_ZOOM = 0.25;
+export const MAX_ZOOM = 8;
+
+// Crisp-zoom budget.
+//
+// Zoom used to magnify the existing bitmap: the backing store stayed at page
+// size while the CSS box grew, so every zoom level above 100% was an upscale.
+// Now the page is genuinely re-rendered at the zoomed resolution, which means
+// the backing store grows with zoom. Browsers cap a canvas both per-edge and
+// by total pixel count (Safari especially), so the render scale is clamped to
+// these bounds and the shortfall degrades to a slight softness at extreme zoom
+// rather than an allocation failure.
+const MAX_CANVAS_EDGE = 16384;
+const MAX_CANVAS_PIXELS = 32e6;
+const MIN_RENDER_SCALE = 0.2;
+
+// Re-rasterizing the imported page is the expensive half of a zoom change, so
+// it only runs once the user stops moving the slider/wheel for this long.
+const RASTER_DEBOUNCE_MS = 180;
 
 export class OmniCanvas {
   constructor(canvasEl, options = {}) {
@@ -27,9 +51,74 @@ export class OmniCanvas {
     this.isStrikethrough = false;
     this.penStyle = "ballpoint";
 
+    // Zoom / Pan state. `currentZoom` is the only zoom variable — it is what
+    // `setZoom` writes and `applyTransform` reads. `panX`/`panY` are the
+    // viewport offset in screen pixels.
+    // `renderZoom` is the zoom the backing store is actually rendered at. It
+    // equals `currentZoom` until the pixel budget clamps it.
+    this.renderZoom = 1;
+    this.currentZoom = 1;
+    this.panX = 0;
+    this.panY = 0;
+    this.isPanning = false;
+    this.panStartX = 0;
+    this.panStartY = 0;
+    this.isSpaceDown = false;
+    // When locked, every zoom path is ignored (wheel, pinch, fit, shortcuts).
+    // Notein does the same and it exists because a stray pinch while your palm
+    // rests on the screen is otherwise unrecoverable mid-sentence.
+    this.zoomLocked = false;
+    this.wheelZoomEnabled = true;
+
+    // Pinch state. A trackpad pinch is a *burst* of ~100 ctrl+wheel events, so
+    // the delta is accumulated across the whole gesture and mapped to a change
+    // in percentage points — the same linear, predictable response you get from
+    // dragging the slider. Applying a factor per event instead makes a single
+    // pinch compound into a runaway jump.
+    this._pinchAccum = 0;
+    this._pinchStartPct = 100;
+    this._pinchTimer = null;
+    // Percentage points gained per pixel of accumulated pinch. Tune this one
+    // number to change how fast a pinch zooms; the slider is the reference feel.
+    this.pinchPercentPerPixel = 0.35;
+    // Latest un-applied pinch target and the frame that will apply it. A pinch
+    // fires far more often than the screen refreshes, so the value is coalesced
+    // into one update per animation frame.
+    this._pinchPendingPct = null;
+    this._pinchFrame = null;
+    // True while a gesture is being tracked by CSS-only scaling (see
+    // `applyTransform`). The backing store is re-rendered once on commit.
+    this._previewActive = false;
+
     this.onModified = options.onModified || (() => {});
     this.onHistoryChange = options.onHistoryChange || (() => {});
     this.onSelectionChange = options.onSelectionChange || (() => {});
+    this.onZoomChange = options.onZoomChange || (() => {});
+    // Set by the app so wheel/pinch zoom goes through the same `setZoom` path
+    // as the slider (UI sync, scroll anchoring, zoom lock).
+    this.onZoomRequest = options.onZoomRequest || null;
+    // Called once when a pinch begins and once when it ends, so the app can
+    // hold a single scroll anchor for the whole gesture.
+    this.onZoomStart = options.onZoomStart || null;
+    this.onZoomEnd = options.onZoomEnd || null;
+
+    // Locked imported-page fallback layer. Held separately from the object graph
+    // so it is never serialized into undo history or persisted canvas JSON.
+    this.backgroundImage = null;
+    this.backgroundVisible = true;
+
+    // Optional link back to the PDF this page was imported from. When present,
+    // the background is re-rasterized from the source at the current zoom
+    // (Google Drive behaviour) instead of being magnified from the single
+    // snapshot captured at import time.
+    this.pdfSource = null;
+    this._bgRasterTimer = null;
+    this._bgRasterToken = 0;
+    this._bgRasterWidth = 0;
+    this._bgRasterBusy = false;
+    this._hiResBgUrl = null;
+    // Every page gets an engine, so only the visible one is worth re-rendering.
+    this.isActivePage = true;
 
     // Undo / Redo history tracking
     this.history = [];
@@ -51,6 +140,7 @@ export class OmniCanvas {
       backgroundColor: "transparent",
       selection: true,
       preserveObjectStacking: true,
+      viewportTransform: [1, 0, 0, 1, 0, 0],
     });
 
     this.canvas.selectionColor = "rgba(99, 102, 241, 0.12)";
@@ -133,33 +223,124 @@ export class OmniCanvas {
     const el = this.canvas.upperCanvasEl;
     if (!el) return;
 
+    // Ctrl/Cmd + wheel (which is what a trackpad pinch actually is on macOS).
+    el.addEventListener(
+      "wheel",
+      (e) => {
+        if (e.ctrlKey || e.metaKey) {
+          // Swallow it either way — otherwise the browser page-zooms instead.
+          e.preventDefault();
+          if (!this.wheelZoomEnabled) return;
+
+          // deltaMode 1 = lines, 2 = pages; normalise both to pixels.
+          const raw =
+            e.deltaMode === 1 ? e.deltaY * 16 : e.deltaMode === 2 ? e.deltaY * 400 : e.deltaY;
+          const px = Math.max(-200, Math.min(200, raw));
+
+          // A pinch is one continuous gesture, not 100 independent zooms. Track
+          // where it started and convert the *running total* into percentage
+          // points, exactly like the distance you dragged the zoom slider.
+          const isNewGesture = !this._pinchTimer;
+          if (this._pinchTimer) {
+            clearTimeout(this._pinchTimer);
+          } else {
+            this._pinchStartPct = this.currentZoom * 100;
+            this._pinchAccum = 0;
+          }
+          this._pinchTimer = setTimeout(() => this._endPinch(), 150);
+          if (isNewGesture && this.onZoomStart) this.onZoomStart(e.clientX, e.clientY);
+
+          this._pinchAccum += -px;
+          this._pinchPendingPct =
+            this._pinchStartPct + this._pinchAccum * this.pinchPercentPerPixel;
+
+          // Coalesce: a trackpad can fire several events between two frames.
+          // Applying every one reallocated and fully re-rendered every canvas in
+          // the notebook, which is what made the gesture stutter.
+          if (!this._pinchFrame) {
+            this._pinchFrame = requestAnimationFrame(() => {
+              this._pinchFrame = null;
+              this._flushPinch();
+            });
+          }
+        }
+      },
+      { passive: false },
+    );
+
+    // Space key for temporary pan mode. Sets isSpaceDown so pointerdown can
+    // decide to pan instead of select/draw.
+    const handleKeyDown = (e) => {
+      if (e.code === "Space" && !e.repeat) {
+        this.isSpaceDown = true;
+        this.canvas.defaultCursor = "grab";
+        el.style.cursor = "grab";
+      }
+    };
+    const handleKeyUp = (e) => {
+      if (e.code === "Space") {
+        this.isSpaceDown = false;
+        this.canvas.defaultCursor = this.currentTool === "eraser" ? "crosshair" : "default";
+        el.style.cursor = "";
+      }
+    };
+    document.addEventListener("keydown", handleKeyDown);
+    document.addEventListener("keyup", handleKeyUp);
+    this._keyboardHandlers = { handleKeyDown, handleKeyUp };
+
     el.addEventListener("pointerdown", (e) => {
       if (this.currentTool === "eraser") {
         this.isEraserDown = true;
         this.performErase(e);
+      } else if (e.button === 1 || (e.button === 0 && this.isSpaceDown)) {
+        // Middle mouse OR space+drag to pan.
+        this.isPanning = true;
+        this.panStartX = e.clientX - this.panX;
+        this.panStartY = e.clientY - this.panY;
+        el.setPointerCapture(e.pointerId);
+        e.preventDefault();
       }
     });
 
     el.addEventListener("pointermove", (e) => {
       if (this.currentTool === "eraser" && this.isEraserDown) {
         this.performErase(e);
+      } else if (this.isPanning) {
+        this.panX = e.clientX - this.panStartX;
+        this.panY = e.clientY - this.panStartY;
+        this.applyTransform();
       }
     });
 
     const finishStroke = () => {
-      if (this.currentTool === "eraser") {
-        this.isEraserDown = false;
-      }
+      this.isEraserDown = false;
+      this.isPanning = false;
     };
 
     el.addEventListener("pointerup", finishStroke);
     el.addEventListener("pointercancel", finishStroke);
+    el.addEventListener("pointerleave", finishStroke);
+  }
+
+  /**
+   * Serializes the editable object graph only. The locked fallback background is
+   * deliberately excluded: it lives in IndexedDB behind an asset id, and its
+   * object URL would be dead by the time this JSON is reloaded.
+   */
+  serialize() {
+    const json = this.canvas.toJSON();
+    delete json.backgroundImage;
+    // Fabric may record the canvas dimensions; they are render state, not
+    // document state, so they are pinned back to the page size.
+    if ("width" in json) json.width = this.width;
+    if ("height" in json) json.height = this.height;
+    return json;
   }
 
   recordHistory(triggerModified = true) {
     if (this.isHistoryProcessing) return;
 
-    const state = JSON.stringify(this.canvas.toJSON());
+    const state = JSON.stringify(this.serialize());
     if (this.history[this.historyIndex] === state) return;
 
     this.historyIndex++;
@@ -198,6 +379,7 @@ export class OmniCanvas {
     this.historyIndex--;
     const state = JSON.parse(this.history[this.historyIndex]);
     await this.canvas.loadFromJSON(state);
+    this.applyBackground();
     this.canvas.requestRenderAll();
     this.isHistoryProcessing = false;
     this.notifyHistory();
@@ -210,6 +392,7 @@ export class OmniCanvas {
     this.historyIndex++;
     const state = JSON.parse(this.history[this.historyIndex]);
     await this.canvas.loadFromJSON(state);
+    this.applyBackground();
     this.canvas.requestRenderAll();
     this.isHistoryProcessing = false;
     this.notifyHistory();
@@ -514,7 +697,7 @@ export class OmniCanvas {
     this.width = Math.round(width);
     this.height = Math.round(height);
     this.canvas.setDimensions({ width: this.width, height: this.height });
-    this.canvas.requestRenderAll();
+    this.applyTransform();
     this.recordHistory();
   }
 
@@ -582,6 +765,18 @@ export class OmniCanvas {
       this.canvas.requestRenderAll();
     }
 
+    // Re-attach after loading, since clear()/loadFromJSON() drop the background.
+    if (page.backgroundAssetId) {
+      await this.loadBackgroundAsset(page.backgroundAssetId);
+    } else {
+      this.applyBackground();
+    }
+
+    // Honour the current zoom so it carries across pages. Always applied, not
+    // just when zoomed: zoom 100% still has to size the backing store for dpr.
+    this.applyTransform();
+    this._scheduleBackgroundRaster(0);
+
     this.isHistoryProcessing = false;
     this.history = [];
     this.historyIndex = -1;
@@ -646,7 +841,10 @@ export class OmniCanvas {
     if (pageData.imageObjects) {
       for (const imgData of pageData.imageObjects) {
         try {
-          const img = await FabricImage.fromURL(imgData.src);
+          const src = imgData.src || (imgData.assetId ? await getAssetUrl(imgData.assetId) : null);
+          if (!src) continue;
+
+          const img = await FabricImage.fromURL(src);
           if (imgData.width && img.width) {
             img.scaleToWidth(imgData.width);
           }
@@ -668,19 +866,363 @@ export class OmniCanvas {
     }
 
     this.isHistoryProcessing = false;
+    this.applyBackground();
     this.canvas.requestRenderAll();
   }
 
+  /**
+   * Loads the locked imported-page fallback for this page from the asset store.
+   * The image is kept out of the object graph so the eraser and selection skip it.
+   */
+  async loadBackgroundAsset(assetId) {
+    if (!assetId) return;
+
+    const url = await getAssetUrl(assetId);
+    if (!url) return;
+
+    const img = await FabricImage.fromURL(url);
+    if (!img || !img.width) return;
+
+    img.set({
+      left: 0,
+      top: 0,
+      originX: "left",
+      originY: "top",
+      selectable: false,
+      evented: false,
+      hoverCursor: "default",
+    });
+    img.scaleX = this.width / img.width;
+    img.scaleY = this.height / img.height;
+
+    this.backgroundImage = img;
+    this.applyBackground();
+  }
+
+  /** Re-attaches the fallback layer after any clear() or loadFromJSON() wipes it. */
+  applyBackground() {
+    if (!this.backgroundImage) return;
+    if (this.canvas.backgroundImage !== this.backgroundImage) {
+      this.canvas.backgroundImage = this.backgroundVisible ? this.backgroundImage : undefined;
+      this.canvas.requestRenderAll();
+    }
+  }
+
+  /**
+   * Remembers which PDF page this canvas came from so the background can be
+   * re-rendered from the source instead of magnified from the import snapshot.
+   */
+  setPdfBackgroundSource(source) {
+    this.pdfSource = source && source.assetId ? source : null;
+    this._scheduleBackgroundRaster(0);
+  }
+
+  /** Marks whether this page is near enough to the viewport to render at full quality. */
+  setActivePage(active) {
+    const was = this.isActivePage !== false;
+    const next = Boolean(active);
+    if (next === was) return;
+    this.isActivePage = next;
+    // Re-render at the higher resolution, and re-rasterize the imported page.
+    this.applyTransform();
+    if (next) this._scheduleBackgroundRaster(0);
+  }
+
+  /** Forces a sharper background at the current zoom (used on page change). */
+  refreshBackgroundRaster(delay = 0) {
+    this._scheduleBackgroundRaster(delay);
+  }
+
+  /**
+   * Schedules a sharper re-render of the imported page.
+   *
+   * Zooming must feel instant, so the viewport transform is applied immediately
+   * and only the pixels are deferred — the same two-stage trick Drive uses.
+   */
+  _scheduleBackgroundRaster(delay = RASTER_DEBOUNCE_MS) {
+    if (!this.pdfSource || this.isActivePage === false) return;
+    if (this._bgRasterTimer) clearTimeout(this._bgRasterTimer);
+    this._bgRasterTimer = setTimeout(() => {
+      this._bgRasterTimer = null;
+      this._rasterizeBackground();
+    }, delay);
+  }
+
+  async _rasterizeBackground() {
+    if (!this.pdfSource || this._bgRasterBusy) return;
+
+    const targetWidth = Math.round(this.width * this.computeRenderScale());
+
+    // Never replace a sharp background with a softer one, and never re-render
+    // for a zoom level that does not actually need more pixels.
+    if (this._bgRasterWidth && targetWidth <= this._bgRasterWidth) return;
+
+    this._bgRasterBusy = true;
+    const token = ++this._bgRasterToken;
+
+    try {
+      const result = await renderPdfPageBlob(
+        this.pdfSource.assetId,
+        this.pdfSource.pageIndex,
+        targetWidth
+      );
+
+      // A newer zoom landed while this render was in flight.
+      if (!result || token !== this._bgRasterToken || !this.canvas) return;
+
+      const url = URL.createObjectURL(result.blob);
+      const img = await FabricImage.fromURL(url);
+      if (!img || !img.width) {
+        URL.revokeObjectURL(url);
+        return;
+      }
+      if (token !== this._bgRasterToken || !this.canvas) {
+        URL.revokeObjectURL(url);
+        return;
+      }
+
+      img.set({
+        left: 0,
+        top: 0,
+        originX: "left",
+        originY: "top",
+        selectable: false,
+        evented: false,
+        hoverCursor: "default",
+      });
+      img.scaleX = this.width / img.width;
+      img.scaleY = this.height / img.height;
+
+      if (this._hiResBgUrl) URL.revokeObjectURL(this._hiResBgUrl);
+      this._hiResBgUrl = url;
+      this._bgRasterWidth = result.width;
+
+      this.backgroundImage = img;
+      this.applyBackground();
+      this.canvas.requestRenderAll();
+    } catch (err) {
+      console.warn("Background re-rasterization failed:", err);
+    } finally {
+      this._bgRasterBusy = false;
+    }
+  }
+
+  setBackgroundVisible(visible) {
+    this.backgroundVisible = visible;
+    if (!visible) {
+      this.canvas.backgroundImage = undefined;
+    } else if (this.backgroundImage) {
+      this.canvas.backgroundImage = this.backgroundImage;
+    }
+    this.canvas.requestRenderAll();
+  }
+
+  /**
+   * Viewport zoom. Document coordinates are untouched — Fabric's
+   * `setViewportTransform` re-maps the scene so pen input and selection keep
+   * working at any scale. `focusX`/`focusY` keep the point under the cursor
+   * stationary during wheel zoom.
+   */
+  setZoom(
+    zoom,
+    { focusX = null, focusY = null, resetPan = false, force = false, preview = false } = {},
+  ) {
+    if (this.zoomLocked && !force) return;
+    const z = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, zoom));
+    const oldZ = this.currentZoom;
+    this.currentZoom = z;
+
+    if (resetPan) {
+      // Explicit zoom changes (buttons, slider, fit) recenter the page.
+      this.panX = 0;
+      this.panY = 0;
+    } else if (focusX !== null && focusY !== null) {
+      // Adjust pan so the focus point stays fixed on screen.
+      this.panX = focusX - ((focusX - this.panX) / oldZ) * z;
+      this.panY = focusY - ((focusY - this.panY) / oldZ) * z;
+    }
+
+    this.applyTransform({ preview });
+    this.onZoomChange(z);
+  }
+
+  /** Applies the pinch target that has accumulated since the last frame. */
+  _flushPinch() {
+    const pct = this._pinchPendingPct;
+    if (pct === null) return;
+    // Routed through the app so a pinch gets the same treatment as the slider:
+    // same UI sync, same scroll anchoring, same lock.
+    if (this.onZoomRequest) this.onZoomRequest(pct, true);
+    else this.setZoom(pct / 100, { preview: true });
+  }
+
+  /** Ends the gesture: land the final value, then re-render at full quality. */
+  _endPinch() {
+    this._pinchTimer = null;
+    this._pinchAccum = 0;
+    if (this._pinchFrame) {
+      cancelAnimationFrame(this._pinchFrame);
+      this._pinchFrame = null;
+    }
+    this._flushPinch();
+    if (this.onZoomEnd) this.onZoomEnd();
+    else this.commitZoomPreview();
+  }
+
+  /**
+   * Ends a cheap CSS-scaled zoom by re-rendering the backing store at the real
+   * resolution. Safe to call when no preview is in flight.
+   */
+  commitZoomPreview() {
+    if (!this._previewActive) return;
+    this.applyTransform();
+    this.refreshBackgroundRaster();
+  }
+
+  /**
+   * Device pixels per CSS pixel. Clamped because a fractional or absurd dpr
+   * (some Windows setups report 3.5+) would blow the pixel budget instantly.
+   */
+  _devicePixelRatio() {
+    const dpr = typeof window === "undefined" ? 1 : window.devicePixelRatio || 1;
+    return Math.max(1, Math.min(3, dpr));
+  }
+
+  /**
+   * Picks the zoom level to actually render at.
+   *
+   * Ideally this is `zoom * dpr` — one device pixel per screen pixel, which is
+   * what makes strokes and text crisp. It is capped so the backing store fits
+   * inside the browser's canvas limits.
+   *
+   * Pages that are not on screen are held at 100%. Every page in a notebook has
+   * a live engine, so rendering all of them at the zoomed resolution would cost
+   * hundreds of megabytes on a long document for pixels nobody is looking at.
+   *
+   * @returns {number} device pixels per page unit
+   */
+  computeRenderScale(zoom = this.currentZoom) {
+    const w = Math.max(1, this.width);
+    const h = Math.max(1, this.height);
+    const dpr = this._devicePixelRatio();
+    const effectiveZoom = this.isActivePage === false ? Math.min(zoom, 1) : zoom;
+
+    const byEdge = Math.min(MAX_CANVAS_EDGE / w, MAX_CANVAS_EDGE / h);
+    const byArea = Math.sqrt(MAX_CANVAS_PIXELS / (w * h));
+
+    return Math.max(MIN_RENDER_SCALE, Math.min(effectiveZoom * dpr, byEdge, byArea));
+  }
+
+  /** Zoom the backing store is rendered at (differs from `currentZoom` when clamped). */
+  getRenderZoom() {
+    return this.renderZoom;
+  }
+
+  /**
+   * Applies the current zoom + pan.
+   *
+   * Two sizes are involved and conflating them is what made zoom blurry:
+   *
+   *   - the *logical* size Fabric draws into, which sets the backing store
+   *     (logical x dpr). This must grow with zoom so the page is re-rendered
+   *     at the zoomed resolution rather than upscaled.
+   *   - the *CSS* size, which is what the user actually sees.
+   *
+   * When the pixel budget clamps the render scale these diverge: the canvas is
+   * drawn slightly smaller than displayed. Fabric's pointer pipeline divides by
+   * the retina factor and multiplies by (backing store / css width), so as long
+   * as the viewport transform is expressed in the *logical* scale the two
+   * cancel out and hit-testing stays exact at any zoom.
+   */
+  applyTransform({ preview = false } = {}) {
+    const z = this.currentZoom;
+
+    if (preview) {
+      /*
+       * Cheap path used while a pinch or slider drag is in flight. Only the CSS
+       * size changes, so the browser scales the bitmap it already has — no
+       * reallocation, no full re-render of every page in the notebook.
+       *
+       * The trade is a soft page for the duration of the gesture; it snaps to
+       * full resolution on `commitZoomPreview`. This is exactly what Google
+       * Drive's viewer and Figma do, and it is the difference between a pinch
+       * that stutters and one that tracks your fingers.
+       */
+      this._previewActive = true;
+      this.canvas.setDimensions(
+        {
+          width: Math.max(1, Math.round(this.width * z)),
+          height: Math.max(1, Math.round(this.height * z)),
+        },
+        { cssOnly: true },
+      );
+      return;
+    }
+    this._previewActive = false;
+
+    const dpr = this._devicePixelRatio();
+    const scale = this.computeRenderScale(z);
+    const renderZoom = scale / dpr;
+
+    this.renderZoom = renderZoom;
+    this.canvas.viewportTransform = [renderZoom, 0, 0, renderZoom, this.panX, this.panY];
+    if (this.canvas.calcViewportBoundaries) this.canvas.calcViewportBoundaries();
+
+    const logicalW = Math.max(1, Math.round(this.width * renderZoom));
+    const logicalH = Math.max(1, Math.round(this.height * renderZoom));
+    const cssW = Math.max(1, Math.round(this.width * z));
+    const cssH = Math.max(1, Math.round(this.height * z));
+
+    // Backstore first (Fabric multiplies by dpr and re-applies the base
+    // transform), then CSS, which also sizes the upper canvas and the wrapper.
+    this.canvas.setDimensions({ width: logicalW, height: logicalH }, { backstoreOnly: true });
+    this.canvas.setDimensions({ width: cssW, height: cssH }, { cssOnly: true });
+
+    this.canvas.requestRenderAll();
+    this._scheduleBackgroundRaster();
+  }
+
+  hasBackground() {
+    return Boolean(this.backgroundImage);
+  }
+
   toJSON() {
+    // Deliberately `this.width`/`this.height` (the page), not `canvas.width`
+    // (the page scaled by the render zoom). Persisting the latter would bake
+    // whatever zoom was active at save time into the notebook.
     return {
-      width: this.canvas.width,
-      height: this.canvas.height,
+      width: this.width,
+      height: this.height,
       paperStyle: this.paperStyle,
-      canvasData: this.canvas.toJSON(),
+      canvasData: this.serialize(),
     };
   }
 
   destroy() {
+    if (this._keyboardHandlers) {
+      document.removeEventListener("keydown", this._keyboardHandlers.handleKeyDown);
+      document.removeEventListener("keyup", this._keyboardHandlers.handleKeyUp);
+      this._keyboardHandlers = null;
+    }
+    if (this._bgRasterTimer) {
+      clearTimeout(this._bgRasterTimer);
+      this._bgRasterTimer = null;
+    }
+    if (this._pinchTimer) {
+      clearTimeout(this._pinchTimer);
+      this._pinchTimer = null;
+    }
+    if (this._pinchFrame) {
+      cancelAnimationFrame(this._pinchFrame);
+      this._pinchFrame = null;
+    }
+    this._pinchPendingPct = null;
+    // Invalidate any in-flight render so it cannot resolve after disposal.
+    this._bgRasterToken++;
+    if (this._hiResBgUrl) {
+      URL.revokeObjectURL(this._hiResBgUrl);
+      this._hiResBgUrl = null;
+    }
     this.canvas.dispose();
   }
 }

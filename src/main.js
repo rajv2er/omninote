@@ -1,7 +1,18 @@
 import "./style.css";
-import { OmniCanvas } from "./canvas/engine.js";
+import { OmniCanvas, MIN_ZOOM, MAX_ZOOM } from "./canvas/engine.js";
+import { Point } from "fabric";
+import { ZoomWindow } from "./canvas/zoomWindow.js";
 import { decomposePdf } from "./pdf/decomposer.js";
-import { exportNotebookToPdf } from "./pdf/exporter.js";
+import { invalidatePdfDoc } from "./pdf/raster.js";
+import { exportNotebookToPdf, renderPageThumbnail } from "./pdf/exporter.js";
+import {
+  putAsset,
+  putAssetFromDataUrl,
+  deleteAssets,
+  getAssetUrl,
+  collectNoteAssetIds,
+  collectPageAssetIds,
+} from "./storage/assets.js";
 
 const STORE_KEY = "omninote-notes-v2";
 
@@ -49,9 +60,34 @@ let loadingMessage = "";
 let showShapesFlyout = false;
 let showPageSetup = false;
 let activeFolder = "unfiled";
+let currentZoom = 1;
+
+// Page Manager (Noteful-style "Select" grid) state
+let showPageManager = false;
+let pageManagerSelection = new Set();
+let pageManagerAnchor = null;
+let pageManagerThumbs = [];
+let pageManagerPriorZoom = 1;
+let zoomRestoreTarget = null;
+// Page-level clipboard for the Page Manager Copy / Cut / Paste ops. Each entry
+// is a fully cloned page object (new id, cloned canvasJson, shared asset ids).
+let pageClipboard = [];
 
 function normalizeNote(n) {
   if (!n) return n;
+  // Legacy cleanup. Before the asset store, imported pages kept full-size
+  // dataURLs inline, which blows the localStorage quota. Drop them on load.
+  for (const p of n.pages || []) {
+    if (p.pendingDecomposedData?.backgroundDataUrl) {
+      delete p.pendingDecomposedData.backgroundDataUrl;
+    }
+    if (typeof p.thumbnail === "string" && p.thumbnail.length > 20000) {
+      p.thumbnail = null;
+    }
+    if (p.backgroundAssetId === undefined) p.backgroundAssetId = null;
+    if (p.thumbnailAssetId === undefined) p.thumbnailAssetId = null;
+  }
+
   if (!Array.isArray(n.pages) || n.pages.length === 0) {
     n.pages = [
       {
@@ -144,6 +180,304 @@ function getActiveCanvasEngine() {
   return canvasEngines[note.currentPageIndex] || canvasEngines[0];
 }
 
+const ZOOM_MIN = MIN_ZOOM;
+const ZOOM_MAX = MAX_ZOOM;
+const ZOOM_STEP = 1.25;
+// Freezes every zoom path. Guards against a stray pinch while writing.
+let zoomLocked = false;
+// Noteful-style magnified writing strip. Created once, re-pointed per page.
+let zoomWindow = null;
+
+/** Single place that keeps the label, the slider and `currentZoom` in sync. */
+function updateZoomUI(z) {
+  currentZoom = z;
+  const pct = Math.round(z * 100);
+  const value = document.querySelector("#zoom-value");
+  // Never overwrite the field while the user is typing into it.
+  if (value && document.activeElement !== value) value.value = pct;
+  const slider = document.querySelector("#zoom-slider");
+  if (slider) slider.value = pct;
+}
+
+/** Content-space box of a page wrapper, independent of the current scroll. */
+function pageContentBox(wrap, contRect, container) {
+  const r = wrap.getBoundingClientRect();
+  return {
+    left: r.left - contRect.left + container.scrollLeft,
+    top: r.top - contRect.top + container.scrollTop,
+    width: r.width,
+    height: r.height,
+  };
+}
+
+/**
+ * Remembers which spot of the document a given screen point is showing.
+ *
+ * Zooming resizes every page, which shifts all the following ones and used to
+ * throw the reader's place away. The anchor is stored as *fractions* of the
+ * page box it lands on, so it is zoom-invariant: restoring re-measures the page
+ * at its new size and puts the same fraction back under the same screen point.
+ * Storing raw pixel offsets instead is what made a long pinch drift — every
+ * step re-measured its own output and locked in the previous step's error.
+ *
+ * @param {number|null} clientX screen point to hold still (pinch cursor);
+ *   defaults to the middle of the viewport, which is what the slider uses.
+ */
+function captureZoomAnchor(clientX = null, clientY = null) {
+  const container = document.querySelector("#canvas-scroll-container");
+  if (!container) return null;
+
+  const contRect = container.getBoundingClientRect();
+  let ox = container.clientWidth / 2;
+  let oy = container.clientHeight / 2;
+  if (clientX !== null && clientY !== null) {
+    const px = clientX - contRect.left;
+    const py = clientY - contRect.top;
+    // Only trust the cursor when it is actually over the page area; synthetic
+    // or off-window events would otherwise anchor to a nonsense point.
+    if (px >= 0 && px <= contRect.width && py >= 0 && py <= contRect.height) {
+      ox = px;
+      oy = py;
+    }
+  }
+
+  const wraps = Array.from(container.querySelectorAll(".page-container"));
+  if (wraps.length === 0) return null;
+
+  const contentX = container.scrollLeft + ox;
+  const contentY = container.scrollTop + oy;
+
+  // The page the anchor point is actually over — not necessarily the "active"
+  // page, which is only the one the observer last reported.
+  let best = null;
+  let bestDist = Infinity;
+  for (const wrap of wraps) {
+    const box = pageContentBox(wrap, contRect, container);
+    const overshoot =
+      contentY < box.top
+        ? box.top - contentY
+        : contentY > box.top + box.height
+          ? contentY - (box.top + box.height)
+          : 0;
+    if (overshoot < bestDist) {
+      bestDist = overshoot;
+      best = { index: Number(wrap.dataset.index ?? 0), box };
+    }
+  }
+  if (!best) return null;
+
+  return {
+    container,
+    index: best.index,
+    fx: best.box.width > 0 ? (contentX - best.box.left) / best.box.width : 0,
+    fy: best.box.height > 0 ? (contentY - best.box.top) / best.box.height : 0,
+    ox,
+    oy,
+  };
+}
+
+/** Puts the spot captured by `captureZoomAnchor` back under the same screen point. */
+function restoreZoomAnchor(anchor) {
+  if (!anchor) return;
+  try {
+    const { container, index, fx, fy, ox, oy } = anchor;
+    const wrap =
+      document.querySelector(`#page-wrapper-${index}`) ||
+      document.querySelector(".page-container");
+    if (!wrap) return;
+    const contRect = container.getBoundingClientRect();
+    const box = pageContentBox(wrap, contRect, container);
+
+    // The workspace scrolls smoothly, which is lovely for page-to-page jumps
+    // but poisonous here: a smooth scroll is an animation, so reading the
+    // offset back returns the *old* value and the next event of a pinch
+    // restarts it from there. Anchoring has to land in one frame.
+    const prevBehavior = container.style.scrollBehavior;
+    container.style.scrollBehavior = "auto";
+    container.scrollLeft = box.left + fx * box.width - ox;
+    container.scrollTop = box.top + fy * box.height - oy;
+    container.style.scrollBehavior = prevBehavior;
+  } catch {
+    // Anchoring is a comfort feature; a bad measurement must never break zoom.
+  }
+}
+
+/**
+ * A pinch is one continuous gesture, so its anchor is measured once when the
+ * fingers land and held for the duration. Re-measuring per event made the
+ * target drift, because each step anchored to the previous step's result.
+ */
+let zoomGestureAnchor = null;
+function beginZoomGesture(clientX, clientY) {
+  zoomGestureAnchor = captureZoomAnchor(clientX, clientY);
+}
+function endZoomGesture() {
+  zoomGestureAnchor = null;
+  // The gesture was tracked by scaling the existing bitmap so it could keep up
+  // with the fingers; now that it has settled, re-render every page at the
+  // final resolution so ink and text are crisp again.
+  for (const engine of canvasEngines) engine.commitZoomPreview();
+}
+
+/**
+ * Turns off the browser's own page zoom.
+ *
+ * By default a trackpad pinch (or Ctrl+scroll, or Cmd +/-) scales the *entire
+ * tab* — toolbar, tool rail and panels included — which both wrecks the layout
+ * and double-scales the canvas. Only the page should ever zoom, and only via
+ * `setZoom`, so every route the browser offers is swallowed here.
+ */
+function disableBrowserZoom() {
+  // Chrome, Edge and Firefox deliver a trackpad pinch as a burst of ctrl+wheel.
+  // `wheel` defaults to passive on window/document/body, so `passive: false`
+  // is required for preventDefault to do anything at all.
+  window.addEventListener(
+    "wheel",
+    (e) => {
+      if (e.ctrlKey || e.metaKey) e.preventDefault();
+    },
+    { passive: false },
+  );
+
+  // Safari uses real gesture events for a pinch and bypasses wheel entirely.
+  for (const type of ["gesturestart", "gesturechange", "gestureend"]) {
+    window.addEventListener(type, (e) => e.preventDefault(), { passive: false });
+  }
+
+  // Two-finger pinch on a touchscreen.
+  window.addEventListener(
+    "touchmove",
+    (e) => {
+      if (e.touches.length > 1) e.preventDefault();
+    },
+    { passive: false },
+  );
+
+  // Keyboard page zoom. This only suppresses the browser default — our own
+  // Cmd/Ctrl +/-/0 shortcuts are separate listeners and still fire.
+  window.addEventListener("keydown", (e) => {
+    if (!(e.ctrlKey || e.metaKey)) return;
+    if (e.key === "+" || e.key === "=" || e.key === "-" || e.key === "_" || e.key === "0") {
+      e.preventDefault();
+    }
+  });
+
+  // Belt and braces: browsers that honour the viewport meta will refuse to
+  // pinch-zoom the document at all.
+  const meta = document.querySelector('meta[name="viewport"]');
+  if (meta) {
+    meta.setAttribute("content", "width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no");
+  }
+}
+
+function setZoom(zoom, { reset = false, resetPan = true, force = false, preview = false } = {}) {
+  if (zoomLocked && !force) return;
+  const next = reset ? 1 : Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, zoom));
+  // A pinch holds one anchor for the whole gesture; everything else measures
+  // fresh each time, which is stable because the anchor is zoom-invariant.
+  const anchor = zoomGestureAnchor || captureZoomAnchor();
+  updateZoomUI(next);
+  for (const engine of canvasEngines) {
+    engine.setZoom(next, { resetPan, force, preview });
+  }
+  restoreZoomAnchor(anchor);
+}
+
+/** Toggles the zoom freeze and pushes the state down to every engine. */
+function toggleZoomLock() {
+  zoomLocked = !zoomLocked;
+  for (const engine of canvasEngines) engine.zoomLocked = zoomLocked;
+  const btn = document.querySelector("#zoom-lock-btn");
+  if (btn) {
+    btn.innerHTML = icon(zoomLocked ? "lockClosed" : "lockOpen", 14);
+    btn.title = zoomLocked ? "Zoom locked — click to unlock" : "Lock zoom";
+    btn.classList.toggle("is-locked", zoomLocked);
+  }
+}
+
+/**
+ * Opening zoom. Wide imported pages are the common case, so pull back to fit
+ * width — but never zoom past 100%, since magnifying a small page on open is
+ * more surprising than helpful.
+ */
+function applyDefaultZoom() {
+  const engine = getActiveCanvasEngine();
+  const avail = getAvailableViewport();
+  if (!engine || !avail || !engine.width) return;
+  const fit = avail.width / engine.width;
+  const z = Math.min(1, Math.max(ZOOM_MIN, fit));
+  if (z < 1) setZoom(z, { force: true });
+}
+
+// --------------------------------------------------------------- zoom window
+
+/** Points the zoom window at whichever page is currently active. */
+function attachZoomWindow() {
+  if (!zoomWindow) return;
+  const note = getActiveNote();
+  if (!note) return;
+  const engine = getActiveCanvasEngine();
+  const pageEl = document.querySelector(`#page-wrapper-${note.currentPageIndex}`);
+  if (!engine || !pageEl) return;
+  zoomWindow.attach(engine, pageEl);
+}
+
+function initZoomWindow() {
+  const stripEl = document.querySelector("#zw-canvas");
+  const boxEl = document.querySelector("#zw-box");
+  if (!stripEl || !boxEl) return;
+  if (!zoomWindow) zoomWindow = new ZoomWindow({ stripEl, boxEl });
+  attachZoomWindow();
+}
+
+function toggleZoomWindow(force) {
+  if (!zoomWindow) return;
+  const next = force === undefined ? !zoomWindow.visible : force;
+  const wrap = document.querySelector("#zoom-window");
+  if (next) {
+    attachZoomWindow();
+    zoomWindow.show();
+    if (wrap) wrap.hidden = false;
+  } else {
+    zoomWindow.hide();
+    if (wrap) wrap.hidden = true;
+  }
+  document.querySelector("#zw-toggle")?.classList.toggle("is-active", next);
+}
+
+function zoomIn() { setZoom(currentZoom * ZOOM_STEP); }
+function zoomOut() { setZoom(currentZoom / ZOOM_STEP); }
+function zoomReset() { setZoom(1, { reset: true }); }
+
+/**
+ * Usable drawing area inside the scroll viewport, excluding its padding.
+ * Returns null if the editor is not mounted.
+ */
+function getAvailableViewport() {
+  const container = document.querySelector("#canvas-scroll-container");
+  if (!container) return null;
+  const style = getComputedStyle(container);
+  const padX = (parseFloat(style.paddingLeft) || 0) + (parseFloat(style.paddingRight) || 0);
+  const padY = (parseFloat(style.paddingTop) || 0) + (parseFloat(style.paddingBottom) || 0);
+  return {
+    width: container.clientWidth - padX,
+    height: container.clientHeight - padY,
+  };
+}
+
+/**
+ * Fits the active page to the viewport. `"width"` fills the width and lets
+ * you scroll vertically; `"page"` fits the whole page on screen at once.
+ */
+function zoomFit(mode = "width") {
+  const engine = getActiveCanvasEngine();
+  const avail = getAvailableViewport();
+  if (!engine || !avail || !engine.width || !engine.height) return;
+  const ratioW = avail.width / engine.width;
+  const ratioH = avail.height / engine.height;
+  setZoom(mode === "page" ? Math.min(ratioW, ratioH) : ratioW, { resetPan: true });
+}
+
 // Crisp, professional SVG icons
 function icon(name, size = 18) {
   const s = size;
@@ -160,8 +494,17 @@ function icon(name, size = 18) {
     delete: `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/></svg>`,
     undo: `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7v6h6"/><path d="M21 17a9 9 0 0 0-9-9 9 9 0 0 0-6 2.3L3 13"/></svg>`,
     redo: `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 7v6h-6"/><path d="M3 17a9 9 0 0 1 9-9 9 9 0 0 1 6 2.3L21 13"/></svg>`,
-    upload: `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>`,
-    download: `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>`,
+    upload: `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><path d="M12 19v-7"/><polyline points="9 15 12 12 15 15"/></svg>`,
+    download: `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><path d="M12 12v7"/><polyline points="9 16 12 19 15 16"/></svg>`,
+    zoomIn: `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/><line x1="11" y1="8" x2="11" y2="14"/><line x1="8" y1="11" x2="14" y2="11"/></svg>`,
+    zoomOut: `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/><line x1="8" y1="11" x2="14" y2="11"/></svg>`,
+    zoomWindow: `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="3" y1="14" x2="21" y2="14"/><line x1="7" y1="18.5" x2="17" y2="18.5"/></svg>`,
+    chevronLeft: `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>`,
+    close: `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>`,
+    lockClosed: `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>`,
+    lockOpen: `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 9.9-1"/></svg>`,
+    fitWidth: `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M8 12h8"/><polyline points="11 9.5 8 12 11 14.5"/><polyline points="13 9.5 16 12 13 14.5"/></svg>`,
+    fitPage: `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 9 4 4 9 4"/><polyline points="15 4 20 4 20 9"/><polyline points="20 15 20 20 15 20"/><polyline points="9 20 4 20 4 15"/></svg>`,
     grid: `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="7" height="7" x="3" y="3" rx="1"/><rect width="7" height="7" x="14" y="3" rx="1"/><rect width="7" height="7" x="14" y="14" rx="1"/><rect width="7" height="7" x="3" y="14" rx="1"/></svg>`,
     folder: `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/></svg>`,
     pin: `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="17" x2="12" y2="22"/><path d="M5 17h14v-1.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V6h1a2 2 0 0 0 0-4H8a2 2 0 0 0 0 4h1v4.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24Z"/></svg>`,
@@ -169,6 +512,8 @@ function icon(name, size = 18) {
     search: `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>`,
     plus: `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>`,
     chevronDown: `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>`,
+    pages: `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2V5a2 2 0 0 0-2-2z"/><path d="M21 7v12a2 2 0 0 1-2 2h-1V9a2 2 0 0 0-2-2h-3"/></svg>`,
+    rotate: `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>`,
   };
   return icons[name] || "";
 }
@@ -178,13 +523,13 @@ function render() {
   const note = getActiveNote();
 
   if (note) {
+    currentZoom = 1;
     app.innerHTML = editorView(note);
     initEditor(note);
   } else {
-    if (canvasEngine) {
-      canvasEngine.destroy();
-      canvasEngine = null;
-    }
+    if (zoomWindow) zoomWindow.hide();
+    canvasEngines.forEach((engine) => engine.destroy());
+    canvasEngines = [];
     app.innerHTML = libraryView();
     bindLibraryEvents();
   }
@@ -293,14 +638,23 @@ function sidebar() {
 function noteCard(note) {
   const firstPage = note.pages?.[0];
   const pageCount = note.pages?.length || 1;
-  const thumb = firstPage?.thumbnail || note.thumbnail;
+  const thumbAssetId = firstPage?.thumbnailAssetId || note.thumbnailAssetId;
+  // Legacy notes may still carry an inline dataURL thumbnail.
+  const legacyThumb = typeof firstPage?.thumbnail === "string" ? firstPage.thumbnail : null;
+
+  let thumbMarkup = `<span style="font-size: 28px; opacity: 0.3;">✦</span>`;
+  if (thumbAssetId) {
+    thumbMarkup = `<img data-thumb="${escapeHtml(thumbAssetId)}" alt="" />`;
+  } else if (legacyThumb) {
+    thumbMarkup = `<img src="${legacyThumb}" alt="" />`;
+  }
 
   return `
     <div class="note-card-wrapper">
       <button class="note-card" data-open="${note.id}">
         <div class="preview ${firstPage?.paperStyle ? `paper-${firstPage.paperStyle}` : ""}">
           ${note.isPdf ? `<span class="preview-badge">${pageCount} ${pageCount === 1 ? "Page" : "Pages"}</span>` : ""}
-          ${thumb ? `<img src="${thumb}" alt="" />` : `<span style="font-size: 28px; opacity: 0.3;">✦</span>`}
+          ${thumbMarkup}
         </div>
         <strong>${escapeHtml(note.title)}</strong>
         <small>${pageCount} ${pageCount === 1 ? "page" : "pages"} · ${note.isPdf ? "PDF Document" : "Notebook"}</small>
@@ -362,13 +716,25 @@ function updateFontToolbarState(selected) {
   );
 
   const engine = getActiveCanvasEngine();
-
+  const fontControlsBar = document.querySelector("#font-controls-bar");
   const fontSelect = document.querySelector("#font-family-select");
   const sizeLabel = document.querySelector("#font-size-label");
   const boldBtn = document.querySelector("#font-bold-btn");
   const italicBtn = document.querySelector("#font-italic-btn");
   const underlineBtn = document.querySelector("#font-underline-btn");
   const strikethroughBtn = document.querySelector("#font-strikethrough-btn");
+
+  const hasTextSelection = !!textObj;
+  const isTextTool = currentTool === "text";
+
+  if (fontControlsBar) {
+    const shouldShow = hasTextSelection || isTextTool;
+    fontControlsBar.classList.toggle("visible", shouldShow);
+  }
+
+  if (!hasTextSelection && !isTextTool) {
+    return;
+  }
 
   if (textObj) {
     const font = textObj.fontFamily || engine?.currentFont || "DM Sans";
@@ -422,6 +788,8 @@ function editorView(note) {
       <header class="editor-top">
         <button class="icon-btn" id="back-btn" title="Back to Library">${icon("back", 18)}</button>
 
+        <button class="icon-btn" id="page-manager-btn" title="Page Manager — select, insert, rotate, extract, share pages">${icon("pages", 18)}</button>
+
         <button class="title-pill" id="rename-btn" title="Click to rename">
           <span>${escapeHtml(note.title)}</span>
           ${icon("chevronDown", 13)}
@@ -438,6 +806,23 @@ function editorView(note) {
           ${icon("grid", 14)}
           <span>Page Style (${page.width} × ${page.height})</span>
         </button>
+
+        <div class="top-bar-divider"></div>
+
+        <div class="zoom-controls" title="Zoom">
+          <button class="icon-btn zoom-btn" id="zoom-out-btn" title="Zoom Out (Cmd/Ctrl + -)">${icon("zoomOut", 14)}</button>
+          <input type="range" class="zoom-slider" id="zoom-slider" min="${Math.round(ZOOM_MIN * 100)}" max="${Math.round(ZOOM_MAX * 100)}" step="1" value="${Math.round(currentZoom * 100)}" title="Drag to zoom" aria-label="Zoom level" />
+          <span class="zoom-label-btn" id="zoom-reset-btn" title="Reset to 100% (Cmd/Ctrl + 0) — or type an exact level">
+            <input class="zoom-value" id="zoom-value" type="text" inputmode="numeric" value="${Math.round(currentZoom * 100)}" aria-label="Zoom percentage" title="Type a zoom level and press Enter" />
+            <span class="zoom-pct">%</span>
+          </span>
+          <button class="icon-btn zoom-btn" id="zoom-in-btn" title="Zoom In (Cmd/Ctrl + =)">${icon("zoomIn", 14)}</button>
+          <button class="icon-btn zoom-btn" id="zoom-fit-width-btn" title="Fit Width (Cmd/Ctrl + 9)">${icon("fitWidth", 14)}</button>
+          <button class="icon-btn zoom-btn" id="zoom-fit-page-btn" title="Fit Whole Page (Cmd/Ctrl + 8)">${icon("fitPage", 14)}</button>
+          <button class="icon-btn zoom-btn" id="zoom-lock-btn" title="Lock zoom">${icon(zoomLocked ? "lockClosed" : "lockOpen", 14)}</button>
+        </div>
+
+        <button class="icon-btn zw-toggle" id="zw-toggle" title="Zoom window — write magnified, ink lands on the page">${icon("zoomWindow", 14)}</button>
 
         <div class="top-bar-divider"></div>
 
@@ -593,6 +978,18 @@ function editorView(note) {
             .join("")}
         </section>
 
+        <!-- Noteful-style zoom window: write magnified, ink lands on the page -->
+        <div class="zoom-window" id="zoom-window" hidden>
+          <canvas class="zoom-window-strip" id="zw-canvas"></canvas>
+          <div class="zoom-window-controls">
+            <button class="zw-btn" id="zw-left" title="Move box left">${icon("chevronLeft", 14)}</button>
+            <button class="zw-btn" id="zw-right" title="Advance box right">${icon("chevronRight", 14)}</button>
+            <button class="zw-btn" id="zw-down" title="Drop to next line">${icon("chevronDown", 14)}</button>
+            <button class="zw-btn" id="zw-close" title="Close zoom window">${icon("close", 14)}</button>
+          </div>
+        </div>
+        <div class="zw-target-box" id="zw-box" hidden></div>
+
         <!-- Interactive Multi-Page Floating Status Pill -->
         <div class="floating-status-pill">
           <button class="page-nav-btn" id="prev-page-btn" title="Previous Page" ${pageIndex === 0 ? "disabled" : ""}>
@@ -610,14 +1007,437 @@ function editorView(note) {
           </button>
         </div>
       </div>
+      ${showPageManager ? pageManagerOverlay(note) : ""}
     </div>
   `;
+}
+
+/* ==========================================================================
+   PAGE MANAGER (Noteful-style "Select" page grid)
+   ========================================================================== */
+
+function pageManagerTilesHtml(note) {
+  return note.pages
+    .map((p, i) => {
+      const selected = pageManagerSelection.has(i);
+      const thumb = pageManagerThumbs[i] || "";
+      const thumbEl = thumb
+        ? `<img class="pm-thumb" src="${thumb}" alt="Page ${i + 1}" draggable="false" />`
+        : `<div class="pm-thumb pm-thumb-empty"></div>`;
+      const tags = Array.isArray(p.tags) && p.tags.length
+        ? `<span class="pm-tags">${p.tags.map((t) => `<span class="pm-tag">${escapeHtml(t)}</span>`).join("")}</span>`
+        : "";
+      return `
+        <button class="pm-tile ${selected ? "selected" : ""}" data-index="${i}" title="Page ${i + 1} — click to toggle, shift-click to range-select">
+          <span class="pm-check">✓</span>
+          ${thumbEl}
+          <span class="pm-num">${i + 1}</span>
+          ${tags}
+        </button>`;
+    })
+    .join("");
+}
+
+function pageManagerOverlay(note) {
+  const total = note.pages.length;
+  const sel = pageManagerSelection.size;
+  return `
+    <div class="page-manager-overlay" id="page-manager-overlay" role="dialog" aria-label="Page Manager">
+      <header class="pm-header">
+        <div class="pm-title">
+          <strong>Pages</strong>
+          <span class="pm-sub">${total} page${total !== 1 ? "s" : ""}${sel ? ` · ${sel} selected` : ""}</span>
+        </div>
+        <div class="pm-header-actions">
+          <button class="pm-text-btn" id="pm-select-all">Select all</button>
+          <button class="pm-text-btn" id="pm-clear">Clear</button>
+          <button class="icon-btn" id="pm-close" title="Close (Esc)">${icon("close", 18)}</button>
+        </div>
+      </header>
+      <div class="pm-grid" id="page-manager-grid">${pageManagerTilesHtml(note)}</div>
+      <footer class="pm-toolbar">
+        <button class="pm-op" id="pm-insert" title="Insert a blank page after the selection">${icon("plus", 16)}<span>Insert</span></button>
+        <button class="pm-op" id="pm-rotate" ${sel ? "" : "disabled"} title="Rotate selected pages 90°">${icon("rotate", 16)}<span>Rotate</span></button>
+        <span class="pm-sep"></span>
+        <button class="pm-op" id="pm-copy" ${sel ? "" : "disabled"} title="Copy selected pages">${icon("copy", 16)}<span>Copy</span></button>
+        <button class="pm-op" id="pm-cut" ${sel ? "" : "disabled"} title="Cut selected pages">${icon("cut", 16)}<span>Cut</span></button>
+        <button class="pm-op" id="pm-paste" ${pageClipboard.length ? "" : "disabled"} title="Paste copied/cut pages">${icon("paste", 16)}<span>Paste</span></button>
+        <button class="pm-op" id="pm-tag" ${sel ? "" : "disabled"} title="Tag selected pages">${icon("tag", 16)}<span>Tag</span></button>
+        <span class="pm-sep"></span>
+        <button class="pm-op pm-danger" id="pm-delete" ${sel ? "" : "disabled"} title="Delete selected pages">${icon("trash", 16)}<span>Delete</span></button>
+        <span class="pm-spacer"></span>
+        <button class="pm-op" id="pm-extract" ${sel ? "" : "disabled"} title="New notebook from selected pages">${icon("folder", 16)}<span>Extract</span></button>
+        <button class="pm-op" id="pm-share" ${sel ? "" : "disabled"} title="Export selected pages as PDF">${icon("download", 16)}<span>Share</span></button>
+      </footer>
+    </div>`;
+}
+
+function updatePageManagerSelectionUI() {
+  document.querySelectorAll("#page-manager-grid .pm-tile").forEach((t) => {
+    const i = Number(t.dataset.index);
+    t.classList.toggle("selected", pageManagerSelection.has(i));
+  });
+  const note = getActiveNote();
+  const sub = document.querySelector(".pm-sub");
+  if (sub) {
+    sub.textContent = `${note.pages.length} page${note.pages.length !== 1 ? "s" : ""}${
+      pageManagerSelection.size ? ` · ${pageManagerSelection.size} selected` : ""
+    }`;
+  }
+  const hasSel = pageManagerSelection.size > 0;
+  ["pm-rotate", "pm-delete", "pm-extract", "pm-share", "pm-copy", "pm-cut", "pm-tag"].forEach((id) => {
+    const b = document.querySelector("#" + id);
+    if (b) b.disabled = !hasSel;
+  });
+  const pasteBtn = document.querySelector("#pm-paste");
+  if (pasteBtn) pasteBtn.disabled = pageClipboard.length === 0;
+}
+
+function bindPageManagerGrid() {
+  document.querySelectorAll("#page-manager-grid .pm-tile").forEach((tile) => {
+    tile.addEventListener("click", (e) => {
+      const i = Number(tile.dataset.index);
+      if (e.shiftKey && pageManagerAnchor !== null) {
+        const a = Math.min(pageManagerAnchor, i);
+        const b = Math.max(pageManagerAnchor, i);
+        for (let k = a; k <= b; k++) pageManagerSelection.add(k);
+      } else {
+        if (pageManagerSelection.has(i)) pageManagerSelection.delete(i);
+        else pageManagerSelection.add(i);
+        pageManagerAnchor = i;
+      }
+      updatePageManagerSelectionUI();
+    });
+  });
+}
+
+function bindPageManagerControls() {
+  document.querySelector("#pm-close")?.addEventListener("click", closePageManager);
+  document.querySelector("#pm-select-all")?.addEventListener("click", () => {
+    const note = getActiveNote();
+    pageManagerSelection = new Set(note.pages.map((_, i) => i));
+    updatePageManagerSelectionUI();
+  });
+  document.querySelector("#pm-clear")?.addEventListener("click", () => {
+    pageManagerSelection = new Set();
+    updatePageManagerSelectionUI();
+  });
+  document.querySelector("#pm-insert")?.addEventListener("click", pmInsert);
+  document.querySelector("#pm-rotate")?.addEventListener("click", pmRotate);
+  document.querySelector("#pm-delete")?.addEventListener("click", pmDelete);
+  document.querySelector("#pm-extract")?.addEventListener("click", pmExtract);
+  document.querySelector("#pm-share")?.addEventListener("click", pmShare);
+  document.querySelector("#pm-copy")?.addEventListener("click", pmCopy);
+  document.querySelector("#pm-cut")?.addEventListener("click", pmCut);
+  document.querySelector("#pm-paste")?.addEventListener("click", pmPaste);
+  document.querySelector("#pm-tag")?.addEventListener("click", pmTag);
+}
+
+async function regeneratePageManagerThumbs() {
+  const note = getActiveNote();
+  pageManagerThumbs = [];
+  for (let i = 0; i < note.pages.length; i++) {
+    try {
+      pageManagerThumbs[i] = await renderPageThumbnail(note.pages[i], 260);
+    } catch {
+      pageManagerThumbs[i] = null;
+    }
+  }
+}
+
+async function openPageManager() {
+  if (showPageManager) return;
+  const note = getActiveNote();
+  if (!note) return;
+  saveActiveCanvasPage();
+  pageManagerPriorZoom = currentZoom;
+  await regeneratePageManagerThumbs();
+  pageManagerSelection = new Set();
+  pageManagerAnchor = null;
+  showPageManager = true;
+  zoomRestoreTarget = pageManagerPriorZoom;
+  render();
+}
+
+function closePageManager() {
+  showPageManager = false;
+  pageManagerSelection = new Set();
+  pageManagerAnchor = null;
+  zoomRestoreTarget = pageManagerPriorZoom;
+  render();
+}
+
+function clonePageForExtract(page) {
+  return {
+    id: crypto.randomUUID(),
+    pageNumber: 1,
+    width: page.width,
+    height: page.height,
+    paperStyle: page.paperStyle || "plain",
+    pageSize: page.pageSize || "custom",
+    thumbnail: null,
+    backgroundAssetId: page.backgroundAssetId || null,
+    thumbnailAssetId: null,
+    tags: Array.isArray(page.tags) ? page.tags.slice() : [],
+    canvasJson: page.canvasJson ? JSON.parse(JSON.stringify(page.canvasJson)) : null,
+    pendingDecomposedData: null,
+    pdfPageIndex: typeof page.pdfPageIndex === "number" ? page.pdfPageIndex : null,
+  };
+}
+
+function rotateObjectAbout(obj, oldW, oldH, newW, newH) {
+  const c = obj.getCenterPoint();
+  const dx = c.x - oldW / 2;
+  const dy = c.y - oldH / 2;
+  // Clockwise 90° about the page centre, then map into the swapped page.
+  const nx = newW / 2 + -dy;
+  const ny = newH / 2 + dx;
+  obj.set({ angle: (obj.angle || 0) + 90 });
+  if (typeof obj.setPositionByOrigin === "function") {
+    obj.setPositionByOrigin(new Point(nx, ny), "center", "center");
+  } else {
+    obj.set({ left: nx, top: ny });
+  }
+  obj.setCoords();
+}
+
+async function rotateEnginePage90(engine, page) {
+  const canvas = engine.canvas;
+  const oldW = engine.width;
+  const oldH = engine.height;
+  const newW = oldH;
+  const newH = oldW;
+  canvas.discardActiveObject();
+  canvas.getObjects().slice().forEach((o) => rotateObjectAbout(o, oldW, oldH, newW, newH));
+  if (canvas.backgroundImage) rotateObjectAbout(canvas.backgroundImage, oldW, oldH, newW, newH);
+  engine.width = newW;
+  engine.height = newH;
+  page.width = newW;
+  page.height = newH;
+  canvas.setDimensions({ width: newW, height: newH });
+  // Keep the rotated snapshot instead of re-rasterizing the source PDF at the
+  // original (now wrong) orientation.
+  try {
+    engine.pdfSource = null;
+  } catch {}
+  engine.setZoom(engine.currentZoom, { force: true, resetPan: true });
+  canvas.requestRenderAll();
+}
+
+async function pmInsert() {
+  const note = getActiveNote();
+  if (!note.pages.length) return;
+  const idx = pageManagerSelection.size ? Math.max(...pageManagerSelection) : note.currentPageIndex;
+  const ref = note.pages[Math.min(idx, note.pages.length - 1)] || note.pages[0];
+  note.pages.splice(idx + 1, 0, {
+    id: crypto.randomUUID(),
+    pageNumber: idx + 2,
+    width: ref.width || 800,
+    height: ref.height || 1130,
+    paperStyle: ref.paperStyle || "lined",
+    pageSize: "custom",
+    thumbnail: null,
+    canvasJson: null,
+    pendingDecomposedData: null,
+  });
+  pageManagerSelection = new Set();
+  saveNotes();
+  await regeneratePageManagerThumbs();
+  zoomRestoreTarget = pageManagerPriorZoom;
+  render();
+}
+
+async function pmDelete() {
+  const note = getActiveNote();
+  if (note.pages.length <= 1) return;
+  if (!confirm(`Delete ${pageManagerSelection.size} selected page(s)? This cannot be undone.`)) return;
+  const indices = Array.from(pageManagerSelection).sort((a, b) => b - a);
+  for (const i of indices) {
+    if (note.pages.length <= 1) break;
+    const [removed] = note.pages.splice(i, 1);
+    // Don't delete assets still referenced by other (e.g. copied) pages.
+    const remainingIds = new Set();
+    for (const p of note.pages) {
+      if (p.backgroundAssetId) remainingIds.add(p.backgroundAssetId);
+      if (p.thumbnailAssetId) remainingIds.add(p.thumbnailAssetId);
+      if (p.pdfAssetId) remainingIds.add(p.pdfAssetId);
+    }
+    const ids = collectPageAssetIds(removed).filter((id) => id && !remainingIds.has(id));
+    if (ids.length) await deleteAssets(ids);
+  }
+  if (note.currentPageIndex >= note.pages.length) note.currentPageIndex = note.pages.length - 1;
+  pageManagerSelection = new Set();
+  saveNotes();
+  await regeneratePageManagerThumbs();
+  zoomRestoreTarget = pageManagerPriorZoom;
+  render();
+}
+
+async function pmRotate() {
+  const note = getActiveNote();
+  const indices = Array.from(pageManagerSelection).sort((a, b) => a - b);
+  if (!indices.length) return;
+  for (const i of indices) {
+    const engine = canvasEngines[i];
+    const page = note.pages[i];
+    if (engine && page) await rotateEnginePage90(engine, page);
+  }
+  saveActiveCanvasPage();
+  pageManagerSelection = new Set();
+  saveNotes();
+  await regeneratePageManagerThumbs();
+  zoomRestoreTarget = pageManagerPriorZoom;
+  render();
+}
+
+async function pmExtract() {
+  const note = getActiveNote();
+  const indices = Array.from(pageManagerSelection).sort((a, b) => a - b);
+  if (!indices.length) return;
+  saveActiveCanvasPage();
+  const pages = indices.map((i) => clonePageForExtract(note.pages[i]));
+  pages.forEach((p, idx) => {
+    p.pageNumber = idx + 1;
+  });
+  const newNote = {
+    id: crypto.randomUUID(),
+    title: `${note.title} (extracted)`,
+    createdAt: Date.now(),
+    isPdf: note.isPdf || false,
+    pdfAssetId: note.pdfAssetId || null,
+    defaultFont: note.defaultFont || "DM Sans",
+    detectedFonts: note.detectedFonts || [],
+    currentPageIndex: 0,
+    pages,
+  };
+  notes.unshift(newNote);
+  saveNotes();
+  showPageManager = false;
+  activeId = null;
+  render();
+}
+
+async function pmShare() {
+  const note = getActiveNote();
+  const indices = Array.from(pageManagerSelection).sort((a, b) => a - b);
+  if (!indices.length) return;
+  isLoading = true;
+  loadingMessage = "Exporting selected pages...";
+  renderLoading();
+  try {
+    await exportNotebookToPdf(note, getActiveCanvasEngine(), (curr, total) => {
+      loadingMessage = `Exporting page ${curr} of ${total}...`;
+      renderLoading();
+    }, indices);
+  } catch (err) {
+    alert("Export failed: " + err.message);
+    console.error(err);
+  } finally {
+    isLoading = false;
+    renderLoading();
+  }
+}
+
+// Deep-clone a page for the clipboard / paste / extract flows. A fresh id is
+// assigned; asset ids are intentionally shared (read-only) so copying a page
+// that uses an imported background does not duplicate the blob.
+function clonePageData(page) {
+  return {
+    id: crypto.randomUUID(),
+    pageNumber: 1,
+    width: page.width,
+    height: page.height,
+    paperStyle: page.paperStyle || "plain",
+    pageSize: page.pageSize || "custom",
+    thumbnail: page.thumbnail || null,
+    backgroundAssetId: page.backgroundAssetId || null,
+    thumbnailAssetId: page.thumbnailAssetId || null,
+    pdfAssetId: page.pdfAssetId || null,
+    pdfPageIndex: typeof page.pdfPageIndex === "number" ? page.pdfPageIndex : null,
+    canvasJson: page.canvasJson ? JSON.parse(JSON.stringify(page.canvasJson)) : null,
+    pendingDecomposedData: null,
+    tags: Array.isArray(page.tags) ? page.tags.slice() : [],
+  };
+}
+
+// Re-render just the thumbnail grid (used after Tag so we don't rebuild engines).
+function refreshPageManagerGrid() {
+  const note = getActiveNote();
+  const grid = document.querySelector("#page-manager-grid");
+  if (grid) {
+    grid.innerHTML = pageManagerTilesHtml(note);
+    bindPageManagerGrid();
+  }
+  updatePageManagerSelectionUI();
+}
+
+function pmCopy() {
+  const note = getActiveNote();
+  if (!pageManagerSelection.size) return;
+  const indices = Array.from(pageManagerSelection).sort((a, b) => a - b);
+  pageClipboard = indices.map((i) => clonePageData(note.pages[i]));
+  updatePageManagerSelectionUI();
+}
+
+async function pmCut() {
+  const note = getActiveNote();
+  if (note.pages.length <= 1 || !pageManagerSelection.size) return;
+  const indices = Array.from(pageManagerSelection).sort((a, b) => b - a);
+  const clones = [];
+  for (const i of indices) {
+    if (note.pages.length <= 1) break;
+    clones.unshift(clonePageData(note.pages[i]));
+    note.pages.splice(i, 1);
+  }
+  pageClipboard = clones;
+  if (note.currentPageIndex >= note.pages.length) note.currentPageIndex = note.pages.length - 1;
+  pageManagerSelection = new Set();
+  saveNotes();
+  await regeneratePageManagerThumbs();
+  zoomRestoreTarget = pageManagerPriorZoom;
+  render();
+}
+
+async function pmPaste() {
+  const note = getActiveNote();
+  if (!pageClipboard.length) return;
+  const clones = pageClipboard.map((p) => clonePageData(p));
+  const target = pageManagerSelection.size ? Math.max(...pageManagerSelection) : note.pages.length - 1;
+  note.pages.splice(target + 1, 0, ...clones);
+  pageManagerSelection = new Set();
+  saveNotes();
+  await regeneratePageManagerThumbs();
+  zoomRestoreTarget = pageManagerPriorZoom;
+  render();
+}
+
+function pmTag() {
+  const note = getActiveNote();
+  if (!pageManagerSelection.size) return;
+  const tag = (prompt("Tag the selected pages (single tag):") || "").trim();
+  if (!tag) return;
+  for (const i of pageManagerSelection) {
+    const p = note.pages[i];
+    p.tags = Array.isArray(p.tags) ? p.tags : [];
+    if (!p.tags.includes(tag)) p.tags.push(tag);
+  }
+  saveNotes();
+  refreshPageManagerGrid();
 }
 
 async function initEditor(note) {
   if (canvasEngines && canvasEngines.length > 0) {
     canvasEngines.forEach(e => e.destroy());
     canvasEngines = [];
+  }
+
+  // When returning from the Page Manager we want to keep the zoom the user had,
+  // rather than snapping back to fit-width. The flag is only set across those
+  // two transitions, so normal note opens still fit to width.
+  const restoreZoom = zoomRestoreTarget != null;
+  if (restoreZoom) {
+    currentZoom = zoomRestoreTarget;
+    zoomRestoreTarget = null;
   }
 
   for (let i = 0; i < note.pages.length; i++) {
@@ -647,6 +1467,13 @@ async function initEditor(note) {
           updateFontToolbarState(selected);
         }
       },
+      onZoomChange: (z) => {
+        updateZoomUI(z);
+      },
+      // Pinch/wheel zoom takes the exact route the slider takes.
+      onZoomStart: (clientX, clientY) => beginZoomGesture(clientX, clientY),
+      onZoomEnd: () => endZoomGesture(),
+      onZoomRequest: (percent, preview) => setZoom(percent / 100, { preview }),
     });
 
     engine.setColor(currentColor);
@@ -664,8 +1491,28 @@ async function initEditor(note) {
       saveNotes();
     }
     
+    engine.zoomLocked = zoomLocked;
+
+    // Only pages near the viewport render at full quality; the rest are held
+    // at 100% until scrolled to.
+    engine.isActivePage = Math.abs(i - note.currentPageIndex) <= 1;
+    if (note.pdfAssetId && Number.isInteger(page.pdfPageIndex)) {
+      engine.setPdfBackgroundSource({ assetId: note.pdfAssetId, pageIndex: page.pdfPageIndex });
+    }
+
     canvasEngines.push(engine);
   }
+
+  // Carry the global zoom across engines so each page renders at the current scale.
+  for (const engine of canvasEngines) {
+    if (engine.currentZoom !== currentZoom) {
+      engine.setZoom(currentZoom, { force: true });
+    }
+  }
+
+  // Wide imported pages are the common case, so open pulled back to fit width.
+  applyDefaultZoom();
+  initZoomWindow();
 
   // Set up scroll observer to update active page index
   const scrollContainer = document.querySelector("#canvas-scroll-container");
@@ -687,6 +1534,9 @@ async function initEditor(note) {
         const nextBtn = document.querySelector("#next-page-btn");
         if (prevBtn) prevBtn.disabled = note.currentPageIndex === 0;
         if (nextBtn) nextBtn.disabled = note.currentPageIndex === note.pages.length - 1;
+        // Full-quality rendering (and PDF re-rasterization) follows the viewport.
+        canvasEngines.forEach((eng, idx) => eng.setActivePage(Math.abs(idx - mostVisibleIndex) <= 1));
+        attachZoomWindow();
         saveNotes();
       }
     }, {
@@ -717,21 +1567,57 @@ function saveActiveCanvasPage() {
       page.width = json.width;
       page.height = json.height;
       page.paperStyle = json.paperStyle;
-
-      // Only generate thumbnail for the first page to save memory
-      if (i === 0) {
-        try {
-          page.thumbnail = engine.canvas.toDataURL({
-            format: "jpeg",
-            quality: 0.35,
-            multiplier: 0.2,
-          });
-        } catch (e) {}
-      }
     }
   });
 
   saveNotes();
+  scheduleThumbnailRefresh(note.id);
+}
+
+let thumbnailTimer = null;
+
+/** Thumbnails are only for the library grid, so they lag behind edits slightly. */
+function scheduleThumbnailRefresh(noteId) {
+  if (thumbnailTimer) clearTimeout(thumbnailTimer);
+  thumbnailTimer = setTimeout(() => {
+    thumbnailTimer = null;
+    refreshNoteThumbnail(noteId).catch(() => {});
+  }, 600);
+}
+
+async function refreshNoteThumbnail(noteId) {
+  if (activeId !== noteId) return;
+
+  const note = getActiveNote();
+  const page = note?.pages?.[0];
+  const engine = canvasEngines[0];
+  if (!note || !page || !engine) return;
+
+  try {
+    // The canvas is sized to (page x render zoom), so a fixed multiplier would
+    // yield a different thumbnail size at every zoom level. Solve for the
+    // intended width instead.
+    const pageW = page.width || engine.width || 800;
+    const renderZoom = engine.getRenderZoom ? engine.getRenderZoom() : 1;
+    const dpr = Math.max(1, Math.min(3, window.devicePixelRatio || 1));
+    const multiplier = Math.min(1, 320 / Math.max(1, pageW * renderZoom * dpr));
+
+    const dataUrl = engine.canvas.toDataURL({
+      format: "jpeg",
+      quality: 0.35,
+      multiplier,
+    });
+    if (!dataUrl) return;
+
+    if (!page.thumbnailAssetId) {
+      page.thumbnailAssetId = `thumb-${crypto.randomUUID()}`;
+    }
+    await putAssetFromDataUrl(page.thumbnailAssetId, dataUrl);
+    page.thumbnail = null;
+    saveNotes();
+  } catch {
+    // A missing thumbnail only costs a card preview, never the notebook itself.
+  }
 }
 
 function bindEditorEvents(note) {
@@ -750,6 +1636,76 @@ function bindEditorEvents(note) {
 
   document.querySelector("#redo-btn")?.addEventListener("click", async () => {
     await getActiveCanvasEngine()?.redo();
+  });
+
+  // Zoom controls
+  document.querySelector("#zoom-in-btn")?.addEventListener("click", zoomIn);
+  document.querySelector("#zoom-out-btn")?.addEventListener("click", zoomOut);
+  document.querySelector("#zoom-reset-btn")?.addEventListener("click", zoomReset);
+
+  document.querySelector("#zoom-fit-width-btn")?.addEventListener("click", () => zoomFit("width"));
+  document.querySelector("#zoom-fit-page-btn")?.addEventListener("click", () => zoomFit("page"));
+  document.querySelector("#zoom-lock-btn")?.addEventListener("click", toggleZoomLock);
+  document.querySelector("#zw-toggle")?.addEventListener("click", () => toggleZoomWindow());
+  document.querySelector("#zw-close")?.addEventListener("click", () => toggleZoomWindow(false));
+  document.querySelector("#zw-down")?.addEventListener("click", () => zoomWindow?.nextLine());
+  document.querySelector("#zw-right")?.addEventListener("click", () => {
+    if (zoomWindow) zoomWindow.nudge(zoomWindow.box.w * 0.25);
+  });
+  document.querySelector("#zw-left")?.addEventListener("click", () => {
+    if (zoomWindow) zoomWindow.nudge(-zoomWindow.box.w * 0.25);
+  });
+
+  // Alt/Option + click on the page drops the zoom window's target box there.
+  document.querySelector("#canvas-scroll-container")?.addEventListener("click", (e) => {
+    if (!zoomWindow?.visible || !e.altKey) return;
+    const engine = getActiveCanvasEngine();
+    if (!engine?.canvas.upperCanvasEl) return;
+    const rect = engine.canvas.upperCanvasEl.getBoundingClientRect();
+    const z = engine.currentZoom;
+    zoomWindow.moveTo(
+      (e.clientX - rect.left - engine.panX) / z,
+      (e.clientY - rect.top - engine.panY) / z,
+    );
+  });
+
+  // Slider: `input` fires continuously while dragging, so zoom tracks the drag.
+  // Same deal as a pinch — preview cheaply while it moves, re-render crisp on
+  // release — otherwise every notch reallocates and repaints all the canvases.
+  const zoomSlider = document.querySelector("#zoom-slider");
+  zoomSlider?.addEventListener("pointerdown", () => beginZoomGesture(null, null));
+  zoomSlider?.addEventListener("input", (e) => {
+    setZoom(Number(e.target.value) / 100, { preview: true });
+  });
+  zoomSlider?.addEventListener("change", (e) => {
+    setZoom(Number(e.target.value) / 100);
+    endZoomGesture();
+  });
+
+  // Percentage field — the precise counterpart to the slider.
+  const zoomValue = document.querySelector("#zoom-value");
+  const commitZoomValue = () => {
+    if (!zoomValue) return;
+    const n = Number.parseFloat(zoomValue.value);
+    if (Number.isFinite(n) && n > 0) setZoom(n / 100);
+    else updateZoomUI(currentZoom);
+  };
+  zoomValue?.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      commitZoomValue();
+      zoomValue.blur();
+    } else if (e.key === "Escape") {
+      updateZoomUI(currentZoom);
+      zoomValue.blur();
+    }
+  });
+  zoomValue?.addEventListener("focus", () => zoomValue.select());
+  zoomValue?.addEventListener("blur", commitZoomValue);
+  // Clicking anywhere on the control except the number resets to 100%.
+  document.querySelector("#zoom-reset-btn")?.addEventListener("click", (e) => {
+    if (e.target === zoomValue) return;
+    setZoom(1, { reset: true });
   });
 
   // Page Navigation
@@ -790,7 +1746,8 @@ function bindEditorEvents(note) {
   document.querySelector("#delete-page-btn")?.addEventListener("click", async () => {
     if (note.pages.length <= 1) return;
     if (confirm(`Delete Page ${note.currentPageIndex + 1}?`)) {
-      note.pages.splice(note.currentPageIndex, 1);
+      const [removed] = note.pages.splice(note.currentPageIndex, 1);
+      await deleteAssets(collectPageAssetIds(removed));
       if (note.currentPageIndex >= note.pages.length) {
         note.currentPageIndex = note.pages.length - 1;
       }
@@ -926,12 +1883,48 @@ function bindEditorEvents(note) {
     }
   });
 
+  // Helper function to position a flyout relative to its trigger button
+  function positionFlyout(flyout, trigger) {
+    if (!flyout || !trigger) return;
+    const rect = trigger.getBoundingClientRect();
+    const flyoutRect = flyout.getBoundingClientRect();
+    const viewportWidth = window.innerWidth;
+    const viewportHeight = window.innerHeight;
+
+    // Default: below and left-aligned
+    let left = rect.left;
+    let top = rect.bottom + 4;
+
+    // Flip horizontally if would overflow right edge
+    if (left + flyoutRect.width > viewportWidth - 8) {
+      left = rect.right - flyoutRect.width;
+    }
+    // Clamp to viewport
+    left = Math.max(8, Math.min(left, viewportWidth - flyoutRect.width - 8));
+
+    // Flip vertically if would overflow bottom edge
+    if (top + flyoutRect.height > viewportHeight - 8) {
+      top = rect.top - flyoutRect.height - 4;
+    }
+    // Clamp to viewport
+    top = Math.max(8, Math.min(top, viewportHeight - flyoutRect.height - 8));
+
+    flyout.style.left = `${left}px`;
+    flyout.style.top = `${top}px`;
+  }
+
   // Shapes Tool Flyout
   document.querySelector("#shapes-btn")?.addEventListener("click", (e) => {
     e.stopPropagation();
     showShapesFlyout = !showShapesFlyout;
     const flyout = document.querySelector("#shapes-flyout");
-    if (flyout) flyout.style.display = showShapesFlyout ? "grid" : "none";
+    const trigger = document.querySelector("#shapes-btn");
+    if (flyout) {
+      flyout.style.display = showShapesFlyout ? "grid" : "none";
+      if (showShapesFlyout && trigger) {
+        positionFlyout(flyout, trigger);
+      }
+    }
   });
 
   // Shape Option Click
@@ -998,6 +1991,12 @@ function bindEditorEvents(note) {
 
       document.querySelectorAll("[data-tool]").forEach((b) => b.classList.remove("selected"));
       btn.classList.add("selected");
+
+      // Update font toolbar visibility when switching to/from text tool
+      const engine = getActiveCanvasEngine();
+      if (engine) {
+        updateFontToolbarState(engine.canvas.getActiveObjects());
+      }
     });
   });
 
@@ -1009,6 +2008,9 @@ function bindEditorEvents(note) {
       e.stopPropagation();
       const isVisible = penStyleFlyout.style.display !== "none";
       penStyleFlyout.style.display = isVisible ? "none" : "flex";
+      if (!isVisible) {
+        positionFlyout(penStyleFlyout, penStyleToggle);
+      }
     });
   }
 
@@ -1055,8 +2057,77 @@ function bindEditorEvents(note) {
     }
   };
 
-  // Quick Swatches — single click = use color, double-click = edit color
+  // Quick Swatches — single click = use color, hover shows context menu
+  let activeSwatchMenu = null;
+
+  function createSwatchContextMenu(btn, idx) {
+    // Remove any existing menu
+    if (activeSwatchMenu) {
+      activeSwatchMenu.remove();
+      activeSwatchMenu = null;
+    }
+
+    const menu = document.createElement("div");
+    menu.className = "swatch-context-menu";
+    menu.innerHTML = `
+      <button class="swatch-menu-btn swatch-edit-btn" title="Edit color">✎ Edit</button>
+      <button class="swatch-menu-btn swatch-delete-btn" title="Delete color">🗑 Delete</button>
+    `;
+
+    const rect = btn.getBoundingClientRect();
+    menu.style.left = `${rect.left}px`;
+    menu.style.top = `${rect.bottom + 4}px`;
+
+    document.body.appendChild(menu);
+    activeSwatchMenu = menu;
+
+    // Edit button
+    menu.querySelector(".swatch-edit-btn").addEventListener("click", (e) => {
+      e.stopPropagation();
+      const input = btn.querySelector(".swatch-edit-input");
+      if (input) input.click();
+      menu.remove();
+      activeSwatchMenu = null;
+    });
+
+    // Delete button
+    menu.querySelector(".swatch-delete-btn").addEventListener("click", (e) => {
+      e.stopPropagation();
+      if (idx < customColors.length) {
+        customColors.splice(idx, 1);
+        localStorage.setItem("omninote-custom-colors", JSON.stringify(customColors));
+        btn.remove();
+
+        // Re-index remaining custom color swatches
+        document.querySelectorAll(".swatch-dot").forEach(b => {
+          const i = Number(b.dataset.swatchIdx);
+          if (i > idx && i <= customColors.length) {
+            b.dataset.swatchIdx = i - 1;
+            const input = b.querySelector(".swatch-edit-input");
+            if (input) input.dataset.swatchIdx = i - 1;
+          }
+        });
+      }
+      menu.remove();
+      activeSwatchMenu = null;
+    });
+
+    // Close on outside click
+    setTimeout(() => {
+      document.addEventListener("click", function closeMenu(e) {
+        if (!menu.contains(e.target) && e.target !== btn) {
+          menu.remove();
+          activeSwatchMenu = null;
+          document.removeEventListener("click", closeMenu);
+        }
+      });
+    }, 0);
+  }
+
+  // Quick Swatches — single click = use color, hover shows context menu
   document.querySelectorAll(".swatch-dot[data-color]").forEach((btn) => {
+    const idx = Number(btn.dataset.swatchIdx);
+
     // Single click: select this color
     btn.addEventListener("click", (e) => {
       // Don't fire if the hidden input was the target
@@ -1068,33 +2139,18 @@ function bindEditorEvents(note) {
       btn.classList.add("chosen");
     });
 
-    // Double-click: open color picker to change this swatch
-    btn.addEventListener("dblclick", () => {
-      const input = btn.querySelector(".swatch-edit-input");
-      if (input) input.click();
+    // Hover: show context menu for custom colors (not default)
+    let hoverTimeout = null;
+    btn.addEventListener("mouseenter", () => {
+      if (idx < customColors.length) {
+        hoverTimeout = setTimeout(() => {
+          createSwatchContextMenu(btn, idx);
+        }, 400);
+      }
     });
 
-    // Right-click: delete swatch
-    btn.addEventListener("contextmenu", (e) => {
-      e.preventDefault();
-      const idxStr = btn.dataset.swatchIdx;
-      if (!idxStr) return;
-      const idx = Number(idxStr);
-      if (idx < customColors.length) {
-        customColors.splice(idx, 1);
-        localStorage.setItem("omninote-custom-colors", JSON.stringify(customColors));
-        btn.remove();
-        
-        // Re-index remaining custom color swatches
-        document.querySelectorAll(".swatch-dot").forEach(b => {
-          const i = Number(b.dataset.swatchIdx);
-          if (i > idx && i <= customColors.length) {
-            b.dataset.swatchIdx = i - 1;
-            const input = b.querySelector(".swatch-edit-input");
-            if (input) input.dataset.swatchIdx = i - 1;
-          }
-        });
-      }
+    btn.addEventListener("mouseleave", () => {
+      if (hoverTimeout) clearTimeout(hoverTimeout);
     });
 
     // When picker confirms a new color, update the swatch in-place
@@ -1228,10 +2284,28 @@ function bindEditorEvents(note) {
     e.target.value = "";
   });
 
+  // Page Manager (Noteful-style "Select" page grid)
+  document.querySelector("#page-manager-btn")?.addEventListener("click", () => {
+    if (showPageManager) closePageManager();
+    else openPageManager();
+  });
+  bindPageManagerControls();
+  bindPageManagerGrid();
+
   // Keyboard Shortcuts: Cmd+Z, Cmd+Shift+Z, Delete, Cmd+C, Cmd+V
   let clipboard = null;
 
   window.onkeydown = (e) => {
+    // While the Page Manager is open, swallow everything except Escape (which
+    // closes it) so shortcuts can't mutate the hidden editor behind the overlay.
+    if (showPageManager) {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        closePageManager();
+      }
+      return;
+    }
+
     const engine = getActiveCanvasEngine();
     const isEditingText = engine?.canvas.getActiveObject()?.isEditing;
 
@@ -1294,10 +2368,45 @@ function bindEditorEvents(note) {
         engine?.deleteSelected();
       }
     }
+    // Zoom shortcuts. Keep active even while editing text — typing into a
+    // textbox never needs +, -, or 0 from the host keyboard.
+    else if ((e.metaKey || e.ctrlKey) && (e.key === "=" || e.key === "+")) {
+      e.preventDefault();
+      zoomIn();
+    } else if ((e.metaKey || e.ctrlKey) && e.key === "-") {
+      e.preventDefault();
+      zoomOut();
+    } else if ((e.metaKey || e.ctrlKey) && e.key === "0") {
+      e.preventDefault();
+      zoomReset();
+    } else if ((e.metaKey || e.ctrlKey) && e.key === "9") {
+      e.preventDefault();
+      zoomFit("width");
+    } else if ((e.metaKey || e.ctrlKey) && e.key === "8") {
+      e.preventDefault();
+      zoomFit("page");
+    }
   };
 }
 
+/** Fills library card previews from IndexedDB once the grid is in the DOM. */
+async function hydrateThumbnails() {
+  const nodes = document.querySelectorAll("img[data-thumb]");
+  for (const node of nodes) {
+    const assetId = node.dataset.thumb;
+    if (!assetId) continue;
+    try {
+      const url = await getAssetUrl(assetId);
+      if (url) node.src = url;
+    } catch {
+      // Leave the placeholder in place if the asset is missing.
+    }
+  }
+}
+
 function bindLibraryEvents() {
+  hydrateThumbnails();
+
   document.querySelectorAll("[data-open]").forEach((card) => {
     card.addEventListener("click", () => {
       activeId = card.dataset.open;
@@ -1307,12 +2416,16 @@ function bindLibraryEvents() {
 
   // Delete note from library card
   document.querySelectorAll("[data-delete-note]").forEach((btn) => {
-    btn.addEventListener("click", (e) => {
+    btn.addEventListener("click", async (e) => {
       e.stopPropagation();
       const noteId = btn.dataset.deleteNote;
       const targetNote = notes.find((n) => n.id === noteId);
       const title = targetNote?.title || "this notebook";
       if (confirm(`Are you sure you want to delete "${title}"?`)) {
+        // Free the blobs first so a failed write can never orphan them silently.
+        await deleteAssets(collectNoteAssetIds(targetNote));
+        // Close the parsed document; it holds the whole file in worker memory.
+        invalidatePdfDoc(targetNote?.pdfAssetId);
         notes = notes.filter((n) => n.id !== noteId);
         if (activeId === noteId) {
           activeId = notes[0]?.id || null;
@@ -1350,15 +2463,16 @@ function bindLibraryEvents() {
           pageNumber: 1,
           width: 800,
           height: 1130,
-          paperStyle: "lined",
-          pageSize: "a4",
-          thumbnail: null,
-          canvasJson: null,
-          pendingDecomposedData: null,
-        },
-      ],
-    };
-    notes.unshift(newNote);
+        paperStyle: "lined",
+        pageSize: "a4",
+        thumbnail: null,
+        canvasJson: null,
+        pendingDecomposedData: null,
+        tags: [],
+      },
+    ],
+  };
+  notes.unshift(newNote);
     activeId = newNote.id;
     saveNotes();
     render();
@@ -1378,7 +2492,38 @@ function bindLibraryEvents() {
 
     try {
       const buffer = await file.arrayBuffer();
-      const pages = await decomposePdf(buffer, 1.333333);
+
+      // Persist each page's binary assets as soon as it is decomposed instead of
+      // holding every page's background in memory until the document finishes.
+      const pages = await decomposePdf(buffer, 1.333333, async (page) => {
+        const ids = {};
+
+        if (page.backgroundBlob) {
+          ids.backgroundAssetId = `bg-${crypto.randomUUID()}`;
+          await putAsset(ids.backgroundAssetId, page.backgroundBlob);
+        }
+
+        if (page.thumbnailBlob) {
+          ids.thumbnailAssetId = `thumb-${crypto.randomUUID()}`;
+          await putAsset(ids.thumbnailAssetId, page.thumbnailBlob);
+        }
+
+        // Embedded images are often the heaviest part of an export, so they go
+        // to the asset store too rather than inline base64.
+        if (Array.isArray(page.imageObjects)) {
+          for (let i = 0; i < page.imageObjects.length; i++) {
+            const img = page.imageObjects[i];
+            if (img?.src && String(img.src).startsWith("data:")) {
+              const assetId = `img-${crypto.randomUUID()}`;
+              await putAssetFromDataUrl(assetId, img.src);
+              page.imageObjects[i] = { ...img, src: null, assetId };
+            }
+          }
+        }
+
+        // Drop the blobs so nothing binary ends up in localStorage.
+        return { ...page, ...ids, backgroundBlob: undefined, thumbnailBlob: undefined };
+      });
 
       if (pages.length === 0) {
         throw new Error("No pages found in this PDF.");
@@ -1386,23 +2531,33 @@ function bindLibraryEvents() {
 
       const baseName = file.name.replace(/\.pdf$/i, "");
 
+      // Keep the original file. The per-page snapshot taken at import is only
+      // ~1600px, which turns to mush once you zoom in; holding on to the source
+      // lets the visible page be re-rendered from the PDF at the current zoom.
+      const pdfAssetId = `pdf-${crypto.randomUUID()}`;
+      await putAsset(pdfAssetId, file);
+
       // Create ONE notebook containing all decomposed pages with their exact individual sizes
       const newNotebook = {
         id: crypto.randomUUID(),
         title: baseName,
         createdAt: Date.now(),
         isPdf: true,
+        pdfAssetId,
         defaultFont: pages.mostUsedFont || "DM Sans",
         detectedFonts: pages.detectedFonts || [],
         currentPageIndex: 0,
         pages: pages.map((page, idx) => ({
           id: crypto.randomUUID(),
           pageNumber: idx + 1,
+          pdfPageIndex: idx,
           width: page.width, // Exact native PDF page dimensions
           height: page.height,
           paperStyle: "plain",
           pageSize: "custom",
-          thumbnail: page.backgroundDataUrl,
+          thumbnail: null,
+          backgroundAssetId: page.backgroundAssetId || null,
+          thumbnailAssetId: page.thumbnailAssetId || null,
           canvasJson: null,
           pendingDecomposedData: page,
         })),
@@ -1432,4 +2587,5 @@ function escapeHtml(value) {
   }[c]));
 }
 
+disableBrowserZoom();
 render();

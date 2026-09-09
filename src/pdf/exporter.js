@@ -1,5 +1,6 @@
 import { PDFDocument } from "pdf-lib";
-import { StaticCanvas, IText, Path, FabricImage } from "fabric";
+import { StaticCanvas } from "fabric";
+import { getAssetUrl } from "../storage/assets.js";
 
 /**
  * Draws paper template patterns (ruled lines, grid, dots) onto a 2D context.
@@ -60,18 +61,20 @@ function dataUrlToBytes(dataUrl) {
 /**
  * Exports an entire multi-page notebook into a single downloadable PDF document.
  */
-export async function exportNotebookToPdf(note, activeCanvasEngine, onProgress = () => {}) {
+export async function exportNotebookToPdf(note, activeCanvasEngine, onProgress = () => {}, pagesToExport = null) {
   const pdfDoc = await PDFDocument.create();
-  const pages = note.pages && note.pages.length > 0 ? note.pages : [{
+  const allPages = note.pages && note.pages.length > 0 ? note.pages : [{
     width: 800,
     height: 1130,
     paperStyle: "plain",
     canvasJson: null,
   }];
+  const indices = pagesToExport && pagesToExport.length ? pagesToExport.slice() : allPages.map((_, i) => i);
 
-  for (let idx = 0; idx < pages.length; idx++) {
-    const page = pages[idx];
-    onProgress(idx + 1, pages.length);
+  for (let k = 0; k < indices.length; k++) {
+    const idx = indices[k];
+    const page = allPages[idx];
+    onProgress(k + 1, indices.length);
 
     const width = page.width || 800;
     const height = page.height || 1130;
@@ -91,34 +94,50 @@ export async function exportNotebookToPdf(note, activeCanvasEngine, onProgress =
     const ctx = offscreen.getContext("2d");
     ctx.scale(scale, scale);
 
-    // Draw background paper template
-    drawPaperPattern(ctx, width, height, paperStyle);
+    // The imported-page fallback already contains the page's own paper, so it
+    // replaces the template rather than sitting on top of it.
+    const backgroundUrl = page.backgroundAssetId
+      ? await getAssetUrl(page.backgroundAssetId).catch(() => null)
+      : null;
+
+    if (backgroundUrl) {
+      await drawImageToContext(ctx, backgroundUrl, width, height);
+    } else {
+      drawPaperPattern(ctx, width, height, paperStyle);
+    }
 
     // Draw canvas layer
     if (idx === note.currentPageIndex && activeCanvasEngine) {
-      // Current active page
       const contentDataUrl = activeCanvasEngine.canvas.toDataURL({
         format: "png",
         multiplier: scale,
       });
       await drawImageToContext(ctx, contentDataUrl, width, height);
     } else if (page.canvasJson) {
-      // Inactive page with serialized Fabric JSON
+      // Inactive page with serialized Fabric JSON. Note the stored shape is
+      // { width, height, paperStyle, canvasData }; loadFromJSON needs the inner
+      // canvasData, otherwise the page exports blank.
+      const canvasData = page.canvasJson.canvasData || page.canvasJson;
       const staticCanvas = new StaticCanvas(null, { width, height });
-      await staticCanvas.loadFromJSON(page.canvasJson);
+      await staticCanvas.loadFromJSON(canvasData);
       const contentDataUrl = staticCanvas.toDataURL({
         format: "png",
         multiplier: scale,
       });
       staticCanvas.dispose();
       await drawImageToContext(ctx, contentDataUrl, width, height);
-    } else if (page.thumbnail) {
-      await drawImageToContext(ctx, page.thumbnail, width, height);
     }
 
-    const pngDataUrl = offscreen.toDataURL("image/png");
-    const pngBytes = dataUrlToBytes(pngDataUrl);
-    const embeddedImage = await pdfDoc.embedPng(pngBytes);
+    // Photographic page backgrounds compress far better as JPEG; pure line art
+    // stays lossless as PNG.
+    let embeddedImage;
+    if (backgroundUrl) {
+      const jpegBytes = dataUrlToBytes(offscreen.toDataURL("image/jpeg", 0.9));
+      embeddedImage = await pdfDoc.embedJpg(jpegBytes);
+    } else {
+      const pngBytes = dataUrlToBytes(offscreen.toDataURL("image/png"));
+      embeddedImage = await pdfDoc.embedPng(pngBytes);
+    }
 
     pdfPage.drawImage(embeddedImage, {
       x: 0,
@@ -154,4 +173,45 @@ function drawImageToContext(ctx, dataUrl, width, height) {
     img.onerror = () => resolve();
     img.src = dataUrl;
   });
+}
+
+/**
+ * Renders a single page (paper or imported background + ink) to a JPEG data URL
+ * at roughly `targetWidth` CSS pixels. Used by the Page Manager grid, which is
+ * independent of the live Fabric engines so it stays correct even mid-edit.
+ */
+export async function renderPageThumbnail(page, targetWidth = 260) {
+  const width = page.width || 800;
+  const height = page.height || 1130;
+  const paperStyle = page.paperStyle || "plain";
+  const scale = targetWidth / width;
+
+  const out = document.createElement("canvas");
+  out.width = Math.max(1, Math.round(width * scale));
+  out.height = Math.max(1, Math.round(height * scale));
+  const ctx = out.getContext("2d");
+  ctx.scale(scale, scale);
+
+  const backgroundUrl = page.backgroundAssetId
+    ? await getAssetUrl(page.backgroundAssetId).catch(() => null)
+    : null;
+
+  if (backgroundUrl) {
+    await drawImageToContext(ctx, backgroundUrl, width, height);
+  } else {
+    drawPaperPattern(ctx, width, height, paperStyle);
+  }
+
+  const canvasData = page.canvasJson?.canvasData || page.canvasJson;
+  if (canvasData) {
+    const staticCanvas = new StaticCanvas(null, { width, height });
+    await staticCanvas.loadFromJSON(canvasData);
+    // PNG keeps the ink's transparency so the paper underneath shows through
+    // instead of the JPEG's no-alpha black background masking the page.
+    const inkUrl = staticCanvas.toDataURL({ format: "png" });
+    staticCanvas.dispose();
+    await drawImageToContext(ctx, inkUrl, width, height);
+  }
+
+  return out.toDataURL("image/jpeg", 0.7);
 }
