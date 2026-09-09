@@ -760,15 +760,20 @@ export class OmniCanvas {
     if (page.pendingDecomposedData) {
       await this.loadDecomposedPdf(page.pendingDecomposedData);
       delete page.pendingDecomposedData;
+      // Canva-like: when decomposition succeeds, hide the fallback background
+      // so only editable objects are visible
+      this.backgroundVisible = false;
+      this.applyBackground();
     } else if (page.canvasJson) {
       await this.canvas.loadFromJSON(page.canvasJson.canvasData || page.canvasJson);
       this.canvas.requestRenderAll();
     }
 
     // Re-attach after loading, since clear()/loadFromJSON() drop the background.
-    if (page.backgroundAssetId) {
+    // Only load background for pages WITHOUT decomposed data (pure Level A fallback)
+    if (!page.pendingDecomposedData && page.backgroundAssetId) {
       await this.loadBackgroundAsset(page.backgroundAssetId);
-    } else {
+    } else if (!page.pendingDecomposedData) {
       this.applyBackground();
     }
 

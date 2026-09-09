@@ -53,7 +53,8 @@ let currentWidth = 4;
 let currentPenStyle = "ballpoint";
 let customColors = [];
 try {
-  customColors = JSON.parse(localStorage.getItem("omninote-custom-colors")) || [];
+  customColors =
+    JSON.parse(localStorage.getItem("omninote-custom-colors")) || [];
 } catch {}
 let isLoading = false;
 let loadingMessage = "";
@@ -103,7 +104,10 @@ function normalizeNote(n) {
       },
     ];
   }
-  if (n.currentPageIndex === undefined || n.currentPageIndex >= n.pages.length) {
+  if (
+    n.currentPageIndex === undefined ||
+    n.currentPageIndex >= n.pages.length
+  ) {
     n.currentPageIndex = 0;
   }
   if (!n.defaultFont) {
@@ -341,7 +345,9 @@ function disableBrowserZoom() {
 
   // Safari uses real gesture events for a pinch and bypasses wheel entirely.
   for (const type of ["gesturestart", "gesturechange", "gestureend"]) {
-    window.addEventListener(type, (e) => e.preventDefault(), { passive: false });
+    window.addEventListener(type, (e) => e.preventDefault(), {
+      passive: false,
+    });
   }
 
   // Two-finger pinch on a touchscreen.
@@ -357,7 +363,13 @@ function disableBrowserZoom() {
   // Cmd/Ctrl +/-/0 shortcuts are separate listeners and still fire.
   window.addEventListener("keydown", (e) => {
     if (!(e.ctrlKey || e.metaKey)) return;
-    if (e.key === "+" || e.key === "=" || e.key === "-" || e.key === "_" || e.key === "0") {
+    if (
+      e.key === "+" ||
+      e.key === "=" ||
+      e.key === "-" ||
+      e.key === "_" ||
+      e.key === "0"
+    ) {
       e.preventDefault();
     }
   });
@@ -366,11 +378,17 @@ function disableBrowserZoom() {
   // pinch-zoom the document at all.
   const meta = document.querySelector('meta[name="viewport"]');
   if (meta) {
-    meta.setAttribute("content", "width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no");
+    meta.setAttribute(
+      "content",
+      "width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no",
+    );
   }
 }
 
-function setZoom(zoom, { reset = false, resetPan = true, force = false, preview = false } = {}) {
+function setZoom(
+  zoom,
+  { reset = false, resetPan = true, force = false, preview = false } = {},
+) {
   if (zoomLocked && !force) return;
   const next = reset ? 1 : Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, zoom));
   // A pinch holds one anchor for the whole gesture; everything else measures
@@ -417,7 +435,9 @@ function attachZoomWindow() {
   const note = getActiveNote();
   if (!note) return;
   const engine = getActiveCanvasEngine();
-  const pageEl = document.querySelector(`#page-wrapper-${note.currentPageIndex}`);
+  const pageEl = document.querySelector(
+    `#page-wrapper-${note.currentPageIndex}`,
+  );
   if (!engine || !pageEl) return;
   zoomWindow.attach(engine, pageEl);
 }
@@ -445,9 +465,15 @@ function toggleZoomWindow(force) {
   document.querySelector("#zw-toggle")?.classList.toggle("is-active", next);
 }
 
-function zoomIn() { setZoom(currentZoom * ZOOM_STEP); }
-function zoomOut() { setZoom(currentZoom / ZOOM_STEP); }
-function zoomReset() { setZoom(1, { reset: true }); }
+function zoomIn() {
+  setZoom(currentZoom * ZOOM_STEP);
+}
+function zoomOut() {
+  setZoom(currentZoom / ZOOM_STEP);
+}
+function zoomReset() {
+  setZoom(1, { reset: true });
+}
 
 /**
  * Usable drawing area inside the scroll viewport, excluding its padding.
@@ -457,8 +483,12 @@ function getAvailableViewport() {
   const container = document.querySelector("#canvas-scroll-container");
   if (!container) return null;
   const style = getComputedStyle(container);
-  const padX = (parseFloat(style.paddingLeft) || 0) + (parseFloat(style.paddingRight) || 0);
-  const padY = (parseFloat(style.paddingTop) || 0) + (parseFloat(style.paddingBottom) || 0);
+  const padX =
+    (parseFloat(style.paddingLeft) || 0) +
+    (parseFloat(style.paddingRight) || 0);
+  const padY =
+    (parseFloat(style.paddingTop) || 0) +
+    (parseFloat(style.paddingBottom) || 0);
   return {
     width: container.clientWidth - padX,
     height: container.clientHeight - padY,
@@ -475,7 +505,9 @@ function zoomFit(mode = "width") {
   if (!engine || !avail || !engine.width || !engine.height) return;
   const ratioW = avail.width / engine.width;
   const ratioH = avail.height / engine.height;
-  setZoom(mode === "page" ? Math.min(ratioW, ratioH) : ratioW, { resetPan: true });
+  setZoom(mode === "page" ? Math.min(ratioW, ratioH) : ratioW, {
+    resetPan: true,
+  });
 }
 
 // Crisp, professional SVG icons
@@ -640,7 +672,8 @@ function noteCard(note) {
   const pageCount = note.pages?.length || 1;
   const thumbAssetId = firstPage?.thumbnailAssetId || note.thumbnailAssetId;
   // Legacy notes may still carry an inline dataURL thumbnail.
-  const legacyThumb = typeof firstPage?.thumbnail === "string" ? firstPage.thumbnail : null;
+  const legacyThumb =
+    typeof firstPage?.thumbnail === "string" ? firstPage.thumbnail : null;
 
   let thumbMarkup = `<span style="font-size: 28px; opacity: 0.3;">✦</span>`;
   if (thumbAssetId) {
@@ -703,8 +736,13 @@ function renderFontOptions(note) {
   }
   html += `</optgroup>`;
 
-  if (!detected.includes(selectedFont) && !STANDARD_FONTS.includes(selectedFont)) {
-    html = `<option value="${escapeHtml(selectedFont)}" selected>${escapeHtml(selectedFont)}</option>` + html;
+  if (
+    !detected.includes(selectedFont) &&
+    !STANDARD_FONTS.includes(selectedFont)
+  ) {
+    html =
+      `<option value="${escapeHtml(selectedFont)}" selected>${escapeHtml(selectedFont)}</option>` +
+      html;
   }
 
   return html;
@@ -712,7 +750,7 @@ function renderFontOptions(note) {
 
 function updateFontToolbarState(selected) {
   const textObj = selected?.find(
-    (o) => o.type === "i-text" || o.text !== undefined
+    (o) => o.type === "i-text" || o.text !== undefined,
   );
 
   const engine = getActiveCanvasEngine();
@@ -739,7 +777,9 @@ function updateFontToolbarState(selected) {
   if (textObj) {
     const font = textObj.fontFamily || engine?.currentFont || "DM Sans";
     if (fontSelect) {
-      const exists = Array.from(fontSelect.options).some((o) => o.value === font);
+      const exists = Array.from(fontSelect.options).some(
+        (o) => o.value === font,
+      );
       if (!exists) {
         fontSelect.add(new Option(font, font, true, true));
       }
@@ -776,11 +816,11 @@ function updateFontToolbarState(selected) {
 function editorView(note) {
   const defaultColors = ["#176a72"];
   const allColors = Array.from(new Set([...customColors, ...defaultColors]));
-  
+
   const page = getCurrentPage();
   const pageIndex = note.currentPageIndex || 0;
   const totalPages = note.pages.length;
-  
+
   const engine = getActiveCanvasEngine();
 
   return `
@@ -854,16 +894,16 @@ function editorView(note) {
           <div class="page-setup-row">
             <label>Paper Template</label>
             <div class="paper-style-grid" id="paper-style-grid">
-              <button class="paper-btn ${page.paperStyle === 'plain' ? 'active' : ''}" data-paper="plain" title="Plain White">
+              <button class="paper-btn ${page.paperStyle === "plain" ? "active" : ""}" data-paper="plain" title="Plain White">
                 <div class="paper-preview p-plain"></div>
               </button>
-              <button class="paper-btn ${page.paperStyle === 'lined' ? 'active' : ''}" data-paper="lined" title="Ruled / Lined">
+              <button class="paper-btn ${page.paperStyle === "lined" ? "active" : ""}" data-paper="lined" title="Ruled / Lined">
                 <div class="paper-preview p-lined"></div>
               </button>
-              <button class="paper-btn ${page.paperStyle === 'grid' ? 'active' : ''}" data-paper="grid" title="Graph Grid">
+              <button class="paper-btn ${page.paperStyle === "grid" ? "active" : ""}" data-paper="grid" title="Graph Grid">
                 <div class="paper-preview p-grid"></div>
               </button>
-              <button class="paper-btn ${page.paperStyle === 'dotted' ? 'active' : ''}" data-paper="dotted" title="Dotted">
+              <button class="paper-btn ${page.paperStyle === "dotted" ? "active" : ""}" data-paper="dotted" title="Dotted">
                 <div class="paper-preview p-dotted"></div>
               </button>
             </div>
@@ -955,7 +995,7 @@ function editorView(note) {
               <label class="swatch-dot ${c === currentColor ? "chosen" : ""}" data-color="${c}" data-swatch-idx="${idx}" style="--swatch:${c}" title="Click to use, double-click to change, Right-click to delete">
                 <input type="color" class="swatch-edit-input" value="${c}" data-swatch-idx="${idx}" />
               </label>
-            `
+            `,
               )
               .join("")}
             <div style="position:relative">
@@ -973,7 +1013,7 @@ function editorView(note) {
             <div class="page-container" id="page-wrapper-${i}" data-index="${i}">
               <canvas id="omni-canvas-${i}"></canvas>
             </div>
-          `
+          `,
             )
             .join("")}
         </section>
@@ -1024,9 +1064,10 @@ function pageManagerTilesHtml(note) {
       const thumbEl = thumb
         ? `<img class="pm-thumb" src="${thumb}" alt="Page ${i + 1}" draggable="false" />`
         : `<div class="pm-thumb pm-thumb-empty"></div>`;
-      const tags = Array.isArray(p.tags) && p.tags.length
-        ? `<span class="pm-tags">${p.tags.map((t) => `<span class="pm-tag">${escapeHtml(t)}</span>`).join("")}</span>`
-        : "";
+      const tags =
+        Array.isArray(p.tags) && p.tags.length
+          ? `<span class="pm-tags">${p.tags.map((t) => `<span class="pm-tag">${escapeHtml(t)}</span>`).join("")}</span>`
+          : "";
       return `
         <div class="pm-cell">
           <span class="pm-num">Page ${i + 1}</span>
@@ -1083,11 +1124,21 @@ function updatePageManagerSelectionUI() {
   const sub = document.querySelector(".pm-sub");
   if (sub) {
     sub.textContent = `${note.pages.length} page${note.pages.length !== 1 ? "s" : ""}${
-      pageManagerSelection.size ? ` · ${pageManagerSelection.size} selected` : ""
+      pageManagerSelection.size
+        ? ` · ${pageManagerSelection.size} selected`
+        : ""
     }`;
   }
   const hasSel = pageManagerSelection.size > 0;
-  ["pm-rotate", "pm-delete", "pm-extract", "pm-share", "pm-copy", "pm-cut", "pm-tag"].forEach((id) => {
+  [
+    "pm-rotate",
+    "pm-delete",
+    "pm-extract",
+    "pm-share",
+    "pm-copy",
+    "pm-cut",
+    "pm-tag",
+  ].forEach((id) => {
     const b = document.querySelector("#" + id);
     if (b) b.disabled = !hasSel;
   });
@@ -1114,7 +1165,9 @@ function bindPageManagerGrid() {
 }
 
 function bindPageManagerControls() {
-  document.querySelector("#pm-close")?.addEventListener("click", closePageManager);
+  document
+    .querySelector("#pm-close")
+    ?.addEventListener("click", closePageManager);
   document.querySelector("#pm-select-all")?.addEventListener("click", () => {
     const note = getActiveNote();
     pageManagerSelection = new Set(note.pages.map((_, i) => i));
@@ -1181,9 +1234,12 @@ function clonePageForExtract(page) {
     backgroundAssetId: page.backgroundAssetId || null,
     thumbnailAssetId: null,
     tags: Array.isArray(page.tags) ? page.tags.slice() : [],
-    canvasJson: page.canvasJson ? JSON.parse(JSON.stringify(page.canvasJson)) : null,
+    canvasJson: page.canvasJson
+      ? JSON.parse(JSON.stringify(page.canvasJson))
+      : null,
     pendingDecomposedData: null,
-    pdfPageIndex: typeof page.pdfPageIndex === "number" ? page.pdfPageIndex : null,
+    pdfPageIndex:
+      typeof page.pdfPageIndex === "number" ? page.pdfPageIndex : null,
   };
 }
 
@@ -1210,8 +1266,12 @@ async function rotateEnginePage90(engine, page) {
   const newW = oldH;
   const newH = oldW;
   canvas.discardActiveObject();
-  canvas.getObjects().slice().forEach((o) => rotateObjectAbout(o, oldW, oldH, newW, newH));
-  if (canvas.backgroundImage) rotateObjectAbout(canvas.backgroundImage, oldW, oldH, newW, newH);
+  canvas
+    .getObjects()
+    .slice()
+    .forEach((o) => rotateObjectAbout(o, oldW, oldH, newW, newH));
+  if (canvas.backgroundImage)
+    rotateObjectAbout(canvas.backgroundImage, oldW, oldH, newW, newH);
   engine.width = newW;
   engine.height = newH;
   page.width = newW;
@@ -1229,7 +1289,9 @@ async function rotateEnginePage90(engine, page) {
 async function pmInsert() {
   const note = getActiveNote();
   if (!note.pages.length) return;
-  const idx = pageManagerSelection.size ? Math.max(...pageManagerSelection) : note.currentPageIndex;
+  const idx = pageManagerSelection.size
+    ? Math.max(...pageManagerSelection)
+    : note.currentPageIndex;
   const ref = note.pages[Math.min(idx, note.pages.length - 1)] || note.pages[0];
   note.pages.splice(idx + 1, 0, {
     id: crypto.randomUUID(),
@@ -1252,7 +1314,12 @@ async function pmInsert() {
 async function pmDelete() {
   const note = getActiveNote();
   if (note.pages.length <= 1) return;
-  if (!confirm(`Delete ${pageManagerSelection.size} selected page(s)? This cannot be undone.`)) return;
+  if (
+    !confirm(
+      `Delete ${pageManagerSelection.size} selected page(s)? This cannot be undone.`,
+    )
+  )
+    return;
   const indices = Array.from(pageManagerSelection).sort((a, b) => b - a);
   for (const i of indices) {
     if (note.pages.length <= 1) break;
@@ -1264,10 +1331,13 @@ async function pmDelete() {
       if (p.thumbnailAssetId) remainingIds.add(p.thumbnailAssetId);
       if (p.pdfAssetId) remainingIds.add(p.pdfAssetId);
     }
-    const ids = collectPageAssetIds(removed).filter((id) => id && !remainingIds.has(id));
+    const ids = collectPageAssetIds(removed).filter(
+      (id) => id && !remainingIds.has(id),
+    );
     if (ids.length) await deleteAssets(ids);
   }
-  if (note.currentPageIndex >= note.pages.length) note.currentPageIndex = note.pages.length - 1;
+  if (note.currentPageIndex >= note.pages.length)
+    note.currentPageIndex = note.pages.length - 1;
   pageManagerSelection = new Set();
   saveNotes();
   await regeneratePageManagerThumbs();
@@ -1327,10 +1397,15 @@ async function pmShare() {
   loadingMessage = "Exporting selected pages...";
   renderLoading();
   try {
-    await exportNotebookToPdf(note, getActiveCanvasEngine(), (curr, total) => {
-      loadingMessage = `Exporting page ${curr} of ${total}...`;
-      renderLoading();
-    }, indices);
+    await exportNotebookToPdf(
+      note,
+      getActiveCanvasEngine(),
+      (curr, total) => {
+        loadingMessage = `Exporting page ${curr} of ${total}...`;
+        renderLoading();
+      },
+      indices,
+    );
   } catch (err) {
     alert("Export failed: " + err.message);
     console.error(err);
@@ -1355,8 +1430,11 @@ function clonePageData(page) {
     backgroundAssetId: page.backgroundAssetId || null,
     thumbnailAssetId: page.thumbnailAssetId || null,
     pdfAssetId: page.pdfAssetId || null,
-    pdfPageIndex: typeof page.pdfPageIndex === "number" ? page.pdfPageIndex : null,
-    canvasJson: page.canvasJson ? JSON.parse(JSON.stringify(page.canvasJson)) : null,
+    pdfPageIndex:
+      typeof page.pdfPageIndex === "number" ? page.pdfPageIndex : null,
+    canvasJson: page.canvasJson
+      ? JSON.parse(JSON.stringify(page.canvasJson))
+      : null,
     pendingDecomposedData: null,
     tags: Array.isArray(page.tags) ? page.tags.slice() : [],
   };
@@ -1392,7 +1470,8 @@ async function pmCut() {
     note.pages.splice(i, 1);
   }
   pageClipboard = clones;
-  if (note.currentPageIndex >= note.pages.length) note.currentPageIndex = note.pages.length - 1;
+  if (note.currentPageIndex >= note.pages.length)
+    note.currentPageIndex = note.pages.length - 1;
   pageManagerSelection = new Set();
   saveNotes();
   await regeneratePageManagerThumbs();
@@ -1404,7 +1483,9 @@ async function pmPaste() {
   const note = getActiveNote();
   if (!pageClipboard.length) return;
   const clones = pageClipboard.map((p) => clonePageData(p));
-  const target = pageManagerSelection.size ? Math.max(...pageManagerSelection) : note.pages.length - 1;
+  const target = pageManagerSelection.size
+    ? Math.max(...pageManagerSelection)
+    : note.pages.length - 1;
   note.pages.splice(target + 1, 0, ...clones);
   pageManagerSelection = new Set();
   saveNotes();
@@ -1429,7 +1510,7 @@ function pmTag() {
 
 async function initEditor(note) {
   if (canvasEngines && canvasEngines.length > 0) {
-    canvasEngines.forEach(e => e.destroy());
+    canvasEngines.forEach((e) => e.destroy());
     canvasEngines = [];
   }
 
@@ -1484,22 +1565,34 @@ async function initEditor(note) {
     await engine.loadPage(page);
 
     // Initial welcome text on first page
-    if (i === 0 && note.id === "welcome-note" && !page.canvasJson && !page.pendingDecomposedData) {
+    if (
+      i === 0 &&
+      note.id === "welcome-note" &&
+      !page.canvasJson &&
+      !page.pendingDecomposedData
+    ) {
       engine.addTextAt("Welcome to OmniNote", 100, 100);
-      engine.addTextAt("Import any PDF using 'Import PDF' to edit text, images, and strokes!", 100, 170);
+      engine.addTextAt(
+        "Import any PDF using 'Import PDF' to edit text, images, and strokes!",
+        100,
+        170,
+      );
       engine.setTool("select");
       const json = engine.toJSON();
       page.canvasJson = json;
       saveNotes();
     }
-    
+
     engine.zoomLocked = zoomLocked;
 
     // Only pages near the viewport render at full quality; the rest are held
     // at 100% until scrolled to.
     engine.isActivePage = Math.abs(i - note.currentPageIndex) <= 1;
     if (note.pdfAssetId && Number.isInteger(page.pdfPageIndex)) {
-      engine.setPdfBackgroundSource({ assetId: note.pdfAssetId, pageIndex: page.pdfPageIndex });
+      engine.setPdfBackgroundSource({
+        assetId: note.pdfAssetId,
+        pageIndex: page.pdfPageIndex,
+      });
     }
 
     canvasEngines.push(engine);
@@ -1519,37 +1612,48 @@ async function initEditor(note) {
   // Set up scroll observer to update active page index
   const scrollContainer = document.querySelector("#canvas-scroll-container");
   if (scrollContainer) {
-    const observer = new IntersectionObserver((entries) => {
-      let maxRatio = 0;
-      let mostVisibleIndex = note.currentPageIndex;
-      entries.forEach(entry => {
-        if (entry.isIntersecting && entry.intersectionRatio > maxRatio) {
-          maxRatio = entry.intersectionRatio;
-          mostVisibleIndex = Number(entry.target.dataset.index);
+    const observer = new IntersectionObserver(
+      (entries) => {
+        let maxRatio = 0;
+        let mostVisibleIndex = note.currentPageIndex;
+        entries.forEach((entry) => {
+          if (entry.isIntersecting && entry.intersectionRatio > maxRatio) {
+            maxRatio = entry.intersectionRatio;
+            mostVisibleIndex = Number(entry.target.dataset.index);
+          }
+        });
+        if (mostVisibleIndex !== note.currentPageIndex) {
+          note.currentPageIndex = mostVisibleIndex;
+          document.querySelector(".page-counter-text").textContent =
+            `Page ${note.currentPageIndex + 1} of ${note.pages.length}`;
+          // Update nav buttons disabled state
+          const prevBtn = document.querySelector("#prev-page-btn");
+          const nextBtn = document.querySelector("#next-page-btn");
+          if (prevBtn) prevBtn.disabled = note.currentPageIndex === 0;
+          if (nextBtn)
+            nextBtn.disabled = note.currentPageIndex === note.pages.length - 1;
+          // Full-quality rendering (and PDF re-rasterization) follows the viewport.
+          canvasEngines.forEach((eng, idx) =>
+            eng.setActivePage(Math.abs(idx - mostVisibleIndex) <= 1),
+          );
+          attachZoomWindow();
+          saveNotes();
         }
-      });
-      if (mostVisibleIndex !== note.currentPageIndex) {
-        note.currentPageIndex = mostVisibleIndex;
-        document.querySelector(".page-counter-text").textContent = `Page ${note.currentPageIndex + 1} of ${note.pages.length}`;
-        // Update nav buttons disabled state
-        const prevBtn = document.querySelector("#prev-page-btn");
-        const nextBtn = document.querySelector("#next-page-btn");
-        if (prevBtn) prevBtn.disabled = note.currentPageIndex === 0;
-        if (nextBtn) nextBtn.disabled = note.currentPageIndex === note.pages.length - 1;
-        // Full-quality rendering (and PDF re-rasterization) follows the viewport.
-        canvasEngines.forEach((eng, idx) => eng.setActivePage(Math.abs(idx - mostVisibleIndex) <= 1));
-        attachZoomWindow();
-        saveNotes();
-      }
-    }, {
-      root: scrollContainer,
-      threshold: [0.1, 0.5, 0.9]
-    });
+      },
+      {
+        root: scrollContainer,
+        threshold: [0.1, 0.5, 0.9],
+      },
+    );
 
-    document.querySelectorAll(".page-container").forEach(el => observer.observe(el));
+    document
+      .querySelectorAll(".page-container")
+      .forEach((el) => observer.observe(el));
 
     // Scroll to the active page on load
-    const activeWrapper = document.querySelector(`#page-wrapper-${note.currentPageIndex}`);
+    const activeWrapper = document.querySelector(
+      `#page-wrapper-${note.currentPageIndex}`,
+    );
     if (activeWrapper) {
       activeWrapper.scrollIntoView();
     }
@@ -1643,14 +1747,28 @@ function bindEditorEvents(note) {
   // Zoom controls
   document.querySelector("#zoom-in-btn")?.addEventListener("click", zoomIn);
   document.querySelector("#zoom-out-btn")?.addEventListener("click", zoomOut);
-  document.querySelector("#zoom-reset-btn")?.addEventListener("click", zoomReset);
+  document
+    .querySelector("#zoom-reset-btn")
+    ?.addEventListener("click", zoomReset);
 
-  document.querySelector("#zoom-fit-width-btn")?.addEventListener("click", () => zoomFit("width"));
-  document.querySelector("#zoom-fit-page-btn")?.addEventListener("click", () => zoomFit("page"));
-  document.querySelector("#zoom-lock-btn")?.addEventListener("click", toggleZoomLock);
-  document.querySelector("#zw-toggle")?.addEventListener("click", () => toggleZoomWindow());
-  document.querySelector("#zw-close")?.addEventListener("click", () => toggleZoomWindow(false));
-  document.querySelector("#zw-down")?.addEventListener("click", () => zoomWindow?.nextLine());
+  document
+    .querySelector("#zoom-fit-width-btn")
+    ?.addEventListener("click", () => zoomFit("width"));
+  document
+    .querySelector("#zoom-fit-page-btn")
+    ?.addEventListener("click", () => zoomFit("page"));
+  document
+    .querySelector("#zoom-lock-btn")
+    ?.addEventListener("click", toggleZoomLock);
+  document
+    .querySelector("#zw-toggle")
+    ?.addEventListener("click", () => toggleZoomWindow());
+  document
+    .querySelector("#zw-close")
+    ?.addEventListener("click", () => toggleZoomWindow(false));
+  document
+    .querySelector("#zw-down")
+    ?.addEventListener("click", () => zoomWindow?.nextLine());
   document.querySelector("#zw-right")?.addEventListener("click", () => {
     if (zoomWindow) zoomWindow.nudge(zoomWindow.box.w * 0.25);
   });
@@ -1659,23 +1777,27 @@ function bindEditorEvents(note) {
   });
 
   // Alt/Option + click on the page drops the zoom window's target box there.
-  document.querySelector("#canvas-scroll-container")?.addEventListener("click", (e) => {
-    if (!zoomWindow?.visible || !e.altKey) return;
-    const engine = getActiveCanvasEngine();
-    if (!engine?.canvas.upperCanvasEl) return;
-    const rect = engine.canvas.upperCanvasEl.getBoundingClientRect();
-    const z = engine.currentZoom;
-    zoomWindow.moveTo(
-      (e.clientX - rect.left - engine.panX) / z,
-      (e.clientY - rect.top - engine.panY) / z,
-    );
-  });
+  document
+    .querySelector("#canvas-scroll-container")
+    ?.addEventListener("click", (e) => {
+      if (!zoomWindow?.visible || !e.altKey) return;
+      const engine = getActiveCanvasEngine();
+      if (!engine?.canvas.upperCanvasEl) return;
+      const rect = engine.canvas.upperCanvasEl.getBoundingClientRect();
+      const z = engine.currentZoom;
+      zoomWindow.moveTo(
+        (e.clientX - rect.left - engine.panX) / z,
+        (e.clientY - rect.top - engine.panY) / z,
+      );
+    });
 
   // Slider: `input` fires continuously while dragging, so zoom tracks the drag.
   // Same deal as a pinch — preview cheaply while it moves, re-render crisp on
   // release — otherwise every notch reallocates and repaints all the canvases.
   const zoomSlider = document.querySelector("#zoom-slider");
-  zoomSlider?.addEventListener("pointerdown", () => beginZoomGesture(null, null));
+  zoomSlider?.addEventListener("pointerdown", () =>
+    beginZoomGesture(null, null),
+  );
   zoomSlider?.addEventListener("input", (e) => {
     setZoom(Number(e.target.value) / 100, { preview: true });
   });
@@ -1713,15 +1835,19 @@ function bindEditorEvents(note) {
   // Page Navigation
   document.querySelector("#prev-page-btn")?.addEventListener("click", () => {
     if (note.currentPageIndex > 0) {
-      const target = document.querySelector(`#page-wrapper-${note.currentPageIndex - 1}`);
-      if (target) target.scrollIntoView({ behavior: 'smooth' });
+      const target = document.querySelector(
+        `#page-wrapper-${note.currentPageIndex - 1}`,
+      );
+      if (target) target.scrollIntoView({ behavior: "smooth" });
     }
   });
 
   document.querySelector("#next-page-btn")?.addEventListener("click", () => {
     if (note.currentPageIndex < note.pages.length - 1) {
-      const target = document.querySelector(`#page-wrapper-${note.currentPageIndex + 1}`);
-      if (target) target.scrollIntoView({ behavior: 'smooth' });
+      const target = document.querySelector(
+        `#page-wrapper-${note.currentPageIndex + 1}`,
+      );
+      if (target) target.scrollIntoView({ behavior: "smooth" });
     }
   });
 
@@ -1745,26 +1871,30 @@ function bindEditorEvents(note) {
     render();
   });
 
-  document.querySelector("#delete-page-btn")?.addEventListener("click", async () => {
-    if (note.pages.length <= 1) return;
-    if (confirm(`Delete Page ${note.currentPageIndex + 1}?`)) {
-      const [removed] = note.pages.splice(note.currentPageIndex, 1);
-      await deleteAssets(collectPageAssetIds(removed));
-      if (note.currentPageIndex >= note.pages.length) {
-        note.currentPageIndex = note.pages.length - 1;
+  document
+    .querySelector("#delete-page-btn")
+    ?.addEventListener("click", async () => {
+      if (note.pages.length <= 1) return;
+      if (confirm(`Delete Page ${note.currentPageIndex + 1}?`)) {
+        const [removed] = note.pages.splice(note.currentPageIndex, 1);
+        await deleteAssets(collectPageAssetIds(removed));
+        if (note.currentPageIndex >= note.pages.length) {
+          note.currentPageIndex = note.pages.length - 1;
+        }
+        saveNotes();
+        render();
       }
-      saveNotes();
-      render();
-    }
-  });
+    });
 
   // Page Setup Toggle
-  document.querySelector("#page-setup-toggle-btn")?.addEventListener("click", (e) => {
-    e.stopPropagation();
-    showPageSetup = !showPageSetup;
-    const modal = document.querySelector("#page-setup-modal");
-    if (modal) modal.style.display = showPageSetup ? "flex" : "none";
-  });
+  document
+    .querySelector("#page-setup-toggle-btn")
+    ?.addEventListener("click", (e) => {
+      e.stopPropagation();
+      showPageSetup = !showPageSetup;
+      const modal = document.querySelector("#page-setup-modal");
+      if (modal) modal.style.display = showPageSetup ? "flex" : "none";
+    });
 
   // Page Template Selection
   document.querySelectorAll(".paper-btn").forEach((btn) => {
@@ -1775,37 +1905,44 @@ function bindEditorEvents(note) {
         page.paperStyle = btn.dataset.paper;
         engine.setPaperStyle(page.paperStyle);
         saveActiveCanvasPage();
-        
-        document.querySelectorAll(".paper-btn").forEach(b => b.classList.remove("active"));
+
+        document
+          .querySelectorAll(".paper-btn")
+          .forEach((b) => b.classList.remove("active"));
         btn.classList.add("active");
       }
     });
   });
 
   // Page Size Selection
-  document.querySelector("#page-size-select")?.addEventListener("change", (e) => {
-    const page = getCurrentPage();
-    const engine = getActiveCanvasEngine();
-    const sizeConfig = PAGE_SIZES[e.target.value];
-    if (page && sizeConfig && engine) {
-      page.width = sizeConfig.width;
-      page.height = sizeConfig.height;
-      engine.setPageDimensions(sizeConfig.width, sizeConfig.height);
-      saveActiveCanvasPage();
-      const setupBtn = document.querySelector("#page-setup-toggle-btn span");
-      if (setupBtn) setupBtn.textContent = `Page Style (${page.width} × ${page.height})`;
-    }
-  });
+  document
+    .querySelector("#page-size-select")
+    ?.addEventListener("change", (e) => {
+      const page = getCurrentPage();
+      const engine = getActiveCanvasEngine();
+      const sizeConfig = PAGE_SIZES[e.target.value];
+      if (page && sizeConfig && engine) {
+        page.width = sizeConfig.width;
+        page.height = sizeConfig.height;
+        engine.setPageDimensions(sizeConfig.width, sizeConfig.height);
+        saveActiveCanvasPage();
+        const setupBtn = document.querySelector("#page-setup-toggle-btn span");
+        if (setupBtn)
+          setupBtn.textContent = `Page Style (${page.width} × ${page.height})`;
+      }
+    });
 
   // Font Family Selection
-  document.querySelector("#font-family-select")?.addEventListener("change", (e) => {
-    const newFont = e.target.value;
-    const engine = getActiveCanvasEngine();
-    if (engine) {
-      engine.setFontFamily(newFont);
-      saveActiveCanvasPage();
-    }
-  });
+  document
+    .querySelector("#font-family-select")
+    ?.addEventListener("change", (e) => {
+      const newFont = e.target.value;
+      const engine = getActiveCanvasEngine();
+      if (engine) {
+        engine.setFontFamily(newFont);
+        saveActiveCanvasPage();
+      }
+    });
 
   // Font Size Selection
   document.querySelector("#font-size-dec")?.addEventListener("click", () => {
@@ -1833,7 +1970,9 @@ function bindEditorEvents(note) {
     const engine = getActiveCanvasEngine();
     if (!engine) return;
     const isBold = engine.toggleBold();
-    document.querySelector("#font-bold-btn")?.classList.toggle("active", isBold);
+    document
+      .querySelector("#font-bold-btn")
+      ?.classList.toggle("active", isBold);
     saveActiveCanvasPage();
   });
 
@@ -1842,48 +1981,64 @@ function bindEditorEvents(note) {
     const engine = getActiveCanvasEngine();
     if (!engine) return;
     const isItalic = engine.toggleItalic();
-    document.querySelector("#font-italic-btn")?.classList.toggle("active", isItalic);
+    document
+      .querySelector("#font-italic-btn")
+      ?.classList.toggle("active", isItalic);
     saveActiveCanvasPage();
   });
 
   // Font Underline Toggle
-  document.querySelector("#font-underline-btn")?.addEventListener("click", () => {
-    const engine = getActiveCanvasEngine();
-    if (!engine) return;
-    const isUnderline = engine.toggleUnderline();
-    document.querySelector("#font-underline-btn")?.classList.toggle("active", isUnderline);
-    saveActiveCanvasPage();
-  });
+  document
+    .querySelector("#font-underline-btn")
+    ?.addEventListener("click", () => {
+      const engine = getActiveCanvasEngine();
+      if (!engine) return;
+      const isUnderline = engine.toggleUnderline();
+      document
+        .querySelector("#font-underline-btn")
+        ?.classList.toggle("active", isUnderline);
+      saveActiveCanvasPage();
+    });
 
   // Font Strikethrough Toggle
-  document.querySelector("#font-strikethrough-btn")?.addEventListener("click", () => {
-    const engine = getActiveCanvasEngine();
-    if (!engine) return;
-    const isStrikethrough = engine.toggleStrikethrough();
-    document.querySelector("#font-strikethrough-btn")?.classList.toggle("active", isStrikethrough);
-    saveActiveCanvasPage();
-  });
+  document
+    .querySelector("#font-strikethrough-btn")
+    ?.addEventListener("click", () => {
+      const engine = getActiveCanvasEngine();
+      if (!engine) return;
+      const isStrikethrough = engine.toggleStrikethrough();
+      document
+        .querySelector("#font-strikethrough-btn")
+        ?.classList.toggle("active", isStrikethrough);
+      saveActiveCanvasPage();
+    });
 
   // Export Multi-Page PDF
-  document.querySelector("#export-pdf-btn")?.addEventListener("click", async () => {
-    saveActiveCanvasPage();
-    isLoading = true;
-    loadingMessage = `Compiling '${note.title}' into PDF...`;
-    renderLoading();
-
-    try {
-      await exportNotebookToPdf(note, getActiveCanvasEngine(), (curr, total) => {
-        loadingMessage = `Exporting page ${curr} of ${total}...`;
-        renderLoading();
-      });
-    } catch (err) {
-      alert("Error exporting PDF: " + err.message);
-      console.error(err);
-    } finally {
-      isLoading = false;
+  document
+    .querySelector("#export-pdf-btn")
+    ?.addEventListener("click", async () => {
+      saveActiveCanvasPage();
+      isLoading = true;
+      loadingMessage = `Compiling '${note.title}' into PDF...`;
       renderLoading();
-    }
-  });
+
+      try {
+        await exportNotebookToPdf(
+          note,
+          getActiveCanvasEngine(),
+          (curr, total) => {
+            loadingMessage = `Exporting page ${curr} of ${total}...`;
+            renderLoading();
+          },
+        );
+      } catch (err) {
+        alert("Error exporting PDF: " + err.message);
+        console.error(err);
+      } finally {
+        isLoading = false;
+        renderLoading();
+      }
+    });
 
   // Helper function to position a flyout relative to its trigger button
   function positionFlyout(flyout, trigger) {
@@ -1938,24 +2093,35 @@ function bindEditorEvents(note) {
       const flyout = document.querySelector("#shapes-flyout");
       if (flyout) flyout.style.display = "none";
       currentTool = "select";
-      canvasEngines.forEach(e => e.setTool("select"));
-      document.querySelectorAll("[data-tool]").forEach((b) => b.classList.remove("selected"));
+      canvasEngines.forEach((e) => e.setTool("select"));
+      document
+        .querySelectorAll("[data-tool]")
+        .forEach((b) => b.classList.remove("selected"));
       document.querySelector('[data-tool="select"]')?.classList.add("selected");
     });
   });
 
   // Close menus on outside click
   document.addEventListener("click", (e) => {
-    if (!e.target.closest("#shapes-flyout") && !e.target.closest("#shapes-btn")) {
+    if (
+      !e.target.closest("#shapes-flyout") &&
+      !e.target.closest("#shapes-btn")
+    ) {
       showShapesFlyout = false;
       const flyout = document.querySelector("#shapes-flyout");
       if (flyout) flyout.style.display = "none";
     }
-    if (!e.target.closest("#pen-styles-flyout") && !e.target.closest("#pen-style-toggle")) {
+    if (
+      !e.target.closest("#pen-styles-flyout") &&
+      !e.target.closest("#pen-style-toggle")
+    ) {
       const penFlyout = document.querySelector("#pen-styles-flyout");
       if (penFlyout) penFlyout.style.display = "none";
     }
-    if (!e.target.closest("#page-setup-modal") && !e.target.closest("#page-setup-toggle-btn")) {
+    if (
+      !e.target.closest("#page-setup-modal") &&
+      !e.target.closest("#page-setup-toggle-btn")
+    ) {
       showPageSetup = false;
       const modal = document.querySelector("#page-setup-modal");
       if (modal) modal.style.display = "none";
@@ -1972,26 +2138,32 @@ function bindEditorEvents(note) {
     }
   });
 
-  document.querySelector("#delete-element-btn")?.addEventListener("click", () => {
-    getActiveCanvasEngine()?.deleteSelected();
-  });
+  document
+    .querySelector("#delete-element-btn")
+    ?.addEventListener("click", () => {
+      getActiveCanvasEngine()?.deleteSelected();
+    });
 
-  document.querySelector("#delete-notebook-btn")?.addEventListener("click", () => {
-    if (confirm(`Are you sure you want to delete "${note.title}"?`)) {
-      notes = notes.filter((n) => n.id !== note.id);
-      activeId = null;
-      saveNotes();
-      render();
-    }
-  });
+  document
+    .querySelector("#delete-notebook-btn")
+    ?.addEventListener("click", () => {
+      if (confirm(`Are you sure you want to delete "${note.title}"?`)) {
+        notes = notes.filter((n) => n.id !== note.id);
+        activeId = null;
+        saveNotes();
+        render();
+      }
+    });
 
   // Tool Selection
   document.querySelectorAll("[data-tool]").forEach((btn) => {
     btn.addEventListener("click", () => {
       currentTool = btn.dataset.tool;
-      canvasEngines.forEach(e => e.setTool(currentTool));
+      canvasEngines.forEach((e) => e.setTool(currentTool));
 
-      document.querySelectorAll("[data-tool]").forEach((b) => b.classList.remove("selected"));
+      document
+        .querySelectorAll("[data-tool]")
+        .forEach((b) => b.classList.remove("selected"));
       btn.classList.add("selected");
 
       // Update font toolbar visibility when switching to/from text tool
@@ -2020,16 +2192,20 @@ function bindEditorEvents(note) {
   document.querySelectorAll("[data-pen-style]").forEach((btn) => {
     btn.addEventListener("click", () => {
       currentPenStyle = btn.dataset.penStyle;
-      canvasEngines.forEach(e => e.setPenStyle(currentPenStyle));
+      canvasEngines.forEach((e) => e.setPenStyle(currentPenStyle));
 
       // Also switch to pen tool
       currentTool = "pen";
-      canvasEngines.forEach(e => e.setTool("pen"));
-      document.querySelectorAll("[data-tool]").forEach((b) => b.classList.remove("selected"));
+      canvasEngines.forEach((e) => e.setTool("pen"));
+      document
+        .querySelectorAll("[data-tool]")
+        .forEach((b) => b.classList.remove("selected"));
       document.querySelector('[data-tool="pen"]')?.classList.add("selected");
 
       // Update active state
-      document.querySelectorAll(".pen-style-opt").forEach(b => b.classList.remove("active"));
+      document
+        .querySelectorAll(".pen-style-opt")
+        .forEach((b) => b.classList.remove("active"));
       btn.classList.add("active");
 
       // Close flyout
@@ -2043,7 +2219,7 @@ function bindEditorEvents(note) {
   if (thicknessSlider) {
     thicknessSlider.addEventListener("input", (e) => {
       currentWidth = Number(e.target.value);
-      canvasEngines.forEach(e => e.setWidth(currentWidth));
+      canvasEngines.forEach((e) => e.setWidth(currentWidth));
       if (thicknessPreview) {
         const size = Math.min(currentWidth, 16);
         thicknessPreview.style.width = size + "px";
@@ -2097,11 +2273,14 @@ function bindEditorEvents(note) {
       e.stopPropagation();
       if (idx < customColors.length) {
         customColors.splice(idx, 1);
-        localStorage.setItem("omninote-custom-colors", JSON.stringify(customColors));
+        localStorage.setItem(
+          "omninote-custom-colors",
+          JSON.stringify(customColors),
+        );
         btn.remove();
 
         // Re-index remaining custom color swatches
-        document.querySelectorAll(".swatch-dot").forEach(b => {
+        document.querySelectorAll(".swatch-dot").forEach((b) => {
           const i = Number(b.dataset.swatchIdx);
           if (i > idx && i <= customColors.length) {
             b.dataset.swatchIdx = i - 1;
@@ -2135,9 +2314,11 @@ function bindEditorEvents(note) {
       // Don't fire if the hidden input was the target
       if (e.target.classList.contains("swatch-edit-input")) return;
       currentColor = btn.dataset.color;
-      canvasEngines.forEach(eng => eng.setColor(currentColor));
+      canvasEngines.forEach((eng) => eng.setColor(currentColor));
       updateThicknessPreview();
-      document.querySelectorAll(".swatch-dot").forEach((b) => b.classList.remove("chosen"));
+      document
+        .querySelectorAll(".swatch-dot")
+        .forEach((b) => b.classList.remove("chosen"));
       btn.classList.add("chosen");
     });
 
@@ -2160,11 +2341,13 @@ function bindEditorEvents(note) {
     if (editInput) {
       editInput.addEventListener("input", (e) => {
         currentColor = e.target.value;
-        canvasEngines.forEach(eng => eng.setColor(currentColor));
+        canvasEngines.forEach((eng) => eng.setColor(currentColor));
         updateThicknessPreview();
         btn.style.setProperty("--swatch", currentColor);
         btn.dataset.color = currentColor;
-        document.querySelectorAll(".swatch-dot").forEach((b) => b.classList.remove("chosen"));
+        document
+          .querySelectorAll(".swatch-dot")
+          .forEach((b) => b.classList.remove("chosen"));
         btn.classList.add("chosen");
       });
       editInput.addEventListener("change", (e) => {
@@ -2172,14 +2355,20 @@ function bindEditorEvents(note) {
         const idx = Number(editInput.dataset.swatchIdx);
         // Update in customColors or replace the default
         const defaultColors = ["#176a72"];
-        const allOld = [...customColors, ...defaultColors.filter(c => !customColors.includes(c))];
+        const allOld = [
+          ...customColors,
+          ...defaultColors.filter((c) => !customColors.includes(c)),
+        ];
         if (idx < allOld.length) {
           if (idx < customColors.length) {
             customColors[idx] = newColor;
           } else {
             customColors.push(newColor);
           }
-          localStorage.setItem("omninote-custom-colors", JSON.stringify(customColors));
+          localStorage.setItem(
+            "omninote-custom-colors",
+            JSON.stringify(customColors),
+          );
         }
       });
     }
@@ -2196,10 +2385,13 @@ function bindEditorEvents(note) {
       const newColor = e.target.value;
       if (!customColors.includes(newColor)) {
         customColors.push(newColor);
-        localStorage.setItem("omninote-custom-colors", JSON.stringify(customColors));
+        localStorage.setItem(
+          "omninote-custom-colors",
+          JSON.stringify(customColors),
+        );
       }
       currentColor = newColor;
-      canvasEngines.forEach(eng => eng.setColor(currentColor));
+      canvasEngines.forEach((eng) => eng.setColor(currentColor));
       updateThicknessPreview();
 
       // Inject swatch into DOM before the + button
@@ -2212,7 +2404,9 @@ function bindEditorEvents(note) {
         const wrapDiv = addColorBtn.parentElement;
         wrapDiv.insertAdjacentHTML("beforebegin", swatchHtml);
 
-        document.querySelectorAll(".swatch-dot").forEach((b) => b.classList.remove("chosen"));
+        document
+          .querySelectorAll(".swatch-dot")
+          .forEach((b) => b.classList.remove("chosen"));
 
         // Bind the new swatch
         const newSwatch = wrapDiv.previousElementSibling;
@@ -2220,9 +2414,11 @@ function bindEditorEvents(note) {
         newSwatch.addEventListener("click", (ev) => {
           if (ev.target.classList.contains("swatch-edit-input")) return;
           currentColor = newSwatch.dataset.color;
-          canvasEngines.forEach(eng => eng.setColor(currentColor));
+          canvasEngines.forEach((eng) => eng.setColor(currentColor));
           updateThicknessPreview();
-          document.querySelectorAll(".swatch-dot").forEach((b) => b.classList.remove("chosen"));
+          document
+            .querySelectorAll(".swatch-dot")
+            .forEach((b) => b.classList.remove("chosen"));
           newSwatch.classList.add("chosen");
         });
         newSwatch.addEventListener("dblclick", () => {
@@ -2236,9 +2432,12 @@ function bindEditorEvents(note) {
           const swIdx = Number(idxStr);
           if (swIdx < customColors.length) {
             customColors.splice(swIdx, 1);
-            localStorage.setItem("omninote-custom-colors", JSON.stringify(customColors));
+            localStorage.setItem(
+              "omninote-custom-colors",
+              JSON.stringify(customColors),
+            );
             newSwatch.remove();
-            document.querySelectorAll(".swatch-dot").forEach(b => {
+            document.querySelectorAll(".swatch-dot").forEach((b) => {
               const i = Number(b.dataset.swatchIdx);
               if (i > swIdx && i <= customColors.length) {
                 b.dataset.swatchIdx = i - 1;
@@ -2252,11 +2451,13 @@ function bindEditorEvents(note) {
         if (editInput) {
           editInput.addEventListener("input", (ev) => {
             currentColor = ev.target.value;
-            canvasEngines.forEach(eng => eng.setColor(currentColor));
+            canvasEngines.forEach((eng) => eng.setColor(currentColor));
             updateThicknessPreview();
             newSwatch.style.setProperty("--swatch", currentColor);
             newSwatch.dataset.color = currentColor;
-            document.querySelectorAll(".swatch-dot").forEach((b) => b.classList.remove("chosen"));
+            document
+              .querySelectorAll(".swatch-dot")
+              .forEach((b) => b.classList.remove("chosen"));
             newSwatch.classList.add("chosen");
           });
           editInput.addEventListener("change", (ev) => {
@@ -2264,7 +2465,10 @@ function bindEditorEvents(note) {
             const swIdx = Number(editInput.dataset.swatchIdx);
             if (swIdx < customColors.length) {
               customColors[swIdx] = updatedColor;
-              localStorage.setItem("omninote-custom-colors", JSON.stringify(customColors));
+              localStorage.setItem(
+                "omninote-custom-colors",
+                JSON.stringify(customColors),
+              );
             }
           });
         }
@@ -2273,18 +2477,24 @@ function bindEditorEvents(note) {
   }
 
   // Insert Image
-  document.querySelector("#image-input")?.addEventListener("change", async (e) => {
-    const file = e.target.files?.[0];
-    const engine = getActiveCanvasEngine();
-    if (file && engine) {
-      await engine.addImageFile(file);
-      currentTool = "select";
-      canvasEngines.forEach(e => e.setTool("select"));
-      document.querySelectorAll("[data-tool]").forEach((b) => b.classList.remove("selected"));
-      document.querySelector('[data-tool="select"]')?.classList.add("selected");
-    }
-    e.target.value = "";
-  });
+  document
+    .querySelector("#image-input")
+    ?.addEventListener("change", async (e) => {
+      const file = e.target.files?.[0];
+      const engine = getActiveCanvasEngine();
+      if (file && engine) {
+        await engine.addImageFile(file);
+        currentTool = "select";
+        canvasEngines.forEach((e) => e.setTool("select"));
+        document
+          .querySelectorAll("[data-tool]")
+          .forEach((b) => b.classList.remove("selected"));
+        document
+          .querySelector('[data-tool="select"]')
+          ?.classList.add("selected");
+      }
+      e.target.value = "";
+    });
 
   // Page Manager (Noteful-style "Select" page grid)
   document.querySelector("#page-manager-btn")?.addEventListener("click", () => {
@@ -2312,7 +2522,11 @@ function bindEditorEvents(note) {
     const isEditingText = engine?.canvas.getActiveObject()?.isEditing;
 
     // Undo: Cmd+Z / Ctrl+Z
-    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "z" && !e.shiftKey) {
+    if (
+      (e.metaKey || e.ctrlKey) &&
+      e.key.toLowerCase() === "z" &&
+      !e.shiftKey
+    ) {
       if (!isEditingText) {
         e.preventDefault();
         engine?.undo();
@@ -2465,128 +2679,143 @@ function bindLibraryEvents() {
           pageNumber: 1,
           width: 800,
           height: 1130,
-        paperStyle: "lined",
-        pageSize: "a4",
-        thumbnail: null,
-        canvasJson: null,
-        pendingDecomposedData: null,
-        tags: [],
-      },
-    ],
-  };
-  notes.unshift(newNote);
+          paperStyle: "lined",
+          pageSize: "a4",
+          thumbnail: null,
+          canvasJson: null,
+          pendingDecomposedData: null,
+          tags: [],
+        },
+      ],
+    };
+    notes.unshift(newNote);
     activeId = newNote.id;
     saveNotes();
     render();
   };
 
-  document.querySelector("#new-note-btn")?.addEventListener("click", handleNewNote);
-  document.querySelector("#fab-new-note")?.addEventListener("click", handleNewNote);
+  document
+    .querySelector("#new-note-btn")
+    ?.addEventListener("click", handleNewNote);
+  document
+    .querySelector("#fab-new-note")
+    ?.addEventListener("click", handleNewNote);
 
   // Import PDF into a single multi-page notebook
-  document.querySelector("#pdf-input")?.addEventListener("change", async (e) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
+  document
+    .querySelector("#pdf-input")
+    ?.addEventListener("change", async (e) => {
+      const file = e.target.files?.[0];
+      if (!file) return;
 
-    isLoading = true;
-    loadingMessage = `Decomposing '${file.name}' into editable pages...`;
-    renderLoading();
+      isLoading = true;
+      loadingMessage = `Decomposing '${file.name}' into editable pages...`;
+      renderLoading();
 
-    try {
-      const buffer = await file.arrayBuffer();
+      try {
+        const buffer = await file.arrayBuffer();
 
-      // Persist each page's binary assets as soon as it is decomposed instead of
-      // holding every page's background in memory until the document finishes.
-      const pages = await decomposePdf(buffer, 1.333333, async (page) => {
-        const ids = {};
+        // Persist each page's binary assets as soon as it is decomposed instead of
+        // holding every page's background in memory until the document finishes.
+        const pages = await decomposePdf(buffer, 1.333333, async (page) => {
+          const ids = {};
 
-        if (page.backgroundBlob) {
-          ids.backgroundAssetId = `bg-${crypto.randomUUID()}`;
-          await putAsset(ids.backgroundAssetId, page.backgroundBlob);
-        }
+          if (page.backgroundBlob) {
+            ids.backgroundAssetId = `bg-${crypto.randomUUID()}`;
+            await putAsset(ids.backgroundAssetId, page.backgroundBlob);
+          }
 
-        if (page.thumbnailBlob) {
-          ids.thumbnailAssetId = `thumb-${crypto.randomUUID()}`;
-          await putAsset(ids.thumbnailAssetId, page.thumbnailBlob);
-        }
+          if (page.thumbnailBlob) {
+            ids.thumbnailAssetId = `thumb-${crypto.randomUUID()}`;
+            await putAsset(ids.thumbnailAssetId, page.thumbnailBlob);
+          }
 
-        // Embedded images are often the heaviest part of an export, so they go
-        // to the asset store too rather than inline base64.
-        if (Array.isArray(page.imageObjects)) {
-          for (let i = 0; i < page.imageObjects.length; i++) {
-            const img = page.imageObjects[i];
-            if (img?.src && String(img.src).startsWith("data:")) {
-              const assetId = `img-${crypto.randomUUID()}`;
-              await putAssetFromDataUrl(assetId, img.src);
-              page.imageObjects[i] = { ...img, src: null, assetId };
+          // Embedded images are often the heaviest part of an export, so they go
+          // to the asset store too rather than inline base64.
+          if (Array.isArray(page.imageObjects)) {
+            for (let i = 0; i < page.imageObjects.length; i++) {
+              const img = page.imageObjects[i];
+              if (img?.src && String(img.src).startsWith("data:")) {
+                const assetId = `img-${crypto.randomUUID()}`;
+                await putAssetFromDataUrl(assetId, img.src);
+                page.imageObjects[i] = { ...img, src: null, assetId };
+              }
             }
           }
+
+          // Drop the blobs so nothing binary ends up in localStorage.
+          return {
+            ...page,
+            ...ids,
+            backgroundBlob: undefined,
+            thumbnailBlob: undefined,
+          };
+        });
+
+        if (pages.length === 0) {
+          throw new Error("No pages found in this PDF.");
         }
 
-        // Drop the blobs so nothing binary ends up in localStorage.
-        return { ...page, ...ids, backgroundBlob: undefined, thumbnailBlob: undefined };
-      });
+        const baseName = file.name.replace(/\.pdf$/i, "");
 
-      if (pages.length === 0) {
-        throw new Error("No pages found in this PDF.");
-      }
+        // Keep the original file. The per-page snapshot taken at import is only
+        // ~1600px, which turns to mush once you zoom in; holding on to the source
+        // lets the visible page be re-rendered from the PDF at the current zoom.
+        const pdfAssetId = `pdf-${crypto.randomUUID()}`;
+        await putAsset(pdfAssetId, file);
 
-      const baseName = file.name.replace(/\.pdf$/i, "");
-
-      // Keep the original file. The per-page snapshot taken at import is only
-      // ~1600px, which turns to mush once you zoom in; holding on to the source
-      // lets the visible page be re-rendered from the PDF at the current zoom.
-      const pdfAssetId = `pdf-${crypto.randomUUID()}`;
-      await putAsset(pdfAssetId, file);
-
-      // Create ONE notebook containing all decomposed pages with their exact individual sizes
-      const newNotebook = {
-        id: crypto.randomUUID(),
-        title: baseName,
-        createdAt: Date.now(),
-        isPdf: true,
-        pdfAssetId,
-        defaultFont: pages.mostUsedFont || "DM Sans",
-        detectedFonts: pages.detectedFonts || [],
-        currentPageIndex: 0,
-        pages: pages.map((page, idx) => ({
+        // Create ONE notebook containing all decomposed pages with their exact individual sizes
+        const newNotebook = {
           id: crypto.randomUUID(),
-          pageNumber: idx + 1,
-          pdfPageIndex: idx,
-          width: page.width, // Exact native PDF page dimensions
-          height: page.height,
-          paperStyle: "plain",
-          pageSize: "custom",
-          thumbnail: null,
-          backgroundAssetId: page.backgroundAssetId || null,
-          thumbnailAssetId: page.thumbnailAssetId || null,
-          canvasJson: null,
-          pendingDecomposedData: page,
-        })),
-      };
+          title: baseName,
+          createdAt: Date.now(),
+          isPdf: true,
+          pdfAssetId,
+          defaultFont: pages.mostUsedFont || "DM Sans",
+          detectedFonts: pages.detectedFonts || [],
+          currentPageIndex: 0,
+          pages: pages.map((page, idx) => ({
+            id: crypto.randomUUID(),
+            pageNumber: idx + 1,
+            pdfPageIndex: idx,
+            width: page.width, // Exact native PDF page dimensions
+            height: page.height,
+            paperStyle: "plain",
+            pageSize: "custom",
+            thumbnail: null,
+            backgroundAssetId: page.backgroundAssetId || null,
+            thumbnailAssetId: page.thumbnailAssetId || null,
+            canvasJson: null,
+            pendingDecomposedData: page,
+          })),
+        };
 
-      notes.unshift(newNotebook);
-      activeId = newNotebook.id;
-      saveNotes();
-    } catch (err) {
-      alert("Could not decompose this PDF: " + err.message);
-      console.error(err);
-    } finally {
-      isLoading = false;
-      e.target.value = "";
-      render();
-    }
-  });
+        notes.unshift(newNotebook);
+        activeId = newNotebook.id;
+        saveNotes();
+      } catch (err) {
+        alert("Could not decompose this PDF: " + err.message);
+        console.error(err);
+      } finally {
+        isLoading = false;
+        e.target.value = "";
+        render();
+      }
+    });
 }
 
 function escapeHtml(value) {
-  return String(value).replace(/[&<>"']/g, (c) => ({
-    "&": "&amp;",
-    "<": "&lt;",
-    ">": "&gt;",
-    '"': "&quot;",
-    "'": "&#039;",
-  }[c]));
+  return String(value).replace(
+    /[&<>"']/g,
+    (c) =>
+      ({
+        "&": "&amp;",
+        "<": "&lt;",
+        ">": "&gt;",
+        '"': "&quot;",
+        "'": "&#039;",
+      })[c],
+  );
 }
 
 disableBrowserZoom();

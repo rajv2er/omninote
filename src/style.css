@@ -962,7 +962,7 @@ nav {
    * the moment the page outgrows the viewport.
    */
   align-items: safe center;
-  gap: 32px;
+  gap: 8px;
   position: relative;
   scroll-behavior: smooth;
 }
