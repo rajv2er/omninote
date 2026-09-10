@@ -15,6 +15,7 @@
 import * as pdfjs from "pdfjs-dist";
 import pdfWorker from "pdfjs-dist/build/pdf.worker.mjs?url";
 import { getAsset } from "../storage/assets.js";
+import { canvasToBlob } from "./canvasBlob.js";
 
 pdfjs.GlobalWorkerOptions.workerSrc = pdfWorker;
 
@@ -45,19 +46,6 @@ async function getPdfDoc(assetId) {
   return pending;
 }
 
-function canvasToBlob(canvas, quality = 0.92) {
-  return new Promise((resolve) => {
-    if (typeof canvas.toBlob !== "function") {
-      resolve(null);
-      return;
-    }
-    canvas.toBlob(
-      (blob) => resolve(blob && blob.size ? blob : null),
-      "image/webp",
-      quality
-    );
-  });
-}
 
 /**
  * Renders one page of a stored PDF at approximately `targetWidth` device pixels.

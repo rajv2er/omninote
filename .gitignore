@@ -26,3 +26,6 @@ npm-debug.log*
 .env
 .env.*
 !.env.example
+
+# AI tool scratch (not part of the project)
+.kilo/

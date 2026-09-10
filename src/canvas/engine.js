@@ -1,5 +1,6 @@
 import {
   Canvas,
+  Group,
   IText,
   Path,
   FabricImage,
@@ -11,6 +12,14 @@ import {
 } from "fabric";
 import { getAssetUrl } from "../storage/assets.js";
 import { renderPdfPageBlob } from "../pdf/raster.js";
+import {
+  IMPORT_OBJECT_PROPS,
+  PLACEHOLDER_IMAGE_SRC,
+  compactCanvasJson,
+  hydrateCanvasJson,
+  legacyCandidatesFromDecomposed,
+  stripVolatileSources,
+} from "../pdf/importModel.js";
 
 // Zoom bounds. The ceiling matters: 400% is a viewing cap, but handwriting
 // needs real magnification, and the note apps this competes with go past it.
@@ -106,6 +115,9 @@ export class OmniCanvas {
     // so it is never serialized into undo history or persisted canvas JSON.
     this.backgroundImage = null;
     this.backgroundVisible = true;
+    // Per-page import outcome, surfaced by the importer and used only for the
+    // completion report; never load-bearing.
+    this.importReport = null;
 
     // Optional link back to the PDF this page was imported from. When present,
     // the background is re-rasterized from the source at the current zoom
@@ -204,6 +216,8 @@ export class OmniCanvas {
     for (let i = objects.length - 1; i >= 0; i--) {
       const obj = objects[i];
       if (obj === this.canvas.backgroundImage) continue;
+      // Locked page furniture is not erasable either.
+      if (obj.omniLocked) continue;
       const bound = obj.getBoundingRect();
       if (
         pointer.x >= bound.left &&
@@ -271,6 +285,18 @@ export class OmniCanvas {
     // Space key for temporary pan mode. Sets isSpaceDown so pointerdown can
     // decide to pan instead of select/draw.
     const handleKeyDown = (e) => {
+      // Space belongs to whatever the user is typing into — including Fabric's
+      // own hidden textarea while a text object is being edited. Arming pan
+      // there would make the next pointerdown pan instead of placing a caret.
+      const t = e.target;
+      const typing =
+        t &&
+        (t.isContentEditable ||
+          t.tagName === "INPUT" ||
+          t.tagName === "TEXTAREA" ||
+          t.tagName === "SELECT");
+      if (typing) return;
+
       if (e.code === "Space" && !e.repeat) {
         this.isSpaceDown = true;
         this.canvas.defaultCursor = "grab";
@@ -328,13 +354,18 @@ export class OmniCanvas {
    * object URL would be dead by the time this JSON is reloaded.
    */
   serialize() {
-    const json = this.canvas.toJSON();
+    // `toJSON()` would drop the import metadata and keep whatever object URL
+    // an imported image was loaded from, so the property list and the URL
+    // scrub both have to happen here.
+    const json = this.canvas.toObject(IMPORT_OBJECT_PROPS);
     delete json.backgroundImage;
     // Fabric may record the canvas dimensions; they are render state, not
     // document state, so they are pinned back to the page size.
     if ("width" in json) json.width = this.width;
     if ("height" in json) json.height = this.height;
-    return json;
+    // Order matters: scrub the dead object URLs first, then drop the default
+    // property boilerplate that otherwise blows the localStorage quota.
+    return compactCanvasJson(stripVolatileSources(json));
   }
 
   recordHistory(triggerModified = true) {
@@ -593,6 +624,12 @@ export class OmniCanvas {
 
   setObjectsSelectable(selectable) {
     this.canvas.forEachObject((obj) => {
+      // Imported page furniture stays locked no matter which tool is active.
+      if (obj.omniLocked) {
+        obj.selectable = false;
+        obj.evented = false;
+        return;
+      }
       obj.selectable = selectable;
       obj.evented = selectable || this.currentTool === "eraser";
     });
@@ -757,41 +794,43 @@ export class OmniCanvas {
     this.canvas.setDimensions({ width: this.width, height: this.height });
     this.setPaperStyle(page.paperStyle || "plain");
 
-    if (page.pendingDecomposedData) {
-      const decomposed = page.pendingDecomposedData;
-      await this.loadDecomposedPdf(decomposed);
-      // Canva-like: hide fallback only if decomposition actually produced objects
-      const hasObjects = (decomposed.textObjects?.length || 0) +
-                         (decomposed.pathObjects?.length || 0) +
-                         (decomposed.imageObjects?.length || 0) > 0;
-      if (hasObjects) {
-        this.backgroundVisible = false;
-        // Don't load the fallback background at all when we have editable objects
-        this.backgroundImage = null;
-        // Remember it so reopening this page from its saved JSON does not paint
-        // the imported raster underneath the editable objects as well.
-        page.decomposedObjects = true;
-      } else {
-        // No objects extracted - keep the fallback background
-        if (page.backgroundAssetId) {
-          await this.loadBackgroundAsset(page.backgroundAssetId);
-        } else {
-          this.applyBackground();
-        }
-      }
-      delete page.pendingDecomposedData;
-    } else if (page.canvasJson) {
-      await this.canvas.loadFromJSON(page.canvasJson.canvasData || page.canvasJson);
-      this.canvas.requestRenderAll();
-      // For saved pages, load background if it exists — unless this page was
-      // successfully decomposed, in which case the raster would only double up
-      // underneath the editable objects that are already there.
-      if (page.decomposedObjects) {
-        this.backgroundVisible = false;
-        this.applyBackground();
-      } else if (page.backgroundAssetId) {
+    // `pendingImportData` is the current one-shot handoff from the importer.
+    // `pendingDecomposedData` is the pre-schema name; old notebooks still carry
+    // it and are converted rather than re-imported.
+    const pending = page.pendingImportData || page.pendingDecomposedData;
+
+    if (pending) {
+      const objects = Array.isArray(pending.objects)
+        ? pending.objects
+        : legacyCandidatesFromDecomposed(pending);
+
+      await this.loadImportObjects(objects);
+
+      // The importer decides whether the locked raster stays visible. Partial
+      // pages keep it so nothing unsupported disappears; fully recovered pages
+      // drop it so recovered objects are not drawn over their own raster.
+      this.backgroundVisible = page.fallbackVisible !== false;
+
+      if (this.backgroundVisible && page.backgroundAssetId) {
         await this.loadBackgroundAsset(page.backgroundAssetId);
       } else {
+        this.backgroundImage = null;
+        this.applyBackground();
+      }
+
+      if (pending.report) this.importReport = pending.report;
+    } else if (page.canvasJson) {
+      const canvasData = await hydrateCanvasJson(
+        page.canvasJson.canvasData || page.canvasJson,
+      );
+      await this.canvas.loadFromJSON(canvasData);
+      this.canvas.requestRenderAll();
+
+      this.backgroundVisible = page.fallbackVisible !== false;
+      if (this.backgroundVisible && page.backgroundAssetId) {
+        await this.loadBackgroundAsset(page.backgroundAssetId);
+      } else {
+        this.backgroundImage = null;
         this.applyBackground();
       }
     }
@@ -807,105 +846,165 @@ export class OmniCanvas {
     this.recordHistory();
   }
 
-  async loadDecomposedPdf(pageData) {
-    this.isHistoryProcessing = true;
-    this.canvas.clear();
-    this.width = Math.round(pageData.width);
-    this.height = Math.round(pageData.height);
-    this.canvas.setDimensions({
-      width: this.width,
-      height: this.height,
+  /**
+   * Builds Fabric objects from the importer's native candidates.
+   *
+   * Coordinates arrive in page space with a top-left origin, so they are used
+   * verbatim — no viewport, zoom or dpr value is involved at any point.
+   */
+  async loadImportObjects(objects) {
+    if (!Array.isArray(objects) || objects.length === 0) return;
+
+    for (const candidate of objects) {
+      try {
+        const fabricObject = await this.buildImportObject(candidate);
+        if (fabricObject) this.canvas.add(fabricObject);
+      } catch (err) {
+        // One bad candidate must not cost the user the rest of the page.
+        console.warn("Skipping unloadable imported object:", err);
+      }
+    }
+
+    this.canvas.requestRenderAll();
+  }
+
+  async buildImportObject(candidate) {
+    switch (candidate.omniType) {
+      case "text":
+        return this.buildImportText(candidate);
+      case "image":
+        return this.buildImportImage(candidate);
+      case "vector":
+      case "vectorGroup":
+        return this.buildImportVector(candidate);
+      default:
+        return null;
+    }
+  }
+
+  buildImportText(candidate) {
+    const itext = new IText(candidate.text || "", {
+      left: candidate.left || 0,
+      top: candidate.top || 0,
+      originX: "left",
+      originY: "top",
+      fontSize: candidate.fontSize || 16,
+      fontFamily: candidate.fontFamily || this.currentFont || "sans-serif",
+      fontWeight: candidate.fontWeight || "normal",
+      fontStyle: candidate.fontStyle || "normal",
+      fill: candidate.fill || "#1e1e1e",
+      angle: candidate.angle || 0,
+      // Directly editable, which is the whole point of recovering text.
+      editable: true,
+      cornerColor: "#6366f1",
+      cornerStyle: "circle",
+      cornerSize: 8,
+      transparentCorners: false,
     });
 
-    // 1. Add Text Objects with detected font
-    if (pageData.textObjects) {
-      for (const t of pageData.textObjects) {
-        const itext = new IText(t.text, {
-          left: t.left,
-          top: t.top,
-          originX: "left",
-          originY: "top",
-          fontSize: t.fontSize,
-          fontFamily: t.fontFamily || this.currentFont || "sans-serif",
-          fill: t.fill || "#1e1e1e",
-          cornerColor: "#6366f1",
-          cornerStyle: "circle",
-          cornerSize: 8,
-          transparentCorners: false,
-        });
-        this.canvas.add(itext);
+    itext.omniId = candidate.omniId;
+    itext.omniType = "text";
+    itext.sourceType = candidate.sourceType || "text";
+    itext.importConfidence = candidate.importConfidence ?? 0;
+    itext.sourceFontName = candidate.sourceFontName || null;
+
+    return itext;
+  }
+
+  async buildImportImage(candidate) {
+    // Assets are resolved by id every time — including on a reopen — so the
+    // authoritative source is the asset id, never an object URL.
+    const src = candidate.assetId ? await getAssetUrl(candidate.assetId) : null;
+    if (!src) return null;
+
+    const img = await FabricImage.fromURL(src);
+    if (!img || !img.width) return null;
+
+    if (candidate.width && img.width) {
+      img.scaleToWidth(candidate.width);
+    }
+
+    img.set({
+      left: candidate.left || 0,
+      top: candidate.top || 0,
+      // The PDF placement may carry a rotation; the origin is the image's own
+      // top-left corner, so the angle is applied about that point.
+      angle: candidate.angle || 0,
+      originX: "left",
+      originY: "top",
+      cornerColor: "#6366f1",
+      cornerStyle: "circle",
+      cornerSize: 8,
+      transparentCorners: false,
+    });
+
+    img.omniId = candidate.omniId;
+    img.omniType = "image";
+    img.sourceType = candidate.sourceType || "imageXObject";
+    img.importConfidence = candidate.importConfidence ?? 0;
+    img.assetId = candidate.assetId || null;
+    img.naturalWidth = candidate.naturalWidth || img.width;
+    img.naturalHeight = candidate.naturalHeight || img.height;
+
+    return img;
+  }
+
+  buildImportVector(candidate) {
+    const shared = {
+      stroke: candidate.stroke || null,
+      strokeWidth: candidate.strokeWidth || 0,
+      fill: candidate.fill || "transparent",
+      strokeLineCap: candidate.strokeLineCap || "round",
+      strokeLineJoin: candidate.strokeLineJoin || "round",
+      opacity: Number.isFinite(candidate.opacity) ? candidate.opacity : 1,
+      originX: "left",
+      originY: "top",
+      cornerColor: "#6366f1",
+      cornerStyle: "circle",
+      cornerSize: 8,
+      transparentCorners: false,
+    };
+
+    const children = Array.isArray(candidate.children) ? candidate.children : null;
+    const parts = children || [candidate];
+
+    let object = null;
+
+    if (parts.length === 1) {
+      object = new Path(parts[0].pathData, { ...shared });
+    } else {
+      const paths = [];
+      for (const part of parts) {
+        if (!part.pathData) continue;
+        paths.push(new Path(part.pathData, { ...shared }));
+      }
+      if (paths.length === 0) return null;
+      if (paths.length === 1) {
+        object = paths[0];
+      } else {
+        // A group keeps a recovered stroke as one selectable object instead of
+        // dozens of two-point slivers.
+        object = new Group(paths, { ...shared, subTargetCheck: false });
       }
     }
 
-    // 2. Add Vector Paths / Handwriting Strokes
-    if (pageData.pathObjects) {
-      for (const p of pageData.pathObjects) {
-        try {
-          // Ensure strokes are visible: if fill is used without stroke, or stroke is white/transparent, default to dark
-          let stroke = p.stroke;
-          let fill = p.fill || "transparent";
-          const isStroked = stroke && stroke !== "transparent" && stroke !== "#ffffff" && stroke !== "#fff";
-          const isFilled = fill && fill !== "transparent" && fill !== "#ffffff" && fill !== "#fff";
-          
-          if (!isStroked && !isFilled) {
-            // Path has no visible color - default to dark stroke for handwriting
-            stroke = "#1e1e1e";
-            fill = "transparent";
-          } else if (isFilled && !isStroked) {
-            // Filled path (shapes) - keep fill, no stroke
-            stroke = null;
-          }
-          
-          const path = new Path(p.pathData, {
-            stroke,
-            strokeWidth: p.strokeWidth || (isStroked ? 2 : 0),
-            fill,
-            strokeLineCap: "round",
-            strokeLineJoin: "round",
-            originX: "left",
-            originY: "top",
-            cornerColor: "#6366f1",
-            cornerStyle: "circle",
-            cornerSize: 8,
-            transparentCorners: false,
-          });
-          this.canvas.add(path);
-        } catch (pathErr) {
-          console.warn("Skipping invalid path segment:", pathErr);
-        }
-      }
+    if (!object) return null;
+
+    object.omniId = candidate.omniId;
+    object.omniType = candidate.omniType || "vector";
+    object.sourceType = candidate.sourceType || "path";
+    object.importConfidence = candidate.importConfidence ?? 0;
+
+    if (candidate.locked) {
+      // Page furniture — the paper rectangle, or a shape hidden beneath it.
+      // Left selectable, dragging it away would expose the page behind.
+      object.omniLocked = true;
+      object.selectable = false;
+      object.evented = false;
+      object.hoverCursor = "default";
     }
 
-    // 3. Add Embedded Images
-    if (pageData.imageObjects) {
-      for (const imgData of pageData.imageObjects) {
-        try {
-          const src = imgData.src || (imgData.assetId ? await getAssetUrl(imgData.assetId) : null);
-          if (!src) continue;
-
-          const img = await FabricImage.fromURL(src);
-          if (imgData.width && img.width) {
-            img.scaleToWidth(imgData.width);
-          }
-          img.set({
-            left: imgData.left,
-            top: imgData.top,
-            originX: "left",
-            originY: "top",
-            cornerColor: "#6366f1",
-            cornerStyle: "circle",
-            cornerSize: 8,
-            transparentCorners: false,
-          });
-          this.canvas.add(img);
-        } catch (imgErr) {
-          console.warn("Skipping image object:", imgErr);
-        }
-      }
-    }
-
-    this.isHistoryProcessing = false;
-    this.canvas.requestRenderAll();
+    return object;
   }
 
   /**
@@ -979,6 +1078,9 @@ export class OmniCanvas {
    */
   _scheduleBackgroundRaster(delay = RASTER_DEBOUNCE_MS) {
     if (!this.pdfSource || this.isActivePage === false) return;
+    // A fully recovered page has no fallback to sharpen; re-rasterizing would
+    // silently paint the source back underneath the editable objects.
+    if (!this.backgroundVisible) return;
     if (this._bgRasterTimer) clearTimeout(this._bgRasterTimer);
     this._bgRasterTimer = setTimeout(() => {
       this._bgRasterTimer = null;

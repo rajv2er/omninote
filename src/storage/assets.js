@@ -135,10 +135,62 @@ export function collectNoteAssetIds(note) {
   return ids;
 }
 
-/** Collects asset ids belonging to a single page. */
+/**
+ * IndexedDB key for a page's Fabric object graph.
+ *
+ * Derived from the page id rather than stored, so a cloned page (which gets a
+ * fresh id) can never end up sharing — and overwriting — its source's graph.
+ */
+export function canvasKeyForPage(page) {
+  return page?.id ? `canvas-${page.id}` : null;
+}
+
+/** IndexedDB key for a page's one-shot import handoff. */
+export function pendingKeyForPage(page) {
+  return page?.id ? `pending-${page.id}` : null;
+}
+
+/**
+ * Stores a JSON payload under a page key.
+ *
+ * The object graph is far too large for localStorage — a real 14-page
+ * handwriting import measured 6.8 MB against a hard 5 MB ceiling — so it lives
+ * here alongside the other document data.
+ */
+export function putPagePayload(key, json) {
+  return withStore("readwrite", (store) => store.put(json, key));
+}
+
+export function getPagePayload(key) {
+  return withStore("readonly", (store) => store.get(key));
+}
+
+/**
+ * Collects asset ids belonging to a single page.
+ *
+ * Imported pages reference image assets from inside their object graph, not
+ * just through `backgroundAssetId`, so those are collected too — otherwise
+ * deleting one page would orphan the images still used by its copies.
+ */
 export function collectPageAssetIds(page) {
   const ids = [];
   if (page?.backgroundAssetId) ids.push(page.backgroundAssetId);
   if (page?.thumbnailAssetId) ids.push(page.thumbnailAssetId);
+
+  // The page's own object graph and import handoff.
+  const canvasKey = canvasKeyForPage(page);
+  if (canvasKey) ids.push(canvasKey);
+  const pendingKey = pendingKeyForPage(page);
+  if (pendingKey) ids.push(pendingKey);
+
+  const pending = page?.pendingImportData || page?.pendingDecomposedData;
+  for (const obj of pending?.objects || []) {
+    if (obj?.assetId) ids.push(obj.assetId);
+  }
+  // Pre-schema records kept images in a separate array.
+  for (const img of pending?.imageObjects || []) {
+    if (img?.assetId) ids.push(img.assetId);
+  }
+
   return ids;
 }

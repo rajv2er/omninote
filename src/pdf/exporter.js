@@ -1,6 +1,35 @@
 import { PDFDocument } from "pdf-lib";
 import { StaticCanvas } from "fabric";
 import { getAssetUrl } from "../storage/assets.js";
+import { hydrateCanvasJson } from "./importModel.js";
+
+/**
+ * True when the page should render its locked imported raster underneath the
+ * editable objects.
+ *
+ * A page is only allowed to drop its fallback when import proved the whole
+ * page was recovered; anything partial keeps the raster so unsupported content
+ * does not silently vanish from the export.
+ */
+function pageShowsFallback(page) {
+  return page?.fallbackVisible !== false;
+}
+
+async function resolveFallbackUrl(page) {
+  if (!pageShowsFallback(page)) return null;
+  if (!page?.backgroundAssetId) return null;
+  return getAssetUrl(page.backgroundAssetId).catch(() => null);
+}
+
+/** Loads a stored Fabric document, resolving imported image assets first. */
+async function renderStoredCanvas(canvasJson, width, height) {
+  const canvasData = canvasJson?.canvasData || canvasJson;
+  if (!canvasData) return null;
+
+  const staticCanvas = new StaticCanvas(null, { width, height });
+  await staticCanvas.loadFromJSON(await hydrateCanvasJson(canvasData));
+  return staticCanvas;
+}
 
 /**
  * Draws paper template patterns (ruled lines, grid, dots) onto a 2D context.
@@ -96,9 +125,7 @@ export async function exportNotebookToPdf(note, activeCanvasEngine, onProgress =
 
     // The imported-page fallback already contains the page's own paper, so it
     // replaces the template rather than sitting on top of it.
-    const backgroundUrl = page.backgroundAssetId
-      ? await getAssetUrl(page.backgroundAssetId).catch(() => null)
-      : null;
+    const backgroundUrl = await resolveFallbackUrl(page);
 
     if (backgroundUrl) {
       await drawImageToContext(ctx, backgroundUrl, width, height);
@@ -114,18 +141,18 @@ export async function exportNotebookToPdf(note, activeCanvasEngine, onProgress =
       });
       await drawImageToContext(ctx, contentDataUrl, width, height);
     } else if (page.canvasJson) {
-      // Inactive page with serialized Fabric JSON. Note the stored shape is
-      // { width, height, paperStyle, canvasData }; loadFromJSON needs the inner
-      // canvasData, otherwise the page exports blank.
-      const canvasData = page.canvasJson.canvasData || page.canvasJson;
-      const staticCanvas = new StaticCanvas(null, { width, height });
-      await staticCanvas.loadFromJSON(canvasData);
-      const contentDataUrl = staticCanvas.toDataURL({
-        format: "png",
-        multiplier: scale,
-      });
-      staticCanvas.dispose();
-      await drawImageToContext(ctx, contentDataUrl, width, height);
+      // Inactive page with serialized Fabric JSON. Image assets are resolved
+      // from IndexedDB before `loadFromJSON`, otherwise imported images are
+      // blank on export.
+      const staticCanvas = await renderStoredCanvas(page.canvasJson, width, height);
+      if (staticCanvas) {
+        const contentDataUrl = staticCanvas.toDataURL({
+          format: "png",
+          multiplier: scale,
+        });
+        staticCanvas.dispose();
+        await drawImageToContext(ctx, contentDataUrl, width, height);
+      }
     }
 
     // Photographic page backgrounds compress far better as JPEG; pure line art
@@ -192,9 +219,7 @@ export async function renderPageThumbnail(page, targetWidth = 320) {
   const ctx = out.getContext("2d");
   ctx.scale(scale, scale);
 
-  const backgroundUrl = page.backgroundAssetId
-    ? await getAssetUrl(page.backgroundAssetId).catch(() => null)
-    : null;
+  const backgroundUrl = await resolveFallbackUrl(page);
 
   if (backgroundUrl) {
     await drawImageToContext(ctx, backgroundUrl, width, height);
@@ -204,13 +229,14 @@ export async function renderPageThumbnail(page, targetWidth = 320) {
 
   const canvasData = page.canvasJson?.canvasData || page.canvasJson;
   if (canvasData) {
-    const staticCanvas = new StaticCanvas(null, { width, height });
-    await staticCanvas.loadFromJSON(canvasData);
-    // PNG keeps the ink's transparency so the paper underneath shows through
-    // instead of the JPEG's no-alpha black background masking the page.
-    const inkUrl = staticCanvas.toDataURL({ format: "png" });
-    staticCanvas.dispose();
-    await drawImageToContext(ctx, inkUrl, width, height);
+    const staticCanvas = await renderStoredCanvas(page.canvasJson, width, height);
+    if (staticCanvas) {
+      // PNG keeps the ink's transparency so the paper underneath shows through
+      // instead of the JPEG's no-alpha black background masking the page.
+      const inkUrl = staticCanvas.toDataURL({ format: "png" });
+      staticCanvas.dispose();
+      await drawImageToContext(ctx, inkUrl, width, height);
+    }
   }
 
   return out.toDataURL("image/jpeg", 0.7);
