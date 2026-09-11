@@ -165,17 +165,34 @@ function rgbArrayToHex(triple, fallback = "#000000") {
  * `get()` early throws. Poll instead — a page with a slow image is worth
  * waiting for, but a missing one must not hang the whole import.
  */
-async function waitForImageObject(page, id, timeoutMs = 4000) {
+async function waitForImageObject(page, id, timeoutMs = 8000) {
   const started = Date.now();
 
+  // pdf.js registers an image in `page.objs`/`commonObjs` the moment the
+  // content stream is parsed, but the decoded pixel buffer (`data`, `bitmap`,
+  // or `src`) arrives asynchronously afterwards. Immediately after
+  // getOperatorList() the object exists yet carries no pixels, and returning
+  // it early makes imageObjectToBlob bail out — which is exactly why imported
+  // images used to vanish while strokes (no async pixel decode) were fine.
+  // Poll until the bytes are actually present.
   while (Date.now() - started < timeoutMs) {
+    let obj = null;
     try {
-      if (page.objs && page.objs.has(id)) return page.objs.get(id);
-      if (page.commonObjs && page.commonObjs.has(id)) return page.commonObjs.get(id);
+      if (page.objs && page.objs.has(id)) obj = page.objs.get(id);
+      else if (page.commonObjs && page.commonObjs.has(id)) obj = page.commonObjs.get(id);
     } catch {
-      return null;
+      obj = null;
     }
-    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    if (
+      obj &&
+      typeof obj === "object" &&
+      (obj.data || obj.bitmap || obj.src)
+    ) {
+      return obj;
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 25));
   }
 
   return null;

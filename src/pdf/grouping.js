@@ -386,8 +386,17 @@ export function groupPageCandidates(page) {
     errors: [],
   };
 
+  // Fabric paints objects in insertion order. Full-page PDF fills are normal
+  // vector objects, so leaving them after images hides those images under an
+  // opaque paper rectangle. Preserve the relative order within each group, but
+  // always paint locked page furniture first.
+  const paintOrderedObjects = [
+    ...objects.filter((object) => object.locked),
+    ...objects.filter((object) => !object.locked),
+  ];
+
   return {
-    objects,
+    objects: paintOrderedObjects,
     fallbackRegions,
     // Set only when the backdrop can stand in for the whole-page render; the
     // importer composites it into a page-sized image and uses that as the
