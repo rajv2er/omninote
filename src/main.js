@@ -2,19 +2,28 @@ import "./style.css";
 import { OmniCanvas, MIN_ZOOM, MAX_ZOOM } from "./canvas/engine.js";
 import { Point } from "fabric";
 import { ZoomWindow } from "./canvas/zoomWindow.js";
-import { decomposePdf } from "./pdf/decomposer.js";
+import {
+  decomposePdf,
+  IMPORT_SCHEMA_VERSION,
+  IMPORTED_OBJECT_VERSION,
+} from "./pdf/decomposer.js";
 import { invalidatePdfDoc } from "./pdf/raster.js";
 import { exportNotebookToPdf, renderPageThumbnail } from "./pdf/exporter.js";
 import {
   putAsset,
-  putAssetFromDataUrl,
   deleteAssets,
   getAssetUrl,
   collectNoteAssetIds,
   collectPageAssetIds,
+  canvasKeyForPage,
+  pendingKeyForPage,
+  putPagePayload,
+  getPagePayload,
 } from "./storage/assets.js";
+import { composePageSizedFallback } from "./pdf/importModel.js";
 
 const STORE_KEY = "omninote-notes-v2";
+const FOLDERS_KEY = "omninote-folders";
 
 const PAGE_SIZES = {
   a4: { label: "A4 (Standard)", width: 800, height: 1130 },
@@ -22,6 +31,28 @@ const PAGE_SIZES = {
   slide: { label: "16:9 Slide", width: 1200, height: 675 },
   square: { label: "Square (1:1)", width: 800, height: 800 },
 };
+
+const FOLDER_PREFIX = "folder:";
+
+function loadFolders() {
+  try {
+    const arr = JSON.parse(localStorage.getItem(FOLDERS_KEY));
+    if (Array.isArray(arr)) {
+      return arr.filter((f) => f && typeof f.id === "string" && typeof f.name === "string");
+    }
+  } catch {}
+  return [];
+}
+
+function saveFolders() {
+  try {
+    localStorage.setItem(FOLDERS_KEY, JSON.stringify(folders));
+  } catch {
+    // Best-effort; the folder list is never worth losing the page over.
+  }
+}
+
+let folders = loadFolders();
 
 const sampleNote = {
   id: "welcome-note",
@@ -51,11 +82,111 @@ let currentTool = "select";
 let currentColor = "#176a72";
 let currentWidth = 4;
 let currentPenStyle = "ballpoint";
+/** Every palette starts from this, so there is always at least one colour. */
+const DEFAULT_COLOR = "#176a72";
+/** Two-column rail: eleven swatches plus the add button. */
+const MAX_SWATCHES = 11;
+
 let customColors = [];
 try {
   customColors =
     JSON.parse(localStorage.getItem("omninote-custom-colors")) || [];
 } catch {}
+if (!Array.isArray(customColors) || customColors.length === 0) {
+  customColors = [DEFAULT_COLOR];
+}
+
+/**
+ * Colour picker state.
+ *
+ * There is exactly one native colour input in the app and it is inert (see
+ * `.swatch-edit-input`). Previously every swatch owned a hidden input inside
+ * its own <label>, so the browser forwarded clicks into it and decided when
+ * the picker opened: after the first pick the input kept focus, a repeat click
+ * was swallowed, and no `change` fired when the value was unchanged — the
+ * picker appeared to work once and then go dead.
+ *
+ * Opening is now explicit and the open/closed state is tracked here rather
+ * than inferred from the browser.
+ */
+let colorPickerOpen = false;
+/** Called once with the chosen colour when the picker commits. */
+let colorPickerApply = null;
+
+function saveCustomColors() {
+  // The palette can never be emptied — there is always one colour to draw with.
+  if (!Array.isArray(customColors) || customColors.length === 0) {
+    customColors = [DEFAULT_COLOR];
+  }
+  try {
+    localStorage.setItem("omninote-custom-colors", JSON.stringify(customColors));
+  } catch {
+    // A colour preference is never worth failing an edit over.
+  }
+}
+
+/** Dims the add button once the rail is full. */
+function refreshAddColorButton() {
+  const btn = document.querySelector("#add-color-btn");
+  if (!btn) return;
+  const full = customColors.length >= MAX_SWATCHES;
+  btn.disabled = full;
+  btn.title = full ? "Colour limit reached" : "Add a new color";
+}
+
+/**
+ * Opens the shared colour picker on `seed`.
+ *
+ * `showPicker()` is the only API that opens a colour input deterministically,
+ * and it throws `NotAllowedError` unless called from inside a user gesture —
+ * so this must stay synchronous with the click that triggered it.
+ *
+ * @param {string} seed colour the picker starts on (the one currently applied)
+ * @param {(hex: string) => void} apply called with the committed colour
+ */
+function openColorPicker(seed, apply) {
+  const input = document.querySelector("#color-picker-input");
+  if (!input) return;
+  // Ignore re-entry: a second request while the picker is up would dismiss it
+  // the moment it appears.
+  if (colorPickerOpen) return;
+
+  colorPickerOpen = true;
+  colorPickerApply = typeof apply === "function" ? apply : null;
+  // Start from the applied colour so re-opening shows the current value.
+  input.value = seed || currentColor;
+
+  try {
+    if (typeof input.showPicker === "function") {
+      input.showPicker();
+    } else {
+      // A focused colour input ignores a programmatic click — dropping focus
+      // first is what makes a repeat click work.
+      input.blur();
+      input.click();
+    }
+  } catch {
+    colorPickerOpen = false;
+    colorPickerApply = null;
+    try {
+      input.click();
+    } catch {
+      /* No picker available in this browser. */
+    }
+  }
+}
+
+/**
+ * Ends a picker session. `value` is null when the user cancelled, in which
+ * case nothing is applied and the previously selected colour stays as it was.
+ */
+function commitColorPicker(value) {
+  if (!colorPickerOpen) return;
+  colorPickerOpen = false;
+  const apply = colorPickerApply;
+  colorPickerApply = null;
+  if (apply && value) apply(value);
+}
 let isLoading = false;
 let loadingMessage = "";
 let showShapesFlyout = false;
@@ -70,6 +201,13 @@ let pageManagerAnchor = null;
 let pageManagerThumbs = [];
 let pageManagerPriorZoom = 1;
 let zoomRestoreTarget = null;
+// Live drag-to-reorder gesture in the Page Manager grid. Null when idle.
+let pageManagerDrag = null;
+// A completed drag also emits a click; that click must not toggle selection.
+// Cleared on the next pointerdown so it can never stay latched.
+let pageManagerSuppressClick = false;
+// Pointer travel before a press counts as a drag rather than a click.
+const PM_DRAG_THRESHOLD = 6;
 // Page-level clipboard for the Page Manager Copy / Cut / Paste ops. Each entry
 // is a fully cloned page object (new id, cloned canvasJson, shared asset ids).
 let pageClipboard = [];
@@ -87,7 +225,55 @@ function normalizeNote(n) {
     }
     if (p.backgroundAssetId === undefined) p.backgroundAssetId = null;
     if (p.thumbnailAssetId === undefined) p.thumbnailAssetId = null;
+
+    // Import schema v2 backfills. Every field is optional and additive: a
+    // record written by any earlier version must still open, and a malformed
+    // report must never block it.
+    if (!Array.isArray(p.tags)) p.tags = [];
+    if (p.importSchemaVersion === undefined) p.importSchemaVersion = 1;
+
+    // `pendingDecomposedData` is the pre-v2 name for the same one-shot
+    // handoff. Alias it forward rather than rewriting the record, so the
+    // original asset ids are never discarded.
+    if (!p.pendingImportData && p.pendingDecomposedData) {
+      p.pendingImportData = p.pendingDecomposedData;
+    }
+    if (p.fallbackVisible === undefined) {
+      // Records written before the flag existed predate the completeness
+      // decision; keeping the fallback is the appearance-preserving default.
+      p.fallbackVisible = true;
+    }
+    // Older records always used a whole-page render as their fallback, so
+    // defaulting to false keeps their re-rasterization behaviour unchanged.
+    if (p.fallbackFromImage === undefined) p.fallbackFromImage = false;
+
+    const report = p.importReport;
+    p.importReport =
+      report && typeof report === "object" && typeof report.status === "string"
+        ? {
+            status: report.status,
+            textObjects: Number(report.textObjects) || 0,
+            vectorGroups: Number(report.vectorGroups) || 0,
+            imageObjects: Number(report.imageObjects) || 0,
+            fallbackRegions: Number(report.fallbackRegions) || 0,
+            backdropImages: Number(report.backdropImages) || 0,
+            fallbackFromImage: report.fallbackFromImage === true,
+            unsupportedOperators: Number(report.unsupportedOperators) || 0,
+            unsupportedAnnotations: Array.isArray(report.unsupportedAnnotations)
+              ? report.unsupportedAnnotations
+              : [],
+            nonVisualAnnotations: Array.isArray(report.nonVisualAnnotations)
+              ? report.nonVisualAnnotations
+              : [],
+            warnings: Array.isArray(report.warnings) ? report.warnings : [],
+            errors: Array.isArray(report.errors) ? report.errors : [],
+          }
+        : null;
   }
+
+  if (n.pinned === undefined) n.pinned = false;
+  if (n.trashed === undefined) n.trashed = false;
+  if (n.folderId === undefined) n.folderId = null;
 
   if (!Array.isArray(n.pages) || n.pages.length === 0) {
     n.pages = [
@@ -101,6 +287,11 @@ function normalizeNote(n) {
         thumbnail: n.thumbnail || null,
         canvasJson: n.canvasJson || null,
         pendingDecomposedData: n.pendingDecomposedData || null,
+        pendingImportData: n.pendingImportData || null,
+        importSchemaVersion: 1,
+        fallbackVisible: true,
+        importReport: null,
+        tags: [],
       },
     ];
   }
@@ -120,11 +311,12 @@ function normalizeNote(n) {
     const detected = new Set();
     let mostUsed = null;
     for (const p of n.pages) {
-      if (p.pendingDecomposedData?.detectedFonts) {
-        p.pendingDecomposedData.detectedFonts.forEach((f) => detected.add(f));
+      const pending = p.pendingImportData || p.pendingDecomposedData;
+      if (pending?.detectedFonts) {
+        pending.detectedFonts.forEach((f) => detected.add(f));
       }
-      if (!mostUsed && p.pendingDecomposedData?.mostUsedFont) {
-        mostUsed = p.pendingDecomposedData.mostUsedFont;
+      if (!mostUsed && pending?.mostUsedFont) {
+        mostUsed = pending.mostUsedFont;
       }
     }
     if (detected.size > 0) {
@@ -149,22 +341,218 @@ function loadNotes() {
   }
 }
 
-function saveNotes() {
+/**
+ * The last JSON written to IndexedDB for each page payload, keyed by storage
+ * key. Editing one page must not rewrite the other thirteen.
+ * @type {Map<string, string>}
+ */
+const persistedPayloads = new Map();
+
+/**
+ * Writes a page payload, skipping the write when it has not changed.
+ *
+ * `null` means the payload was cleared, which deletes the stored copy. That
+ * matters for the import handoff: leaving it behind would let a later load
+ * rebuild the page from its original import data and silently discard every
+ * edit the user has since made.
+ */
+function persistPayload(key, value) {
+  if (!key) return Promise.resolve();
+
+  if (value == null) {
+    if (persistedPayloads.get(key) === null) return Promise.resolve();
+    persistedPayloads.set(key, null);
+    return deleteAssets([key]).catch(() => {});
+  }
+
+  let json;
   try {
-    localStorage.setItem(STORE_KEY, JSON.stringify(notes));
+    json = typeof value === "string" ? value : JSON.stringify(value);
+  } catch {
+    return Promise.resolve();
+  }
+  if (persistedPayloads.get(key) === json) return Promise.resolve();
+
+  persistedPayloads.set(key, json);
+  return putPagePayload(key, json).catch((err) => {
+    // Drop the cached value so the next save retries rather than believing
+    // this payload is already stored.
+    persistedPayloads.delete(key);
+    console.warn("Could not store page data:", err);
+  });
+}
+
+/**
+ * Makes sure every page payload that is currently in memory has been written.
+ *
+ * `saveNotes` strips these payloads from the localStorage record, so anything
+ * not yet in IndexedDB would be dropped on the floor — this is the safety net
+ * for payloads that arrived some other way (a legacy record, or a page whose
+ * graph was assigned directly).
+ */
+function ensurePayloadsPersisted() {
+  for (const note of notes) {
+    for (const page of note.pages || []) {
+      // Pass null rather than skipping, so a cleared payload is deleted
+      // instead of being left to resurrect on the next load.
+      persistPayload(canvasKeyForPage(page), page.canvasJson ?? null);
+      persistPayload(
+        pendingKeyForPage(page),
+        page.pendingImportData ?? page.pendingDecomposedData ?? null,
+      );
+    }
+  }
+}
+
+/**
+ * The localStorage shape of the notebooks: everything except the object graph
+ * and the import handoff, which are far too large to live here.
+ */
+function projectNotesForStorage() {
+  return notes.map((note) => ({
+    ...note,
+    pages: (note.pages || []).map((page) => {
+      const {
+        canvasJson: _canvasJson,
+        pendingImportData: _pendingImportData,
+        pendingDecomposedData: _pendingDecomposedData,
+        ...rest
+      } = page;
+      return rest;
+    }),
+  }));
+}
+
+/**
+ * Loads every page's object graph back out of IndexedDB.
+ *
+ * Must finish before the first render, otherwise every imported page would
+ * come up blank.
+ */
+async function hydrateNotes() {
+  const jobs = [];
+
+  for (const note of notes) {
+    for (const page of note.pages || []) {
+      const canvasKey = canvasKeyForPage(page);
+      if (canvasKey && !page.canvasJson) {
+        jobs.push(
+          getPagePayload(canvasKey)
+            .then((json) => {
+              if (typeof json === "string") {
+                page.canvasJson = JSON.parse(json);
+                // Seed the cache so the first save does not rewrite it.
+                persistedPayloads.set(canvasKey, json);
+              }
+            })
+            .catch(() => {}),
+        );
+      } else if (canvasKey && page.canvasJson) {
+        // Legacy inline graph: keep it, and let the next save move it across.
+        jobs.push(Promise.resolve());
+      }
+
+      // The import handoff is only a fallback for a page that has no persisted
+      // graph yet. Once one exists it is authoritative, so restoring the
+      // handoff would rebuild the page and throw away the user's edits.
+      const pendingKey = pendingKeyForPage(page);
+      if (
+        pendingKey &&
+        !page.canvasJson &&
+        !page.pendingImportData &&
+        !page.pendingDecomposedData
+      ) {
+        jobs.push(
+          getPagePayload(pendingKey)
+            .then((json) => {
+              if (typeof json === "string") {
+                page.pendingImportData = JSON.parse(json);
+                persistedPayloads.set(pendingKey, json);
+              }
+            })
+            .catch(() => {}),
+        );
+      }
+    }
+  }
+
+  await Promise.all(jobs);
+}
+
+function saveNotes() {
+  // Nothing may be stripped from the record until it is safely stored.
+  ensurePayloadsPersisted();
+
+  try {
+    localStorage.setItem(STORE_KEY, JSON.stringify(projectNotesForStorage()));
+    clearStorageWarning();
+    return true;
   } catch (e) {
     console.warn("Storage quota exceeded, stripping thumbnails:", e);
     // If local storage is full, strip heavy thumbnails to allow note save
     try {
-      const stripped = notes.map((n) => ({
+      const stripped = projectNotesForStorage().map((n) => ({
         ...n,
         pages: n.pages.map((p) => ({ ...p, thumbnail: null })),
       }));
       localStorage.setItem(STORE_KEY, JSON.stringify(stripped));
+      return true;
     } catch (err2) {
       console.error("Critical storage failure:", err2);
+      // Losing the notebook silently is the worst possible outcome, so say so.
+      showStorageWarning(err2);
+      return false;
     }
   }
+}
+
+/**
+ * Tells the user their notebook could not be saved.
+ *
+ * The object graph is JSON in localStorage, which has a ~5 MB ceiling — a real
+ * multi-page handwriting import blows past it, and without this the only
+ * symptom is that the notebook is missing after a reload.
+ */
+function showStorageWarning(error) {
+  // Dedupe on presence rather than a flag: the import report toast removes
+  // itself from the DOM, and a flag would then suppress the warning forever.
+  if (document.querySelector(".storage-warning")) return;
+
+  const card = document.createElement("div");
+  // Its own class, deliberately NOT `.import-report` — the completion toast
+  // clears anything with that class and would wipe this warning out.
+  card.className = "storage-warning";
+  card.setAttribute("role", "alert");
+
+  const title = document.createElement("strong");
+  title.textContent = "This notebook is too large to save";
+  card.appendChild(title);
+
+  const detail = document.createElement("span");
+  detail.textContent =
+    "It is open and editable, but changes will be lost when you reload. " +
+    "Export it to PDF to keep a copy, or split it into smaller notebooks.";
+  card.appendChild(detail);
+
+  const reason = document.createElement("em");
+  reason.textContent = String(error?.name || error?.message || "Storage is full");
+  card.appendChild(reason);
+
+  const close = document.createElement("button");
+  close.type = "button";
+  close.className = "import-report-close";
+  close.setAttribute("aria-label", "Dismiss");
+  close.textContent = "×";
+  close.addEventListener("click", () => card.remove());
+  card.appendChild(close);
+
+  document.body.appendChild(card);
+  // Deliberately not auto-dismissed: this one matters.
+}
+
+/** Clears the warning once a save finally succeeds. */
+function clearStorageWarning() {
+  document.querySelector(".storage-warning")?.remove();
 }
 
 function getActiveNote() {
@@ -546,6 +934,13 @@ function icon(name, size = 18) {
     chevronDown: `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>`,
     pages: `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2V5a2 2 0 0 0-2-2z"/><path d="M21 7v12a2 2 0 0 1-2 2h-1V9a2 2 0 0 0-2-2h-3"/></svg>`,
     rotate: `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>`,
+    copy: `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>`,
+    cut: `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><line x1="20" y1="4" x2="8.12" y2="15.88"/><line x1="14.47" y1="14.48" x2="20" y2="20"/><line x1="8.12" y1="8.12" x2="12" y2="12"/></svg>`,
+    paste: `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/><rect x="8" y="2" width="8" height="4" rx="1" ry="1"/></svg>`,
+    tag: `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg>`,
+    star: `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>`,
+    starFilled: `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>`,
+    restore: `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7v6h6"/><path d="M21 17a9 9 0 0 0-9-9 9 9 0 0 0-6 2.3L3 13"/></svg>`,
   };
   return icons[name] || "";
 }
@@ -584,7 +979,72 @@ function renderLoading() {
   }
 }
 
+function notesInCurrentView() {
+  // What the library should show right now, given `activeFolder`.
+  // activeFolder is "unfiled" | "pinned" | "trashed" | "folder:<id>".
+  if (activeFolder === "pinned") {
+    return notes.filter((n) => n.pinned && !n.trashed);
+  }
+  if (activeFolder === "trashed") {
+    return notes.filter((n) => n.trashed);
+  }
+  if (activeFolder && activeFolder.startsWith(FOLDER_PREFIX)) {
+    const id = activeFolder.slice(FOLDER_PREFIX.length);
+    return notes.filter((n) => !n.trashed && n.folderId === id);
+  }
+  // Unfiled: not trashed, not pinned, no folder.
+  return notes.filter((n) => !n.trashed && !n.pinned && !n.folderId);
+}
+
+function noteCount(bucket) {
+  if (bucket === "unfiled") {
+    return notes.filter((n) => !n.trashed && !n.pinned && !n.folderId).length;
+  }
+  if (bucket === "pinned") {
+    return notes.filter((n) => n.pinned && !n.trashed).length;
+  }
+  if (bucket === "trashed") {
+    return notes.filter((n) => n.trashed).length;
+  }
+  return 0;
+}
+
+function libraryHeading() {
+  if (activeFolder === "pinned") return "Pinned";
+  if (activeFolder === "trashed") return "Trash";
+  if (activeFolder && activeFolder.startsWith(FOLDER_PREFIX)) {
+    return folderById(activeFolder.slice(FOLDER_PREFIX.length))?.name || "Folder";
+  }
+  return "Unfiled";
+}
+
+function emptyMessage() {
+  if (activeFolder === "pinned") return "No pinned notebooks yet. Pin one from a card.";
+  if (activeFolder === "trashed") return "Trash is empty.";
+  if (activeFolder && activeFolder.startsWith(FOLDER_PREFIX)) {
+    return "No notebooks in this folder.";
+  }
+  return "No notebooks yet. Create one or import a PDF.";
+}
+
+function folderById(id) {
+  return folders.find((f) => f.id === id) || null;
+}
+
 function libraryView() {
+  const visibleNotes = notesInCurrentView();
+  const folderList = folders
+    .map(
+      (f) => `
+      <button class="side ${activeFolder === FOLDER_PREFIX + f.id ? "active" : ""}" data-folder="${FOLDER_PREFIX}${escapeHtml(f.id)}">
+        ${icon("folder", 16)}
+        <span>${escapeHtml(f.name)}</span>
+        <span class="side-badge">${notes.filter((n) => !n.trashed && n.folderId === f.id).length}</span>
+        <button class="side-remove" data-remove-folder="${escapeHtml(f.id)}" title="Delete folder">${icon("close", 12)}</button>
+      </button>`,
+    )
+    .join("");
+
   return `
     <div class="shell">
       <aside>${sidebar()}</aside>
@@ -592,7 +1052,7 @@ function libraryView() {
         <header class="library-top">
           <div class="library-top-title">
             ${icon("folder", 22)}
-            <h1>Unfiled</h1>
+            <h1>${escapeHtml(libraryHeading())}</h1>
           </div>
           <div class="library-actions">
             <div class="search-bar">
@@ -604,6 +1064,14 @@ function libraryView() {
               Import PDF
               <input type="file" accept="application/pdf,.pdf" id="pdf-input" />
             </label>
+            <select
+              id="import-mode"
+              class="import-mode-select"
+              title="Make editable rebuilds the PDF's content as native objects, so it costs several times the file size and takes longer. Annotate PDF keeps the original and draws on top of it."
+            >
+              <option value="editable">Make editable</option>
+              <option value="annotations">Annotate PDF</option>
+            </select>
             <button class="new-note-btn" id="new-note-btn">
               ${icon("plus", 16)}
               New Note
@@ -611,9 +1079,9 @@ function libraryView() {
           </div>
         </header>
 
-        <p class="library-section-label">All Documents (${notes.length})</p>
+        <p class="library-section-label">${escapeHtml(libraryHeading())} (${visibleNotes.length})</p>
         <div class="note-grid">
-          ${notes.map(noteCard).join("")}
+          ${visibleNotes.length ? visibleNotes.map((n) => noteCard(n, activeFolder)).join("") : `<div class="library-empty">${emptyMessage()}</div>`}
         </div>
 
         <button class="fab" id="fab-new-note" title="Create New Note">
@@ -625,6 +1093,18 @@ function libraryView() {
 }
 
 function sidebar() {
+  const folderList = folders
+    .map(
+      (f) => `
+      <button class="side ${activeFolder === FOLDER_PREFIX + f.id ? "active" : ""}" data-folder="${FOLDER_PREFIX}${escapeHtml(f.id)}">
+        ${icon("folder", 16)}
+        <span>${escapeHtml(f.name)}</span>
+        <span class="side-badge">${notes.filter((n) => !n.trashed && n.folderId === f.id).length}</span>
+        <button class="side-remove" data-remove-folder="${escapeHtml(f.id)}" title="Delete folder">${icon("close", 12)}</button>
+      </button>`,
+    )
+    .join("");
+
   return `
     <div class="profile">
       <div class="profile-avatar">O</div>
@@ -641,15 +1121,17 @@ function sidebar() {
       <button class="side ${activeFolder === "unfiled" ? "active" : ""}" data-folder="unfiled">
         ${icon("folder", 16)}
         <span>Unfiled</span>
-        <span class="side-badge">${notes.length}</span>
+        <span class="side-badge">${noteCount("unfiled")}</span>
       </button>
       <button class="side ${activeFolder === "pinned" ? "active" : ""}" data-folder="pinned">
-        ${icon("pin", 16)}
+        ${icon("star", 16)}
         <span>Pinned</span>
+        <span class="side-badge">${noteCount("pinned")}</span>
       </button>
-      <button class="side ${activeFolder === "trash" ? "active" : ""}" data-folder="trash">
+      <button class="side ${activeFolder === "trashed" ? "active" : ""}" data-folder="trashed">
         ${icon("trash", 16)}
         <span>Trashed</span>
+        <span class="side-badge">${noteCount("trashed")}</span>
       </button>
     </nav>
 
@@ -659,15 +1141,16 @@ function sidebar() {
       <span>Folders</span>
     </div>
     <nav>
-      <button class="side">
-        ${icon("folder", 16)}
-        <span>Lecture Notes</span>
+      ${folders.length === 0 ? `<button class="side side-disabled" disabled>${icon("folder", 16)}<span>No folders yet</span></button>` : folderList}
+      <button class="side side-add" id="new-folder-btn" title="Create a new folder">
+        ${icon("plus", 16)}
+        <span>New folder</span>
       </button>
     </nav>
   `;
 }
 
-function noteCard(note) {
+function noteCard(note, view) {
   const firstPage = note.pages?.[0];
   const pageCount = note.pages?.length || 1;
   const thumbAssetId = firstPage?.thumbnailAssetId || note.thumbnailAssetId;
@@ -682,19 +1165,40 @@ function noteCard(note) {
     thumbMarkup = `<img src="${legacyThumb}" alt="" />`;
   }
 
+  const inTrash = view === "trashed";
+  const folderOptions = [
+    `<option value="__none__"${!note.folderId ? " selected" : ""}>No folder</option>`,
+    ...folders.map(
+      (f) =>
+        `<option value="${escapeHtml(f.id)}"${note.folderId === f.id ? " selected" : ""}>${escapeHtml(f.name)}</option>`,
+    ),
+  ].join("");
+
+  // The trash icon doubles as "Move to trash" outside trash, "Delete forever"
+  // inside it (with confirm). "Restore" only appears in trash.
+  const trashTitle = inTrash ? "Delete forever" : "Move to trash";
+  const pinTitle = note.pinned ? "Unpin" : "Pin";
+  const folderSelect = inTrash
+    ? ""
+    : `<select class="card-folder-select" data-folder-select="${escapeHtml(note.id)}" title="Move to folder" aria-label="Move to folder">${folderOptions}</select>`;
+
   return `
     <div class="note-card-wrapper">
-      <button class="note-card" data-open="${note.id}">
+      <button class="note-card" data-open="${escapeHtml(note.id)}">
         <div class="preview ${firstPage?.paperStyle ? `paper-${firstPage.paperStyle}` : ""}">
           ${note.isPdf ? `<span class="preview-badge">${pageCount} ${pageCount === 1 ? "Page" : "Pages"}</span>` : ""}
           ${thumbMarkup}
         </div>
         <strong>${escapeHtml(note.title)}</strong>
         <small>${pageCount} ${pageCount === 1 ? "page" : "pages"} · ${note.isPdf ? "PDF Document" : "Notebook"}</small>
+        ${folderSelect}
       </button>
-      <button class="card-delete-btn" data-delete-note="${note.id}" title="Delete notebook">
-        ${icon("trash", 14)}
-      </button>
+      <div class="card-actions">
+        ${inTrash
+          ? `<button class="card-restore-btn" data-restore="${escapeHtml(note.id)}" title="Restore">${icon("restore", 14)}</button>`
+          : `<button class="card-pin-btn ${note.pinned ? "is-pinned" : ""}" data-pin="${escapeHtml(note.id)}" title="${pinTitle}">${icon(note.pinned ? "starFilled" : "star", 14)}</button>`}
+        <button class="card-delete-btn" data-delete-note="${escapeHtml(note.id)}" title="${trashTitle}">${icon("trash", 14)}</button>
+      </div>
     </div>
   `;
 }
@@ -814,8 +1318,9 @@ function updateFontToolbarState(selected) {
 }
 
 function editorView(note) {
-  const defaultColors = ["#176a72"];
-  const allColors = Array.from(new Set([...customColors, ...defaultColors]));
+  const allColors = Array.from(
+    new Set(customColors.length ? customColors : [DEFAULT_COLOR]),
+  );
 
   const page = getCurrentPage();
   const pageIndex = note.currentPageIndex || 0;
@@ -989,19 +1494,15 @@ function editorView(note) {
           <!-- Swatches & Custom Picker -->
           <div class="swatches-stack">
             ${allColors
-              .slice(0, 11)
+              .slice(0, MAX_SWATCHES)
               .map(
                 (c, idx) => `
-              <label class="swatch-dot ${c === currentColor ? "chosen" : ""}" data-color="${c}" data-swatch-idx="${idx}" style="--swatch:${c}" title="Click to use, double-click to change, Right-click to delete">
-                <input type="color" class="swatch-edit-input" value="${c}" data-swatch-idx="${idx}" />
-              </label>
+              <label class="swatch-dot ${c === currentColor ? "chosen" : ""}" data-color="${c}" data-swatch-idx="${idx}" style="--swatch:${c}" title="Click to use · click again to change · right-click to remove"></label>
             `,
               )
               .join("")}
-            <div style="position:relative">
-              <button class="swatch-add-btn" id="add-color-btn" title="Add new color">+</button>
-              <input type="color" id="add-color-input" class="swatch-edit-input" value="${currentColor}" />
-            </div>
+            <button type="button" class="swatch-add-btn" id="add-color-btn" title="Add a new color">+</button>
+            <input type="color" id="color-picker-input" class="swatch-edit-input" value="${currentColor}" tabindex="-1" aria-hidden="true" />
           </div>
         </nav>
 
@@ -1071,7 +1572,7 @@ function pageManagerTilesHtml(note) {
       return `
         <div class="pm-cell">
           <span class="pm-num">Page ${i + 1}</span>
-          <button class="pm-tile ${selected ? "selected" : ""}" data-index="${i}" title="Page ${i + 1} — click to toggle, shift-click to range-select">
+          <button class="pm-tile ${selected ? "selected" : ""}" data-index="${i}" title="Page ${i + 1} — click to toggle, shift-click for a range, drag to reorder">
             <span class="pm-check">✓</span>
             ${thumbEl}
             ${tags}
@@ -1146,10 +1647,69 @@ function updatePageManagerSelectionUI() {
   if (pasteBtn) pasteBtn.disabled = pageClipboard.length === 0;
 }
 
+function clearPageManagerDropMarkers() {
+  document
+    .querySelectorAll("#page-manager-grid .pm-tile.pm-drop-target")
+    .forEach((t) => t.classList.remove("pm-drop-target"));
+}
+
+/**
+ * Where an index lands after `from` is spliced out and re-inserted at `to`.
+ * Reordering shifts everything between the two, so the selection, the shift
+ * anchor, the thumbnails and the active page all have to be remapped or they
+ * end up pointing at the wrong pages.
+ */
+function remapIndexForMove(index, from, to) {
+  if (index === from) return to;
+  if (from < to && index > from && index <= to) return index - 1;
+  if (to < from && index >= to && index < from) return index + 1;
+  return index;
+}
+
+function reorderPages(from, to) {
+  const note = getActiveNote();
+  if (!note || !Array.isArray(note.pages)) return;
+  if (from === to) return;
+  if (from < 0 || to < 0 || from >= note.pages.length || to >= note.pages.length) {
+    return;
+  }
+
+  const [moved] = note.pages.splice(from, 1);
+  note.pages.splice(to, 0, moved);
+
+  // Thumbnails are index-aligned with pages. Moving them together means the
+  // grid can be repainted from the existing images instead of re-rendering
+  // every page after a drop.
+  pageManagerThumbs.splice(to, 0, pageManagerThumbs.splice(from, 1)[0]);
+
+  note.pages.forEach((p, i) => {
+    p.pageNumber = i + 1;
+  });
+
+  pageManagerSelection = new Set(
+    Array.from(pageManagerSelection, (i) => remapIndexForMove(i, from, to)),
+  );
+  if (pageManagerAnchor !== null) {
+    pageManagerAnchor = remapIndexForMove(pageManagerAnchor, from, to);
+  }
+  note.currentPageIndex = remapIndexForMove(note.currentPageIndex, from, to);
+
+  saveNotes();
+  // The editor's page stack is rendered from `note.pages`, so it has to be
+  // rebuilt for the new order to take effect. Hold the zoom across it.
+  zoomRestoreTarget = currentZoom;
+  render();
+}
+
 function bindPageManagerGrid() {
   document.querySelectorAll("#page-manager-grid .pm-tile").forEach((tile) => {
+    const i = Number(tile.dataset.index);
+
     tile.addEventListener("click", (e) => {
-      const i = Number(tile.dataset.index);
+      if (pageManagerSuppressClick) {
+        pageManagerSuppressClick = false;
+        return;
+      }
       if (e.shiftKey && pageManagerAnchor !== null) {
         const a = Math.min(pageManagerAnchor, i);
         const b = Math.max(pageManagerAnchor, i);
@@ -1161,6 +1721,69 @@ function bindPageManagerGrid() {
       }
       updatePageManagerSelectionUI();
     });
+
+    // Drag-to-reorder.
+    //
+    // Pointer events rather than HTML5 drag-and-drop: the same gesture then
+    // works with a mouse, trackpad and stylus, and click-to-select keeps
+    // working because a press only becomes a drag past a small threshold.
+    tile.addEventListener("pointerdown", (e) => {
+      pageManagerSuppressClick = false;
+      // A touch drag should scroll the grid, not start a reorder.
+      if (e.button !== 0 || e.pointerType === "touch") return;
+      pageManagerDrag = {
+        index: i,
+        startX: e.clientX,
+        startY: e.clientY,
+        active: false,
+        over: null,
+      };
+      tile.setPointerCapture?.(e.pointerId);
+    });
+
+    tile.addEventListener("pointermove", (e) => {
+      const drag = pageManagerDrag;
+      if (!drag || drag.index !== i) return;
+
+      if (!drag.active) {
+        const travelled = Math.hypot(
+          e.clientX - drag.startX,
+          e.clientY - drag.startY,
+        );
+        if (travelled < PM_DRAG_THRESHOLD) return;
+        drag.active = true;
+        tile.classList.add("pm-dragging");
+      }
+
+      // Pointer capture routes events to this tile, so hit-test explicitly to
+      // find which tile is actually under the cursor.
+      const under = document.elementFromPoint(e.clientX, e.clientY);
+      const target = under && under.closest ? under.closest(".pm-tile") : null;
+      const over = target && target !== tile ? Number(target.dataset.index) : null;
+
+      if (over !== drag.over) {
+        clearPageManagerDropMarkers();
+        drag.over = over;
+        if (over !== null) target.classList.add("pm-drop-target");
+      }
+    });
+
+    const finishDrag = (e) => {
+      const drag = pageManagerDrag;
+      if (!drag || drag.index !== i) return;
+      pageManagerDrag = null;
+      tile.releasePointerCapture?.(e.pointerId);
+      tile.classList.remove("pm-dragging");
+      clearPageManagerDropMarkers();
+
+      // An ordinary click falls through to the click handler above.
+      if (!drag.active) return;
+      pageManagerSuppressClick = true;
+      if (drag.over !== null && drag.over !== i) reorderPages(i, drag.over);
+    };
+
+    tile.addEventListener("pointerup", finishDrag);
+    tile.addEventListener("pointercancel", finishDrag);
   });
 }
 
@@ -1327,9 +1950,7 @@ async function pmDelete() {
     // Don't delete assets still referenced by other (e.g. copied) pages.
     const remainingIds = new Set();
     for (const p of note.pages) {
-      if (p.backgroundAssetId) remainingIds.add(p.backgroundAssetId);
-      if (p.thumbnailAssetId) remainingIds.add(p.thumbnailAssetId);
-      if (p.pdfAssetId) remainingIds.add(p.pdfAssetId);
+      for (const id of collectPageAssetIds(p)) remainingIds.add(id);
     }
     const ids = collectPageAssetIds(removed).filter(
       (id) => id && !remainingIds.has(id),
@@ -1523,6 +2144,8 @@ async function initEditor(note) {
     zoomRestoreTarget = null;
   }
 
+  let needsSave = false;
+
   for (let i = 0; i < note.pages.length; i++) {
     const page = note.pages[i];
     const canvasEl = document.querySelector(`#omni-canvas-${i}`);
@@ -1564,6 +2187,14 @@ async function initEditor(note) {
     engine.setTool(currentTool);
     await engine.loadPage(page);
 
+    // The import handoff is one-shot: clear it only once the page has actually
+    // been loaded, so a failed load can still be retried on the next open.
+    if (page.pendingImportData || page.pendingDecomposedData) {
+      page.pendingImportData = null;
+      page.pendingDecomposedData = null;
+      needsSave = true;
+    }
+
     // Initial welcome text on first page
     if (
       i === 0 &&
@@ -1588,7 +2219,11 @@ async function initEditor(note) {
     // Only pages near the viewport render at full quality; the rest are held
     // at 100% until scrolled to.
     engine.isActivePage = Math.abs(i - note.currentPageIndex) <= 1;
-    if (note.pdfAssetId && Number.isInteger(page.pdfPageIndex)) {
+    if (
+      note.pdfAssetId &&
+      Number.isInteger(page.pdfPageIndex) &&
+      !page.fallbackFromImage
+    ) {
       engine.setPdfBackgroundSource({
         assetId: note.pdfAssetId,
         pageIndex: page.pdfPageIndex,
@@ -1596,6 +2231,16 @@ async function initEditor(note) {
     }
 
     canvasEngines.push(engine);
+  }
+
+  // `saveActiveCanvasPage` refuses to run while `canvasEngines` is still being
+  // filled, so the `onModified` fired by the first page's `loadPage` is a no-op
+  // and the freshly imported object graph was never written back. Persist it
+  // here instead, or reopening the notebook would show a blank page.
+  if (needsSave) {
+    saveActiveCanvasPage();
+  } else {
+    saveNotes();
   }
 
   // Carry the global zoom across engines so each page renders at the current scale.
@@ -1877,7 +2522,14 @@ function bindEditorEvents(note) {
       if (note.pages.length <= 1) return;
       if (confirm(`Delete Page ${note.currentPageIndex + 1}?`)) {
         const [removed] = note.pages.splice(note.currentPageIndex, 1);
-        await deleteAssets(collectPageAssetIds(removed));
+        // Copied pages can share image assets with the page being deleted.
+        const stillUsed = new Set();
+        for (const p of note.pages) {
+          for (const id of collectPageAssetIds(p)) stillUsed.add(id);
+        }
+        await deleteAssets(
+          collectPageAssetIds(removed).filter((id) => id && !stillUsed.has(id)),
+        );
         if (note.currentPageIndex >= note.pages.length) {
           note.currentPageIndex = note.pages.length - 1;
         }
@@ -2139,12 +2791,6 @@ function bindEditorEvents(note) {
   });
 
   document
-    .querySelector("#delete-element-btn")
-    ?.addEventListener("click", () => {
-      getActiveCanvasEngine()?.deleteSelected();
-    });
-
-  document
     .querySelector("#delete-notebook-btn")
     ?.addEventListener("click", () => {
       if (confirm(`Are you sure you want to delete "${note.title}"?`)) {
@@ -2235,244 +2881,138 @@ function bindEditorEvents(note) {
     }
   };
 
-  // Quick Swatches — single click = use color, hover shows context menu
-  let activeSwatchMenu = null;
+  /** Applies `hex` everywhere and marks `btn` (if given) as the chosen swatch. */
+  const useColor = (hex, btn) => {
+    currentColor = hex;
+    canvasEngines.forEach((eng) => eng.setColor(hex));
+    updateThicknessPreview();
+    document
+      .querySelectorAll(".swatch-dot")
+      .forEach((b) => b.classList.remove("chosen"));
+    if (btn) btn.classList.add("chosen");
+  };
 
-  function createSwatchContextMenu(btn, idx) {
-    // Remove any existing menu
-    if (activeSwatchMenu) {
-      activeSwatchMenu.remove();
-      activeSwatchMenu = null;
-    }
-
-    const menu = document.createElement("div");
-    menu.className = "swatch-context-menu";
-    menu.innerHTML = `
-      <button class="swatch-menu-btn swatch-edit-btn" title="Edit color">✎ Edit</button>
-      <button class="swatch-menu-btn swatch-delete-btn" title="Delete color">🗑 Delete</button>
-    `;
-
-    const rect = btn.getBoundingClientRect();
-    menu.style.left = `${rect.left}px`;
-    menu.style.top = `${rect.bottom + 4}px`;
-
-    document.body.appendChild(menu);
-    activeSwatchMenu = menu;
-
-    // Edit button
-    menu.querySelector(".swatch-edit-btn").addEventListener("click", (e) => {
-      e.stopPropagation();
-      const input = btn.querySelector(".swatch-edit-input");
-      if (input) input.click();
-      menu.remove();
-      activeSwatchMenu = null;
-    });
-
-    // Delete button
-    menu.querySelector(".swatch-delete-btn").addEventListener("click", (e) => {
-      e.stopPropagation();
-      if (idx < customColors.length) {
-        customColors.splice(idx, 1);
-        localStorage.setItem(
-          "omninote-custom-colors",
-          JSON.stringify(customColors),
-        );
-        btn.remove();
-
-        // Re-index remaining custom color swatches
-        document.querySelectorAll(".swatch-dot").forEach((b) => {
-          const i = Number(b.dataset.swatchIdx);
-          if (i > idx && i <= customColors.length) {
-            b.dataset.swatchIdx = i - 1;
-            const input = b.querySelector(".swatch-edit-input");
-            if (input) input.dataset.swatchIdx = i - 1;
-          }
-        });
+  // Quick Swatches — click to use, double-click to change, right-click to drop.
+  // Shared by the rendered swatches and any swatch added later, so both behave
+  // identically.
+  const bindSwatch = (btn) => {
+    // First click applies the colour; clicking the swatch that is already
+    // chosen is what opens the picker to change it. There is deliberately no
+    // separate edit affordance in the UI.
+    btn.addEventListener("click", () => {
+      if (btn.dataset.color === currentColor) {
+        editSwatchColor(btn);
+      } else {
+        useColor(btn.dataset.color, btn);
       }
-      menu.remove();
-      activeSwatchMenu = null;
     });
 
-    // Close on outside click
-    setTimeout(() => {
-      document.addEventListener("click", function closeMenu(e) {
-        if (!menu.contains(e.target) && e.target !== btn) {
-          menu.remove();
-          activeSwatchMenu = null;
-          document.removeEventListener("click", closeMenu);
-        }
-      });
-    }, 0);
+    btn.addEventListener("contextmenu", (e) => {
+      e.preventDefault();
+      removeSwatch(btn);
+    });
+  };
+
+  /** Opens the picker to recolour an existing swatch in place. */
+  const editSwatchColor = (btn) => {
+    openColorPicker(btn.dataset.color, (hex) => {
+      const swIdx = Number(btn.dataset.swatchIdx);
+      if (swIdx >= 0 && swIdx < customColors.length) {
+        customColors[swIdx] = hex;
+      } else {
+        customColors.push(hex);
+        btn.dataset.swatchIdx = String(customColors.length - 1);
+      }
+      btn.style.setProperty("--swatch", hex);
+      btn.dataset.color = hex;
+      saveCustomColors();
+      useColor(hex, btn);
+    });
+  };
+
+  /**
+   * Removes a swatch. The last colour can never go — without one there is
+   * nothing to draw with — and if the removed colour was the one in use, the
+   * first remaining colour takes over so the tool never ends up colourless.
+   */
+  const removeSwatch = (btn) => {
+    if (customColors.length <= 1) return;
+    const swIdx = Number(btn.dataset.swatchIdx);
+    if (!Number.isFinite(swIdx) || swIdx < 0 || swIdx >= customColors.length) {
+      return;
+    }
+    const wasInUse = btn.dataset.color === currentColor;
+    customColors.splice(swIdx, 1);
+    saveCustomColors();
+    btn.remove();
+
+    document.querySelectorAll(".swatch-dot").forEach((b) => {
+      const i = Number(b.dataset.swatchIdx);
+      if (i > swIdx && i <= customColors.length) b.dataset.swatchIdx = i - 1;
+    });
+
+    if (wasInUse) {
+      const first = document.querySelector(".swatch-dot");
+      useColor(first ? first.dataset.color : DEFAULT_COLOR, first);
+    }
+    refreshAddColorButton();
+  };
+
+  document.querySelectorAll(".swatch-dot[data-color]").forEach(bindSwatch);
+  refreshAddColorButton();
+
+  // The shared picker input.
+  const colorInput = document.querySelector("#color-picker-input");
+  if (colorInput) {
+    colorInput.addEventListener("change", (e) =>
+      commitColorPicker(e.target.value),
+    );
+    // Fired when the user dismisses the picker without choosing.
+    colorInput.addEventListener("cancel", () => commitColorPicker(null));
+    // Last resort if neither of the above arrives: focus loss clears the flag
+    // on the next tick, i.e. after `change` has already had its turn.
+    colorInput.addEventListener("blur", () => {
+      setTimeout(() => commitColorPicker(null), 0);
+    });
   }
 
-  // Quick Swatches — single click = use color, hover shows context menu
-  document.querySelectorAll(".swatch-dot[data-color]").forEach((btn) => {
-    const idx = Number(btn.dataset.swatchIdx);
-
-    // Single click: select this color
-    btn.addEventListener("click", (e) => {
-      // Don't fire if the hidden input was the target
-      if (e.target.classList.contains("swatch-edit-input")) return;
-      currentColor = btn.dataset.color;
-      canvasEngines.forEach((eng) => eng.setColor(currentColor));
-      updateThicknessPreview();
-      document
-        .querySelectorAll(".swatch-dot")
-        .forEach((b) => b.classList.remove("chosen"));
-      btn.classList.add("chosen");
-    });
-
-    // Hover: show context menu for custom colors (not default)
-    let hoverTimeout = null;
-    btn.addEventListener("mouseenter", () => {
-      if (idx < customColors.length) {
-        hoverTimeout = setTimeout(() => {
-          createSwatchContextMenu(btn, idx);
-        }, 400);
-      }
-    });
-
-    btn.addEventListener("mouseleave", () => {
-      if (hoverTimeout) clearTimeout(hoverTimeout);
-    });
-
-    // When picker confirms a new color, update the swatch in-place
-    const editInput = btn.querySelector(".swatch-edit-input");
-    if (editInput) {
-      editInput.addEventListener("input", (e) => {
-        currentColor = e.target.value;
-        canvasEngines.forEach((eng) => eng.setColor(currentColor));
-        updateThicknessPreview();
-        btn.style.setProperty("--swatch", currentColor);
-        btn.dataset.color = currentColor;
-        document
-          .querySelectorAll(".swatch-dot")
-          .forEach((b) => b.classList.remove("chosen"));
-        btn.classList.add("chosen");
-      });
-      editInput.addEventListener("change", (e) => {
-        const newColor = e.target.value;
-        const idx = Number(editInput.dataset.swatchIdx);
-        // Update in customColors or replace the default
-        const defaultColors = ["#176a72"];
-        const allOld = [
-          ...customColors,
-          ...defaultColors.filter((c) => !customColors.includes(c)),
-        ];
-        if (idx < allOld.length) {
-          if (idx < customColors.length) {
-            customColors[idx] = newColor;
-          } else {
-            customColors.push(newColor);
-          }
-          localStorage.setItem(
-            "omninote-custom-colors",
-            JSON.stringify(customColors),
-          );
-        }
-      });
-    }
-  });
-
-  // Add new color button
+  // Add new color button — opens the same shared picker, repeatedly.
   const addColorBtn = document.querySelector("#add-color-btn");
-  const addColorInput = document.querySelector("#add-color-input");
-  if (addColorBtn && addColorInput) {
+  if (addColorBtn) {
     addColorBtn.addEventListener("click", () => {
-      addColorInput.click();
-    });
-    addColorInput.addEventListener("change", (e) => {
-      const newColor = e.target.value;
-      if (!customColors.includes(newColor)) {
-        customColors.push(newColor);
-        localStorage.setItem(
-          "omninote-custom-colors",
-          JSON.stringify(customColors),
+      openColorPicker(currentColor, (hex) => {
+        // Re-picking a colour that already has a swatch just selects it,
+        // rather than adding a duplicate.
+        const existing = document.querySelector(
+          `.swatch-dot[data-color="${hex}"]`,
         );
-      }
-      currentColor = newColor;
-      canvasEngines.forEach((eng) => eng.setColor(currentColor));
-      updateThicknessPreview();
-
-      // Inject swatch into DOM before the + button
-      const stack = document.querySelector(".swatches-stack");
-      if (stack && addColorBtn) {
-        const idx = customColors.length - 1;
-        const swatchHtml = `<label class="swatch-dot chosen" data-color="${newColor}" data-swatch-idx="${idx}" style="--swatch:${newColor}" title="Click to use, double-click to change, Right-click to delete">
-          <input type="color" class="swatch-edit-input" value="${newColor}" data-swatch-idx="${idx}" />
-        </label>`;
-        const wrapDiv = addColorBtn.parentElement;
-        wrapDiv.insertAdjacentHTML("beforebegin", swatchHtml);
-
-        document
-          .querySelectorAll(".swatch-dot")
-          .forEach((b) => b.classList.remove("chosen"));
-
-        // Bind the new swatch
-        const newSwatch = wrapDiv.previousElementSibling;
-        newSwatch.classList.add("chosen");
-        newSwatch.addEventListener("click", (ev) => {
-          if (ev.target.classList.contains("swatch-edit-input")) return;
-          currentColor = newSwatch.dataset.color;
-          canvasEngines.forEach((eng) => eng.setColor(currentColor));
-          updateThicknessPreview();
-          document
-            .querySelectorAll(".swatch-dot")
-            .forEach((b) => b.classList.remove("chosen"));
-          newSwatch.classList.add("chosen");
-        });
-        newSwatch.addEventListener("dblclick", () => {
-          const input = newSwatch.querySelector(".swatch-edit-input");
-          if (input) input.click();
-        });
-        newSwatch.addEventListener("contextmenu", (e) => {
-          e.preventDefault();
-          const idxStr = newSwatch.dataset.swatchIdx;
-          if (!idxStr) return;
-          const swIdx = Number(idxStr);
-          if (swIdx < customColors.length) {
-            customColors.splice(swIdx, 1);
-            localStorage.setItem(
-              "omninote-custom-colors",
-              JSON.stringify(customColors),
-            );
-            newSwatch.remove();
-            document.querySelectorAll(".swatch-dot").forEach((b) => {
-              const i = Number(b.dataset.swatchIdx);
-              if (i > swIdx && i <= customColors.length) {
-                b.dataset.swatchIdx = i - 1;
-                const input = b.querySelector(".swatch-edit-input");
-                if (input) input.dataset.swatchIdx = i - 1;
-              }
-            });
-          }
-        });
-        const editInput = newSwatch.querySelector(".swatch-edit-input");
-        if (editInput) {
-          editInput.addEventListener("input", (ev) => {
-            currentColor = ev.target.value;
-            canvasEngines.forEach((eng) => eng.setColor(currentColor));
-            updateThicknessPreview();
-            newSwatch.style.setProperty("--swatch", currentColor);
-            newSwatch.dataset.color = currentColor;
-            document
-              .querySelectorAll(".swatch-dot")
-              .forEach((b) => b.classList.remove("chosen"));
-            newSwatch.classList.add("chosen");
-          });
-          editInput.addEventListener("change", (ev) => {
-            const updatedColor = ev.target.value;
-            const swIdx = Number(editInput.dataset.swatchIdx);
-            if (swIdx < customColors.length) {
-              customColors[swIdx] = updatedColor;
-              localStorage.setItem(
-                "omninote-custom-colors",
-                JSON.stringify(customColors),
-              );
-            }
-          });
+        if (existing) {
+          useColor(hex, existing);
+          return;
         }
-      }
+
+        customColors.push(hex);
+        saveCustomColors();
+
+        const stack = document.querySelector(".swatches-stack");
+        if (!stack) {
+          useColor(hex, null);
+          return;
+        }
+
+        const swatch = document.createElement("label");
+        swatch.className = "swatch-dot chosen";
+        swatch.dataset.color = hex;
+        swatch.dataset.swatchIdx = String(customColors.length - 1);
+        swatch.style.setProperty("--swatch", hex);
+        swatch.title =
+          "Click to use · click again to change · right-click to remove";
+        // Insert before the + button so new colours stack above it.
+        stack.insertBefore(swatch, addColorBtn);
+        bindSwatch(swatch);
+        useColor(hex, swatch);
+        refreshAddColorButton();
+      });
     });
   }
 
@@ -2517,6 +3057,11 @@ function bindEditorEvents(note) {
       }
       return;
     }
+
+    // Never steal keys from a focused form field. On macOS the key labelled
+    // "Delete" reports `Backspace`, so correcting a digit in the zoom field
+    // would otherwise delete the selected object and swallow the keystroke.
+    if (isTypingTarget(e.target)) return;
 
     const engine = getActiveCanvasEngine();
     const isEditingText = engine?.canvas.getActiveObject()?.isEditing;
@@ -2630,25 +3175,120 @@ function bindLibraryEvents() {
     });
   });
 
-  // Delete note from library card
+  // Sidebar destinations: Unfiled / Pinned / Trash / individual folders.
+  document.querySelectorAll(".side[data-folder]").forEach((btn) => {
+    btn.addEventListener("click", (e) => {
+      // Folder rows have a small × button to delete the folder; ignore those.
+      if (e.target.closest("[data-remove-folder]")) return;
+      const target = btn.dataset.folder;
+      // If the folder it points to was deleted, fall back to Unfiled.
+      if (target && target.startsWith(FOLDER_PREFIX)) {
+        const id = target.slice(FOLDER_PREFIX.length);
+        if (!folderById(id)) {
+          activeFolder = "unfiled";
+          render();
+          return;
+        }
+      }
+      activeFolder = target;
+      render();
+    });
+  });
+
+  // "+ New folder" button — prompts for a name and creates the folder.
+  document.querySelector("#new-folder-btn")?.addEventListener("click", () => {
+    const name = (prompt("Folder name:") || "").trim();
+    if (!name) return;
+    const folder = { id: crypto.randomUUID(), name, createdAt: Date.now() };
+    folders = [...folders, folder];
+    saveFolders();
+    activeFolder = FOLDER_PREFIX + folder.id;
+    render();
+  });
+
+  // Per-folder × to remove (notes inside the folder become Unfiled).
+  document.querySelectorAll("[data-remove-folder]").forEach((btn) => {
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      const id = btn.dataset.removeFolder;
+      const folder = folderById(id);
+      if (!folder) return;
+      if (!confirm(`Delete folder "${folder.name}"? Notes inside will move to Unfiled.`)) return;
+      const moved = notes.filter((n) => n.folderId === id).length;
+      for (const n of notes) if (n.folderId === id) n.folderId = null;
+      folders = folders.filter((f) => f.id !== id);
+      saveFolders();
+      saveNotes();
+      if (activeFolder === FOLDER_PREFIX + id) activeFolder = "unfiled";
+      console.info(`Removed folder "${folder.name}" (${moved} notes moved to Unfiled)`);
+      render();
+    });
+  });
+
+  // Pin toggle on a card.
+  document.querySelectorAll("[data-pin]").forEach((btn) => {
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      const n = notes.find((x) => x.id === btn.dataset.pin);
+      if (!n) return;
+      n.pinned = !n.pinned;
+      saveNotes();
+      render();
+    });
+  });
+
+  // Restore from Trash.
+  document.querySelectorAll("[data-restore]").forEach((btn) => {
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      const n = notes.find((x) => x.id === btn.dataset.restore);
+      if (!n) return;
+      n.trashed = false;
+      saveNotes();
+      render();
+    });
+  });
+
+  // Per-card folder select.
+  document.querySelectorAll("[data-folder-select]").forEach((sel) => {
+    sel.addEventListener("change", (e) => {
+      e.stopPropagation();
+      const n = notes.find((x) => x.id === sel.dataset.folderSelect);
+      if (!n) return;
+      const v = sel.value;
+      n.folderId = v === "__none__" ? null : v;
+      saveNotes();
+      // If the note just left the current view, re-render to hide it.
+      const stillVisible = notesInCurrentView().some((x) => x.id === n.id);
+      if (!stillVisible) render();
+    });
+    // The card's <button> would otherwise intercept the click; stop bubbling
+    // so a click on the select opens the dropdown instead of opening the card.
+    sel.addEventListener("click", (e) => e.stopPropagation());
+  });
+
+  // Card trash button — move to trash outside trash, delete forever inside.
   document.querySelectorAll("[data-delete-note]").forEach((btn) => {
     btn.addEventListener("click", async (e) => {
       e.stopPropagation();
       const noteId = btn.dataset.deleteNote;
       const targetNote = notes.find((n) => n.id === noteId);
-      const title = targetNote?.title || "this notebook";
-      if (confirm(`Are you sure you want to delete "${title}"?`)) {
-        // Free the blobs first so a failed write can never orphan them silently.
+      if (!targetNote) return;
+      if (activeFolder === "trashed") {
+        if (!confirm(`Delete "${targetNote.title}" forever? This cannot be undone.`)) return;
         await deleteAssets(collectNoteAssetIds(targetNote));
-        // Close the parsed document; it holds the whole file in worker memory.
         invalidatePdfDoc(targetNote?.pdfAssetId);
         notes = notes.filter((n) => n.id !== noteId);
-        if (activeId === noteId) {
-          activeId = notes[0]?.id || null;
-        }
+        if (activeId === noteId) activeId = notes[0]?.id || null;
         saveNotes();
         render();
+        return;
       }
+      // Move to trash (no confirm — undoable via Restore).
+      targetNote.trashed = true;
+      // Leaving a folder for trash clears the folder pin.
+      saveNotes();
+      render();
     });
   });
 
@@ -2709,48 +3349,95 @@ function bindLibraryEvents() {
       if (!file) return;
 
       isLoading = true;
-      loadingMessage = `Decomposing '${file.name}' into editable pages...`;
+      loadingMessage = `Reading '${file.name}'...`;
       renderLoading();
+
+      // Every asset this import creates, so a failure can clean up after
+      // itself without touching anything an existing notebook owns.
+      const createdAssetIds = [];
+
+      // Read the mode once, before any await, so a change mid-import cannot
+      // produce a notebook that is half one thing and half the other.
+      const importMode =
+        document.querySelector("#import-mode")?.value === "annotations"
+          ? "annotations"
+          : "editable";
 
       try {
         const buffer = await file.arrayBuffer();
 
-        // Persist each page's binary assets as soon as it is decomposed instead of
-        // holding every page's background in memory until the document finishes.
-        const pages = await decomposePdf(buffer, 1.333333, async (page) => {
+        // Persist each page's binary assets as soon as it is decomposed instead
+        // of holding every page's background in memory until the document
+        // finishes.
+        const pages = await decomposePdf(
+          buffer,
+          1.333333,
+          async (page, index) => {
           const ids = {};
 
-          if (page.backgroundBlob) {
+          // When the only unrecovered content is the page's own backdrop, the
+          // extracted backdrop image replaces the whole-page render. The render
+          // also contains the content we recovered, so using it would paint
+          // everything twice — visibly, because the raster's substituted font
+          // and the text object's font do not share advance widths.
+          let fallbackBlob = page.backgroundBlob;
+          let fallbackFromImage = false;
+
+          if (page.fallbackImage?.blob) {
+            const composed = await composePageSizedFallback(
+              page.fallbackImage.blob,
+              page.fallbackImage,
+              page.width,
+              page.height,
+            );
+            if (composed) {
+              fallbackBlob = composed;
+              fallbackFromImage = true;
+            }
+          }
+
+          if (fallbackBlob) {
             ids.backgroundAssetId = `bg-${crypto.randomUUID()}`;
-            await putAsset(ids.backgroundAssetId, page.backgroundBlob);
+            await putAsset(ids.backgroundAssetId, fallbackBlob);
+            createdAssetIds.push(ids.backgroundAssetId);
           }
 
           if (page.thumbnailBlob) {
             ids.thumbnailAssetId = `thumb-${crypto.randomUUID()}`;
             await putAsset(ids.thumbnailAssetId, page.thumbnailBlob);
+            createdAssetIds.push(ids.thumbnailAssetId);
           }
 
-          // Embedded images are often the heaviest part of an export, so they go
-          // to the asset store too rather than inline base64.
-          if (Array.isArray(page.imageObjects)) {
-            for (let i = 0; i < page.imageObjects.length; i++) {
-              const img = page.imageObjects[i];
-              if (img?.src && String(img.src).startsWith("data:")) {
-                const assetId = `img-${crypto.randomUUID()}`;
-                await putAssetFromDataUrl(assetId, img.src);
-                page.imageObjects[i] = { ...img, src: null, assetId };
-              }
+          // Embedded images are often the heaviest part of an export, so they
+          // go to the asset store as real blobs rather than inline base64.
+          for (const obj of page.objects || []) {
+            if (obj.omniType === "image" && obj.blob) {
+              const assetId = `img-${crypto.randomUUID()}`;
+              await putAsset(assetId, obj.blob);
+              createdAssetIds.push(assetId);
+              obj.assetId = assetId;
+              // The blob is binary and must never reach localStorage.
+              delete obj.blob;
             }
           }
 
-          // Drop the blobs so nothing binary ends up in localStorage.
+          loadingMessage =
+            importMode === "annotations"
+              ? `Rendering page ${index + 1}...`
+              : `Recovering page ${index + 1}...`;
+          renderLoading();
+
+          // Drop the page-level blobs so nothing binary ends up persisted.
           return {
             ...page,
             ...ids,
+            fallbackFromImage,
             backgroundBlob: undefined,
             thumbnailBlob: undefined,
           };
-        });
+          },
+          { mode: importMode },
+        );
 
         if (pages.length === 0) {
           throw new Error("No pages found in this PDF.");
@@ -2759,18 +3446,23 @@ function bindLibraryEvents() {
         const baseName = file.name.replace(/\.pdf$/i, "");
 
         // Keep the original file. The per-page snapshot taken at import is only
-        // ~1600px, which turns to mush once you zoom in; holding on to the source
-        // lets the visible page be re-rendered from the PDF at the current zoom.
+        // ~1600px, which turns to mush once you zoom in; holding on to the
+        // source lets the visible page be re-rendered at the current zoom.
         const pdfAssetId = `pdf-${crypto.randomUUID()}`;
         await putAsset(pdfAssetId, file);
+        createdAssetIds.push(pdfAssetId);
 
-        // Create ONE notebook containing all decomposed pages with their exact individual sizes
+        const report = summarizeImport(pages);
+
+        // Built in memory first and committed only once every page succeeded.
         const newNotebook = {
           id: crypto.randomUUID(),
           title: baseName,
           createdAt: Date.now(),
           isPdf: true,
           pdfAssetId,
+          importSchemaVersion: IMPORT_SCHEMA_VERSION,
+          importReport: report,
           defaultFont: pages.mostUsedFont || "DM Sans",
           detectedFonts: pages.detectedFonts || [],
           currentPageIndex: 0,
@@ -2786,15 +3478,32 @@ function bindLibraryEvents() {
             backgroundAssetId: page.backgroundAssetId || null,
             thumbnailAssetId: page.thumbnailAssetId || null,
             canvasJson: null,
-            pendingDecomposedData: page,
+            importSchemaVersion: IMPORT_SCHEMA_VERSION,
+            importedObjectVersion: page.importedObjectVersion ?? IMPORTED_OBJECT_VERSION,
+            importReport: page.report || null,
+            fallbackVisible: page.fallbackVisible !== false,
+            // The fallback is the extracted backdrop, not a page render, so it
+            // must not be replaced by a full-page re-rasterization on zoom —
+            // that would reintroduce the very doubling it exists to avoid.
+            fallbackFromImage: page.fallbackFromImage === true,
+            pendingImportData: {
+              objects: page.objects || [],
+              report: page.report || null,
+            },
+            tags: [],
           })),
         };
 
         notes.unshift(newNotebook);
         activeId = newNotebook.id;
         saveNotes();
+
+        showImportReport(report);
       } catch (err) {
-        alert("Could not decompose this PDF: " + err.message);
+        // Nothing was committed, so delete only what this attempt created and
+        // leave every existing notebook exactly as it was.
+        await deleteAssets(createdAssetIds).catch(() => {});
+        alert("Could not import this PDF: " + err.message);
         console.error(err);
       } finally {
         isLoading = false;
@@ -2802,6 +3511,20 @@ function bindLibraryEvents() {
         render();
       }
     });
+}
+
+/**
+ * True when a keystroke belongs to a field the user is typing into.
+ *
+ * Global shortcuts must not fire for these: on macOS the key labelled "Delete"
+ * reports `Backspace`, so without this guard correcting a digit in the zoom
+ * percentage field would also delete the selected object on the canvas.
+ */
+function isTypingTarget(el) {
+  if (!el || typeof el !== "object") return false;
+  if (el.isContentEditable) return true;
+  const tag = el.tagName;
+  return tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT";
 }
 
 function escapeHtml(value) {
@@ -2818,5 +3541,184 @@ function escapeHtml(value) {
   );
 }
 
+/**
+ * Folds every page's import report into one notebook-level summary.
+ *
+ * Counts describe objects that were actually created, never operators that
+ * were merely inspected — the whole point is that the report can be trusted.
+ */
+function summarizeImport(pages) {
+  const report = {
+    pages: pages.length,
+    textObjects: 0,
+    vectorGroups: 0,
+    imageObjects: 0,
+    completePages: 0,
+    partialPages: 0,
+    fallbackPages: 0,
+    fallbackRegions: 0,
+    warnings: [],
+    errors: [],
+  };
+
+  for (const page of pages) {
+    const r = page.report;
+    if (!r) continue;
+
+    report.textObjects += r.textObjects || 0;
+    report.vectorGroups += r.vectorGroups || 0;
+    report.imageObjects += r.imageObjects || 0;
+    report.fallbackRegions += r.fallbackRegions || 0;
+
+    if (r.status === "complete") report.completePages++;
+    else if (r.status === "fallback") report.fallbackPages++;
+    else report.partialPages++;
+
+    for (const w of r.warnings || []) {
+      if (!report.warnings.includes(w)) report.warnings.push(w);
+    }
+    for (const e of r.errors || []) {
+      if (!report.errors.includes(e)) report.errors.push(e);
+    }
+  }
+
+  if (report.fallbackPages === report.pages) {
+    report.status = "fallback";
+  } else if (report.partialPages > 0 || report.fallbackPages > 0) {
+    report.status = "partial";
+  } else {
+    report.status = "complete";
+  }
+
+  return report;
+}
+
+const IMPORT_WARNING_TEXT = {
+  "unsupported-graphics-operators": "Some graphics could not be converted.",
+  "unsupported-annotations": "Some annotations stayed in the page image.",
+  "images-left-in-fallback": "Some images could not be extracted.",
+  "page-sized-images-kept-in-fallback": "Full-page images stayed in the page image.",
+  "low-confidence-regions-kept-in-fallback": "Uncertain regions were kept as an image.",
+  "text-colour-approximated": "Text colours were approximated.",
+  "text-extraction-failed": "Text could not be read on this page.",
+  "operator-stream-failed": "Part of the page could not be read.",
+  "fallback-render-failed": "The page image could not be rendered.",
+  "operator-list-unavailable": "The page content stream was unreadable.",
+  "annotation-scan-failed": "Annotations could not be inspected.",
+};
+
+/**
+ * Non-blocking completion card.
+ *
+ * Deliberately a corner toast rather than a modal: the notebook is usable the
+ * moment the import finishes, and nothing here waits for the user.
+ */
+function showImportReport(report) {
+  // Only clears a previous *completion* toast; a storage warning is a
+  // different, more important message and must survive this.
+  document.querySelector(".import-report")?.remove();
+
+  const lines = [];
+  lines.push(`${report.pages} ${report.pages === 1 ? "page" : "pages"} imported`);
+
+  const recovered = [];
+  if (report.textObjects) recovered.push(`${report.textObjects} editable text`);
+  if (report.imageObjects) recovered.push(`${report.imageObjects} image${report.imageObjects === 1 ? "" : "s"}`);
+  if (report.vectorGroups) recovered.push(`${report.vectorGroups} ink group${report.vectorGroups === 1 ? "" : "s"}`);
+  lines.push(recovered.length ? recovered.join(" · ") : "No editable content recovered");
+
+  if (report.fallbackPages > 0) {
+    lines.push(
+      `${report.fallbackPages} ${report.fallbackPages === 1 ? "page kept" : "pages kept"} as an image`,
+    );
+  } else if (report.partialPages > 0) {
+    lines.push(
+      `${report.partialPages} partial ${report.partialPages === 1 ? "page" : "pages"} keep their original image underneath`,
+    );
+  }
+
+  const card = document.createElement("div");
+  card.className = `import-report import-report--${report.status}`;
+  card.setAttribute("role", "status");
+
+  const title = document.createElement("strong");
+  title.textContent =
+    report.status === "complete"
+      ? "Import complete"
+      : report.status === "fallback"
+        ? "Imported as page images"
+        : "Import finished with gaps";
+  card.appendChild(title);
+
+  for (const line of lines) {
+    const p = document.createElement("span");
+    p.textContent = line;
+    card.appendChild(p);
+  }
+
+  const notes = (report.warnings || [])
+    .map((w) => IMPORT_WARNING_TEXT[w] || w)
+    .filter(Boolean);
+  if (notes.length) {
+    const list = document.createElement("em");
+    list.textContent = notes.slice(0, 3).join(" ");
+    card.appendChild(list);
+  }
+
+  const close = document.createElement("button");
+  close.type = "button";
+  close.className = "import-report-close";
+  close.setAttribute("aria-label", "Dismiss");
+  close.textContent = "×";
+  close.addEventListener("click", () => card.remove());
+  card.appendChild(close);
+
+  document.body.appendChild(card);
+
+  setTimeout(() => card.remove(), 9000);
+}
+
+// Dev-only inspection hook for the browser regression harness. Vite replaces
+// `import.meta.env.DEV` with `false` in a production build, so this whole
+// block is dead code there and is dropped by the minifier.
+if (import.meta.env.DEV) {
+  window.__omni = {
+    getNotes: () => notes,
+    getActiveId: () => activeId,
+    getEngines: () => canvasEngines,
+    /** Snapshot of every object on a page, for assertions. */
+    inspectPage: (index) => {
+      const engine = canvasEngines[index];
+      if (!engine) return null;
+      return {
+        width: engine.width,
+        height: engine.height,
+        backgroundVisible: engine.backgroundVisible,
+        hasBackground: Boolean(engine.canvas.backgroundImage),
+        objects: engine.canvas.getObjects().map((o) => ({
+          type: o.type,
+          omniType: o.omniType,
+          sourceType: o.sourceType,
+          omniId: o.omniId,
+          assetId: o.assetId,
+          text: o.text,
+          left: Math.round(o.left),
+          top: Math.round(o.top),
+          angle: Math.round((o.angle || 0) * 100) / 100,
+          width: Math.round(o.width || 0),
+          height: Math.round(o.height || 0),
+          // Fabric v6+ keeps group children on `_objects`.
+          children: o._objects ? o._objects.length : undefined,
+        })),
+      };
+    },
+  };
+}
+
 disableBrowserZoom();
-render();
+
+// Every page's object graph lives in IndexedDB, so the first render has to
+// wait for it — rendering early would show blank imported pages.
+hydrateNotes()
+  .catch((err) => console.warn("Could not restore page data:", err))
+  .finally(() => render());
