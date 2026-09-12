@@ -122,17 +122,23 @@ export function getCachedAssetUrl(id) {
   return id ? urlCache.get(id) || null : null;
 }
 
-/** Collects every asset id referenced by a notebook, for cleanup on delete. */
+/**
+ * Collects every asset id referenced by a notebook, for cleanup on delete.
+ *
+ * Delegates to `collectPageAssetIds` per page rather than re-listing the page
+ * fields. A page also owns its object-graph payload, its import handoff, and the
+ * image assets embedded inside that handoff; listing only the background and
+ * thumbnail here left all of those orphaned in IndexedDB on delete.
+ */
 export function collectNoteAssetIds(note) {
-  const ids = [];
+  const ids = new Set();
   for (const page of note?.pages || []) {
-    if (page.backgroundAssetId) ids.push(page.backgroundAssetId);
-    if (page.thumbnailAssetId) ids.push(page.thumbnailAssetId);
+    for (const id of collectPageAssetIds(page)) ids.add(id);
   }
-  if (note?.thumbnailAssetId) ids.push(note.thumbnailAssetId);
+  if (note?.thumbnailAssetId) ids.add(note.thumbnailAssetId);
   // Source PDF, kept so pages can be re-rendered crisply when zoomed.
-  if (note?.pdfAssetId) ids.push(note.pdfAssetId);
-  return ids;
+  if (note?.pdfAssetId) ids.add(note.pdfAssetId);
+  return [...ids];
 }
 
 /**
@@ -193,4 +199,74 @@ export function collectPageAssetIds(page) {
   }
 
   return ids;
+}
+
+/**
+ * Every `assetId` mentioned anywhere inside a serialized object graph.
+ *
+ * Imported images are referenced *only* from here once the import handoff has
+ * been consumed: `pendingImportData` is cleared the first time a page is opened
+ * (see `initEditor`), so the notebook record alone can no longer say which
+ * blobs a page still needs. Walking the stored graph is the only way to find
+ * them, and it is also what keeps a duplicated page's images safe — the copy
+ * shares the same `assetId`s without sharing a record.
+ */
+export function collectAssetIdsFromGraph(value) {
+  const ids = new Set();
+  const seen = new Set();
+
+  const walk = (node) => {
+    if (!node || typeof node !== "object" || seen.has(node)) return;
+    seen.add(node);
+
+    if (Array.isArray(node)) {
+      for (const item of node) walk(item);
+      return;
+    }
+    for (const [key, val] of Object.entries(node)) {
+      if (key === "assetId") {
+        if (typeof val === "string" && val) ids.add(val);
+      } else {
+        walk(val);
+      }
+    }
+  };
+
+  walk(value);
+  return [...ids];
+}
+
+/**
+ * Asset ids owned by a page, including those reachable only through its stored
+ * object graph. Async because the graph lives in IndexedDB.
+ *
+ * Deleting an imported page without this leaves every embedded image behind.
+ */
+export async function collectPageAssetIdsDeep(page) {
+  const ids = new Set(collectPageAssetIds(page));
+
+  const key = canvasKeyForPage(page);
+  if (!key) return [...ids];
+
+  let parsed;
+  try {
+    const json = await getPagePayload(key);
+    if (!json) return [...ids];
+    parsed = JSON.parse(json);
+  } catch {
+    // A missing or unreadable graph must not block the delete.
+    return [...ids];
+  }
+
+  for (const id of collectAssetIdsFromGraph(parsed)) ids.add(id);
+  return [...ids];
+}
+
+/** Notebook-wide version of `collectPageAssetIdsDeep`. */
+export async function collectNoteAssetIdsDeep(note) {
+  const ids = new Set(collectNoteAssetIds(note));
+  for (const page of note?.pages || []) {
+    for (const id of await collectPageAssetIdsDeep(page)) ids.add(id);
+  }
+  return [...ids];
 }

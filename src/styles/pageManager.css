@@ -1,0 +1,235 @@
+/* ==========================================================================
+   PAGE MANAGER (Noteful-style "Select" page grid)
+   ========================================================================== */
+.page-manager-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-shell);
+  color: var(--text-primary, #f1f5f9);
+}
+
+.pm-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 20px;
+  background: var(--bg-topbar);
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.pm-title {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+}
+
+.pm-title strong {
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+
+.pm-sub {
+  font-size: 12px;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.pm-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.pm-text-btn {
+  background: transparent;
+  color: var(--accent-primary);
+  border: 1px solid transparent;
+  border-radius: 7px;
+  padding: 6px 10px;
+  font-size: 13px;
+  font-weight: 500;
+  transition: background 0.12s ease;
+}
+
+.pm-text-btn:hover {
+  background: var(--accent-soft);
+}
+
+.pm-grid {
+  flex: 1;
+  overflow-y: auto;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(168px, 1fr));
+  gap: 18px;
+  padding: 24px;
+  align-content: start;
+  align-items: start;
+}
+
+.pm-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+.pm-tile {
+  position: relative;
+  padding: 8px;
+  background: var(--bg-surface);
+  border: 2px solid var(--border-subtle);
+  border-radius: 12px;
+  cursor: pointer;
+  user-select: none;
+  transition: border-color 0.12s ease, transform 0.12s ease, box-shadow 0.12s ease;
+}
+
+.pm-tile:hover {
+  border-color: #3a3e4d;
+  transform: translateY(-2px);
+}
+
+.pm-tile.selected {
+  border-color: var(--accent-primary);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+.pm-tile.pm-dragging {
+  opacity: 0.4;
+  transform: scale(0.97);
+  cursor: grabbing;
+  border-color: var(--accent-primary);
+}
+
+/* Dashed so a drop target reads differently from a selected tile. */
+.pm-tile.pm-drop-target {
+  border-color: var(--accent-primary);
+  border-style: dashed;
+  box-shadow: 0 0 0 3px var(--accent-soft);
+  transform: translateY(-2px);
+}
+
+.pm-thumb {
+  width: 100%;
+  height: auto;
+  display: block;
+  background: #ffffff;
+  border-radius: 6px;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.4);
+  pointer-events: none;
+}
+
+.pm-thumb-empty {
+  background: #ffffff;
+  aspect-ratio: 800 / 1130;
+}
+
+.pm-num {
+  font-size: 12px;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+  text-align: center;
+  letter-spacing: 0.04em;
+}
+
+.pm-check {
+  position: absolute;
+  top: 14px;
+  left: 14px;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  font-size: 13px;
+  color: #fff;
+  background: var(--accent-primary);
+  opacity: 0;
+  transform: scale(0.6);
+  transition: opacity 0.12s ease, transform 0.12s ease;
+}
+
+.pm-tile.selected .pm-check {
+  opacity: 1;
+  transform: scale(1);
+}
+
+.pm-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 20px;
+  background: var(--bg-topbar);
+  border-top: 1px solid var(--border-subtle);
+}
+
+.pm-spacer {
+  flex: 1;
+}
+
+.pm-op {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: var(--bg-surface);
+  color: var(--text-primary, #f1f5f9);
+  border: 1px solid var(--border-subtle);
+  border-radius: 9px;
+  padding: 8px 14px;
+  font-size: 13px;
+  font-weight: 500;
+  transition: background 0.12s ease, border-color 0.12s ease, opacity 0.12s ease;
+}
+
+.pm-op:hover:not(:disabled) {
+  background: var(--bg-hover);
+  border-color: #3a3e4d;
+}
+
+.pm-op:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+
+.pm-op.pm-danger:hover:not(:disabled) {
+  background: rgba(239, 68, 68, 0.18);
+  border-color: #ef4444;
+  color: #fca5a5;
+}
+
+.pm-sep {
+  width: 1px;
+  align-self: stretch;
+  margin: 4px 2px;
+  background: var(--border-subtle);
+}
+
+.pm-tags {
+  position: absolute;
+  left: 6px;
+  bottom: 6px;
+  right: 6px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  pointer-events: none;
+}
+
+.pm-tag {
+  font-size: 10px;
+  line-height: 1.4;
+  font-weight: 600;
+  padding: 1px 6px;
+  border-radius: 999px;
+  color: #0b1220;
+  background: var(--accent-primary, #4f9d9d);
+  white-space: nowrap;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
