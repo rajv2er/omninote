@@ -1,7 +1,33 @@
 import "./style.css";
-import { OmniCanvas, MIN_ZOOM, MAX_ZOOM } from "./canvas/engine.js";
+import { OmniCanvas } from "./canvas/engine.js";
 import { Point } from "fabric";
-import { ZoomWindow } from "./canvas/zoomWindow.js";
+import {
+  configureViewport,
+  ZOOM_MIN,
+  ZOOM_MAX,
+  getCurrentZoom,
+  setCurrentZoom,
+  isZoomLocked,
+  updateZoomUI,
+  beginZoomGesture,
+  endZoomGesture,
+  disableBrowserZoom,
+  setZoom,
+  toggleZoomLock,
+  applyDefaultZoom,
+  initZoomWindow,
+  toggleZoomWindow,
+  hideZoomWindow,
+  attachZoomWindow,
+  zoomIn,
+  zoomOut,
+  zoomReset,
+  zoomFit,
+  zoomWindowNextLine,
+  zoomWindowNudge,
+  zoomWindowMoveTo,
+} from "./canvas/viewport.js";
+
 import {
   decomposePdf,
   IMPORT_SCHEMA_VERSION,
@@ -11,16 +37,36 @@ import { invalidatePdfDoc } from "./pdf/raster.js";
 import { exportNotebookToPdf, renderPageThumbnail } from "./pdf/exporter.js";
 import {
   putAsset,
+  putAssetFromDataUrl,
   deleteAssets,
   getAssetUrl,
-  collectNoteAssetIds,
-  collectPageAssetIds,
+  collectNoteAssetIdsDeep,
+  collectPageAssetIdsDeep,
   canvasKeyForPage,
   pendingKeyForPage,
   putPagePayload,
   getPagePayload,
 } from "./storage/assets.js";
 import { composePageSizedFallback } from "./pdf/importModel.js";
+import { icon } from "./ui/icons.js";
+import { escapeHtml } from "./ui/escapeHtml.js";
+import {
+  showImportReport,
+  summarizeImport,
+  showStorageWarning,
+  clearStorageWarning,
+} from "./ui/dialogs.js";
+import {
+  libraryView as renderLibraryHtml,
+  sidebar as renderSidebarHtml,
+  noteCard as renderNoteCardHtml,
+  renderFontOptions as renderFontOptionsHtml,
+  STANDARD_FONTS,
+} from "./ui/libraryView.js";
+import {
+  pageManagerTilesHtml as renderPageManagerTilesHtml,
+  pageManagerOverlay as renderPageManagerOverlay,
+} from "./ui/pageManagerView.js";
 
 const STORE_KEY = "omninote-notes-v2";
 const FOLDERS_KEY = "omninote-folders";
@@ -192,7 +238,7 @@ let loadingMessage = "";
 let showShapesFlyout = false;
 let showPageSetup = false;
 let activeFolder = "unfiled";
-let currentZoom = 1;
+
 
 // Page Manager (Noteful-style "Select" grid) state
 let showPageManager = false;
@@ -349,6 +395,37 @@ function loadNotes() {
 const persistedPayloads = new Map();
 
 /**
+ * Payload writes that have not settled yet.
+ *
+ * The notebook record in localStorage is written synchronously, but the object
+ * graph it refers to lands in IndexedDB asynchronously. A quit during that gap
+ * leaves a page whose graph never arrived — it comes back blank, with no error.
+ * These are tracked so the app can drain them before it goes away.
+ * @type {Set<Promise<void>>}
+ */
+const inFlightPayloads = new Set();
+
+/** Registers a payload write so it can be drained on unload. */
+function trackPayload(promise) {
+  const tracked = promise
+    .catch(() => {})
+    .finally(() => inFlightPayloads.delete(tracked));
+  inFlightPayloads.add(tracked);
+  return tracked;
+}
+
+/**
+ * Settles every payload write still in flight.
+ *
+ * Best-effort by nature: unload handlers get no time to await. It is still worth
+ * doing, because backgrounding the app (visibilitychange) leaves the process
+ * alive, and an already-open IndexedDB transaction usually completes.
+ */
+function flushPayloads() {
+  return Promise.all([...inFlightPayloads]);
+}
+
+/**
  * Writes a page payload, skipping the write when it has not changed.
  *
  * `null` means the payload was cleared, which deletes the stored copy. That
@@ -362,7 +439,7 @@ function persistPayload(key, value) {
   if (value == null) {
     if (persistedPayloads.get(key) === null) return Promise.resolve();
     persistedPayloads.set(key, null);
-    return deleteAssets([key]).catch(() => {});
+    return trackPayload(deleteAssets([key]).catch(() => {}));
   }
 
   let json;
@@ -374,12 +451,14 @@ function persistPayload(key, value) {
   if (persistedPayloads.get(key) === json) return Promise.resolve();
 
   persistedPayloads.set(key, json);
-  return putPagePayload(key, json).catch((err) => {
-    // Drop the cached value so the next save retries rather than believing
-    // this payload is already stored.
-    persistedPayloads.delete(key);
-    console.warn("Could not store page data:", err);
-  });
+  return trackPayload(
+    putPagePayload(key, json).catch((err) => {
+      // Drop the cached value so the next save retries rather than believing
+      // this payload is already stored.
+      persistedPayloads.delete(key);
+      console.warn("Could not store page data:", err);
+    }),
+  );
 }
 
 /**
@@ -506,54 +585,6 @@ function saveNotes() {
   }
 }
 
-/**
- * Tells the user their notebook could not be saved.
- *
- * The object graph is JSON in localStorage, which has a ~5 MB ceiling — a real
- * multi-page handwriting import blows past it, and without this the only
- * symptom is that the notebook is missing after a reload.
- */
-function showStorageWarning(error) {
-  // Dedupe on presence rather than a flag: the import report toast removes
-  // itself from the DOM, and a flag would then suppress the warning forever.
-  if (document.querySelector(".storage-warning")) return;
-
-  const card = document.createElement("div");
-  // Its own class, deliberately NOT `.import-report` — the completion toast
-  // clears anything with that class and would wipe this warning out.
-  card.className = "storage-warning";
-  card.setAttribute("role", "alert");
-
-  const title = document.createElement("strong");
-  title.textContent = "This notebook is too large to save";
-  card.appendChild(title);
-
-  const detail = document.createElement("span");
-  detail.textContent =
-    "It is open and editable, but changes will be lost when you reload. " +
-    "Export it to PDF to keep a copy, or split it into smaller notebooks.";
-  card.appendChild(detail);
-
-  const reason = document.createElement("em");
-  reason.textContent = String(error?.name || error?.message || "Storage is full");
-  card.appendChild(reason);
-
-  const close = document.createElement("button");
-  close.type = "button";
-  close.className = "import-report-close";
-  close.setAttribute("aria-label", "Dismiss");
-  close.textContent = "×";
-  close.addEventListener("click", () => card.remove());
-  card.appendChild(close);
-
-  document.body.appendChild(card);
-  // Deliberately not auto-dismissed: this one matters.
-}
-
-/** Clears the warning once a save finally succeeds. */
-function clearStorageWarning() {
-  document.querySelector(".storage-warning")?.remove();
-}
 
 function getActiveNote() {
   const note = notes.find((n) => n.id === activeId);
@@ -572,394 +603,28 @@ function getActiveCanvasEngine() {
   return canvasEngines[note.currentPageIndex] || canvasEngines[0];
 }
 
-const ZOOM_MIN = MIN_ZOOM;
-const ZOOM_MAX = MAX_ZOOM;
-const ZOOM_STEP = 1.25;
-// Freezes every zoom path. Guards against a stray pinch while writing.
-let zoomLocked = false;
-// Noteful-style magnified writing strip. Created once, re-pointed per page.
-let zoomWindow = null;
-
-/** Single place that keeps the label, the slider and `currentZoom` in sync. */
-function updateZoomUI(z) {
-  currentZoom = z;
-  const pct = Math.round(z * 100);
-  const value = document.querySelector("#zoom-value");
-  // Never overwrite the field while the user is typing into it.
-  if (value && document.activeElement !== value) value.value = pct;
-  const slider = document.querySelector("#zoom-slider");
-  if (slider) slider.value = pct;
-}
-
-/** Content-space box of a page wrapper, independent of the current scroll. */
-function pageContentBox(wrap, contRect, container) {
-  const r = wrap.getBoundingClientRect();
-  return {
-    left: r.left - contRect.left + container.scrollLeft,
-    top: r.top - contRect.top + container.scrollTop,
-    width: r.width,
-    height: r.height,
-  };
-}
-
-/**
- * Remembers which spot of the document a given screen point is showing.
- *
- * Zooming resizes every page, which shifts all the following ones and used to
- * throw the reader's place away. The anchor is stored as *fractions* of the
- * page box it lands on, so it is zoom-invariant: restoring re-measures the page
- * at its new size and puts the same fraction back under the same screen point.
- * Storing raw pixel offsets instead is what made a long pinch drift — every
- * step re-measured its own output and locked in the previous step's error.
- *
- * @param {number|null} clientX screen point to hold still (pinch cursor);
- *   defaults to the middle of the viewport, which is what the slider uses.
- */
-function captureZoomAnchor(clientX = null, clientY = null) {
-  const container = document.querySelector("#canvas-scroll-container");
-  if (!container) return null;
-
-  const contRect = container.getBoundingClientRect();
-  let ox = container.clientWidth / 2;
-  let oy = container.clientHeight / 2;
-  if (clientX !== null && clientY !== null) {
-    const px = clientX - contRect.left;
-    const py = clientY - contRect.top;
-    // Only trust the cursor when it is actually over the page area; synthetic
-    // or off-window events would otherwise anchor to a nonsense point.
-    if (px >= 0 && px <= contRect.width && py >= 0 && py <= contRect.height) {
-      ox = px;
-      oy = py;
-    }
-  }
-
-  const wraps = Array.from(container.querySelectorAll(".page-container"));
-  if (wraps.length === 0) return null;
-
-  const contentX = container.scrollLeft + ox;
-  const contentY = container.scrollTop + oy;
-
-  // The page the anchor point is actually over — not necessarily the "active"
-  // page, which is only the one the observer last reported.
-  let best = null;
-  let bestDist = Infinity;
-  for (const wrap of wraps) {
-    const box = pageContentBox(wrap, contRect, container);
-    const overshoot =
-      contentY < box.top
-        ? box.top - contentY
-        : contentY > box.top + box.height
-          ? contentY - (box.top + box.height)
-          : 0;
-    if (overshoot < bestDist) {
-      bestDist = overshoot;
-      best = { index: Number(wrap.dataset.index ?? 0), box };
-    }
-  }
-  if (!best) return null;
-
-  return {
-    container,
-    index: best.index,
-    fx: best.box.width > 0 ? (contentX - best.box.left) / best.box.width : 0,
-    fy: best.box.height > 0 ? (contentY - best.box.top) / best.box.height : 0,
-    ox,
-    oy,
-  };
-}
-
-/** Puts the spot captured by `captureZoomAnchor` back under the same screen point. */
-function restoreZoomAnchor(anchor) {
-  if (!anchor) return;
-  try {
-    const { container, index, fx, fy, ox, oy } = anchor;
-    const wrap =
-      document.querySelector(`#page-wrapper-${index}`) ||
-      document.querySelector(".page-container");
-    if (!wrap) return;
-    const contRect = container.getBoundingClientRect();
-    const box = pageContentBox(wrap, contRect, container);
-
-    // The workspace scrolls smoothly, which is lovely for page-to-page jumps
-    // but poisonous here: a smooth scroll is an animation, so reading the
-    // offset back returns the *old* value and the next event of a pinch
-    // restarts it from there. Anchoring has to land in one frame.
-    const prevBehavior = container.style.scrollBehavior;
-    container.style.scrollBehavior = "auto";
-    container.scrollLeft = box.left + fx * box.width - ox;
-    container.scrollTop = box.top + fy * box.height - oy;
-    container.style.scrollBehavior = prevBehavior;
-  } catch {
-    // Anchoring is a comfort feature; a bad measurement must never break zoom.
-  }
-}
-
-/**
- * A pinch is one continuous gesture, so its anchor is measured once when the
- * fingers land and held for the duration. Re-measuring per event made the
- * target drift, because each step anchored to the previous step's result.
- */
-let zoomGestureAnchor = null;
-function beginZoomGesture(clientX, clientY) {
-  zoomGestureAnchor = captureZoomAnchor(clientX, clientY);
-}
-function endZoomGesture() {
-  zoomGestureAnchor = null;
-  // The gesture was tracked by scaling the existing bitmap so it could keep up
-  // with the fingers; now that it has settled, re-render every page at the
-  // final resolution so ink and text are crisp again.
-  for (const engine of canvasEngines) engine.commitZoomPreview();
-}
-
-/**
- * Turns off the browser's own page zoom.
- *
- * By default a trackpad pinch (or Ctrl+scroll, or Cmd +/-) scales the *entire
- * tab* — toolbar, tool rail and panels included — which both wrecks the layout
- * and double-scales the canvas. Only the page should ever zoom, and only via
- * `setZoom`, so every route the browser offers is swallowed here.
- */
-function disableBrowserZoom() {
-  // Chrome, Edge and Firefox deliver a trackpad pinch as a burst of ctrl+wheel.
-  // `wheel` defaults to passive on window/document/body, so `passive: false`
-  // is required for preventDefault to do anything at all.
-  window.addEventListener(
-    "wheel",
-    (e) => {
-      if (e.ctrlKey || e.metaKey) e.preventDefault();
-    },
-    { passive: false },
-  );
-
-  // Safari uses real gesture events for a pinch and bypasses wheel entirely.
-  for (const type of ["gesturestart", "gesturechange", "gestureend"]) {
-    window.addEventListener(type, (e) => e.preventDefault(), {
-      passive: false,
-    });
-  }
-
-  // Two-finger pinch on a touchscreen.
-  window.addEventListener(
-    "touchmove",
-    (e) => {
-      if (e.touches.length > 1) e.preventDefault();
-    },
-    { passive: false },
-  );
-
-  // Keyboard page zoom. This only suppresses the browser default — our own
-  // Cmd/Ctrl +/-/0 shortcuts are separate listeners and still fire.
-  window.addEventListener("keydown", (e) => {
-    if (!(e.ctrlKey || e.metaKey)) return;
-    if (
-      e.key === "+" ||
-      e.key === "=" ||
-      e.key === "-" ||
-      e.key === "_" ||
-      e.key === "0"
-    ) {
-      e.preventDefault();
-    }
-  });
-
-  // Belt and braces: browsers that honour the viewport meta will refuse to
-  // pinch-zoom the document at all.
-  const meta = document.querySelector('meta[name="viewport"]');
-  if (meta) {
-    meta.setAttribute(
-      "content",
-      "width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no",
-    );
-  }
-}
-
-function setZoom(
-  zoom,
-  { reset = false, resetPan = true, force = false, preview = false } = {},
-) {
-  if (zoomLocked && !force) return;
-  const next = reset ? 1 : Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, zoom));
-  // A pinch holds one anchor for the whole gesture; everything else measures
-  // fresh each time, which is stable because the anchor is zoom-invariant.
-  const anchor = zoomGestureAnchor || captureZoomAnchor();
-  updateZoomUI(next);
-  for (const engine of canvasEngines) {
-    engine.setZoom(next, { resetPan, force, preview });
-  }
-  restoreZoomAnchor(anchor);
-}
-
-/** Toggles the zoom freeze and pushes the state down to every engine. */
-function toggleZoomLock() {
-  zoomLocked = !zoomLocked;
-  for (const engine of canvasEngines) engine.zoomLocked = zoomLocked;
-  const btn = document.querySelector("#zoom-lock-btn");
-  if (btn) {
-    btn.innerHTML = icon(zoomLocked ? "lockClosed" : "lockOpen", 14);
-    btn.title = zoomLocked ? "Zoom locked — click to unlock" : "Lock zoom";
-    btn.classList.toggle("is-locked", zoomLocked);
-  }
-}
-
-/**
- * Opening zoom. Wide imported pages are the common case, so pull back to fit
- * width — but never zoom past 100%, since magnifying a small page on open is
- * more surprising than helpful.
- */
-function applyDefaultZoom() {
-  const engine = getActiveCanvasEngine();
-  const avail = getAvailableViewport();
-  if (!engine || !avail || !engine.width) return;
-  const fit = avail.width / engine.width;
-  const z = Math.min(1, Math.max(ZOOM_MIN, fit));
-  if (z < 1) setZoom(z, { force: true });
-}
-
-// --------------------------------------------------------------- zoom window
-
-/** Points the zoom window at whichever page is currently active. */
-function attachZoomWindow() {
-  if (!zoomWindow) return;
-  const note = getActiveNote();
-  if (!note) return;
-  const engine = getActiveCanvasEngine();
-  const pageEl = document.querySelector(
-    `#page-wrapper-${note.currentPageIndex}`,
-  );
-  if (!engine || !pageEl) return;
-  zoomWindow.attach(engine, pageEl);
-}
-
-function initZoomWindow() {
-  const stripEl = document.querySelector("#zw-canvas");
-  const boxEl = document.querySelector("#zw-box");
-  if (!stripEl || !boxEl) return;
-  if (!zoomWindow) zoomWindow = new ZoomWindow({ stripEl, boxEl });
-  attachZoomWindow();
-}
-
-function toggleZoomWindow(force) {
-  if (!zoomWindow) return;
-  const next = force === undefined ? !zoomWindow.visible : force;
-  const wrap = document.querySelector("#zoom-window");
-  if (next) {
-    attachZoomWindow();
-    zoomWindow.show();
-    if (wrap) wrap.hidden = false;
-  } else {
-    zoomWindow.hide();
-    if (wrap) wrap.hidden = true;
-  }
-  document.querySelector("#zw-toggle")?.classList.toggle("is-active", next);
-}
-
-function zoomIn() {
-  setZoom(currentZoom * ZOOM_STEP);
-}
-function zoomOut() {
-  setZoom(currentZoom / ZOOM_STEP);
-}
-function zoomReset() {
-  setZoom(1, { reset: true });
-}
-
-/**
- * Usable drawing area inside the scroll viewport, excluding its padding.
- * Returns null if the editor is not mounted.
- */
-function getAvailableViewport() {
-  const container = document.querySelector("#canvas-scroll-container");
-  if (!container) return null;
-  const style = getComputedStyle(container);
-  const padX =
-    (parseFloat(style.paddingLeft) || 0) +
-    (parseFloat(style.paddingRight) || 0);
-  const padY =
-    (parseFloat(style.paddingTop) || 0) +
-    (parseFloat(style.paddingBottom) || 0);
-  return {
-    width: container.clientWidth - padX,
-    height: container.clientHeight - padY,
-  };
-}
-
-/**
- * Fits the active page to the viewport. `"width"` fills the width and lets
- * you scroll vertically; `"page"` fits the whole page on screen at once.
- */
-function zoomFit(mode = "width") {
-  const engine = getActiveCanvasEngine();
-  const avail = getAvailableViewport();
-  if (!engine || !avail || !engine.width || !engine.height) return;
-  const ratioW = avail.width / engine.width;
-  const ratioH = avail.height / engine.height;
-  setZoom(mode === "page" ? Math.min(ratioW, ratioH) : ratioW, {
-    resetPan: true,
-  });
-}
-
-// Crisp, professional SVG icons
-function icon(name, size = 18) {
-  const s = size;
-  const icons = {
-    back: `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>`,
-    chevronRight: `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg>`,
-    pen: `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/><path d="m15 5 4 4"/></svg>`,
-    marker: `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/><line x1="2" y1="22" x2="22" y2="22" stroke-width="4" stroke-linecap="round"/></svg>`,
-    eraser: `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m7 21-4.3-4.3c-1-1-1-2.5 0-3.4l9.6-9.6c1-1 2.5-1 3.4 0l5.6 5.6c1 1 1 2.5 0 3.4L13 21"/><path d="M22 21H7"/><path d="m5 11 9 9"/></svg>`,
-    select: `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m3 3 7 18 3-7 7-3L3 3z"/></svg>`,
-    text: `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 7 4 4 20 4 20 7"/><line x1="9" y1="20" x2="15" y2="20"/><line x1="12" y1="4" x2="12" y2="20"/></svg>`,
-    shapes: `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="10" height="10" x="3" y="3" rx="1.5"/><circle cx="16" cy="16" r="6"/></svg>`,
-    image: `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="3" rx="2" ry="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>`,
-    delete: `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/></svg>`,
-    undo: `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7v6h6"/><path d="M21 17a9 9 0 0 0-9-9 9 9 0 0 0-6 2.3L3 13"/></svg>`,
-    redo: `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 7v6h-6"/><path d="M3 17a9 9 0 0 1 9-9 9 9 0 0 1 6 2.3L21 13"/></svg>`,
-    upload: `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><path d="M12 19v-7"/><polyline points="9 15 12 12 15 15"/></svg>`,
-    download: `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><path d="M12 12v7"/><polyline points="9 16 12 19 15 16"/></svg>`,
-    zoomIn: `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/><line x1="11" y1="8" x2="11" y2="14"/><line x1="8" y1="11" x2="14" y2="11"/></svg>`,
-    zoomOut: `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/><line x1="8" y1="11" x2="14" y2="11"/></svg>`,
-    zoomWindow: `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="3" y1="14" x2="21" y2="14"/><line x1="7" y1="18.5" x2="17" y2="18.5"/></svg>`,
-    chevronLeft: `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>`,
-    close: `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>`,
-    lockClosed: `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>`,
-    lockOpen: `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 9.9-1"/></svg>`,
-    fitWidth: `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M8 12h8"/><polyline points="11 9.5 8 12 11 14.5"/><polyline points="13 9.5 16 12 13 14.5"/></svg>`,
-    fitPage: `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 9 4 4 9 4"/><polyline points="15 4 20 4 20 9"/><polyline points="20 15 20 20 15 20"/><polyline points="9 20 4 20 4 15"/></svg>`,
-    grid: `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="7" height="7" x="3" y="3" rx="1"/><rect width="7" height="7" x="14" y="3" rx="1"/><rect width="7" height="7" x="14" y="14" rx="1"/><rect width="7" height="7" x="3" y="14" rx="1"/></svg>`,
-    folder: `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/></svg>`,
-    pin: `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="17" x2="12" y2="22"/><path d="M5 17h14v-1.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V6h1a2 2 0 0 0 0-4H8a2 2 0 0 0 0 4h1v4.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24Z"/></svg>`,
-    trash: `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/></svg>`,
-    search: `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>`,
-    plus: `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>`,
-    chevronDown: `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>`,
-    pages: `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2V5a2 2 0 0 0-2-2z"/><path d="M21 7v12a2 2 0 0 1-2 2h-1V9a2 2 0 0 0-2-2h-3"/></svg>`,
-    rotate: `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>`,
-    copy: `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>`,
-    cut: `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><line x1="20" y1="4" x2="8.12" y2="15.88"/><line x1="14.47" y1="14.48" x2="20" y2="20"/><line x1="8.12" y1="8.12" x2="12" y2="12"/></svg>`,
-    paste: `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/><rect x="8" y="2" width="8" height="4" rx="1" ry="1"/></svg>`,
-    tag: `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg>`,
-    star: `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>`,
-    starFilled: `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>`,
-    restore: `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7v6h6"/><path d="M21 17a9 9 0 0 0-9-9 9 9 0 0 0-6 2.3L3 13"/></svg>`,
-  };
-  return icons[name] || "";
-}
+configureViewport({
+  getCanvasEngines: () => canvasEngines,
+  getActiveNote,
+  getActiveCanvasEngine,
+});
 
 function render() {
   const app = document.querySelector("#app");
   const note = getActiveNote();
 
   if (note) {
-    currentZoom = 1;
+    setCurrentZoom(1);
     app.innerHTML = editorView(note);
     initEditor(note);
   } else {
-    if (zoomWindow) zoomWindow.hide();
+    hideZoomWindow();
     canvasEngines.forEach((engine) => engine.destroy());
     canvasEngines = [];
     app.innerHTML = libraryView();
     bindLibraryEvents();
   }
+
 
   renderLoading();
 }
@@ -1032,224 +697,36 @@ function folderById(id) {
 }
 
 function libraryView() {
-  const visibleNotes = notesInCurrentView();
-  const folderList = folders
-    .map(
-      (f) => `
-      <button class="side ${activeFolder === FOLDER_PREFIX + f.id ? "active" : ""}" data-folder="${FOLDER_PREFIX}${escapeHtml(f.id)}">
-        ${icon("folder", 16)}
-        <span>${escapeHtml(f.name)}</span>
-        <span class="side-badge">${notes.filter((n) => !n.trashed && n.folderId === f.id).length}</span>
-        <button class="side-remove" data-remove-folder="${escapeHtml(f.id)}" title="Delete folder">${icon("close", 12)}</button>
-      </button>`,
-    )
-    .join("");
-
-  return `
-    <div class="shell">
-      <aside>${sidebar()}</aside>
-      <section class="library">
-        <header class="library-top">
-          <div class="library-top-title">
-            ${icon("folder", 22)}
-            <h1>${escapeHtml(libraryHeading())}</h1>
-          </div>
-          <div class="library-actions">
-            <div class="search-bar">
-              ${icon("search", 15)}
-              <input type="text" placeholder="Search notes..." id="search-input" />
-            </div>
-            <label class="import-pdf-btn">
-              ${icon("upload", 15)}
-              Import PDF
-              <input type="file" accept="application/pdf,.pdf" id="pdf-input" />
-            </label>
-            <select
-              id="import-mode"
-              class="import-mode-select"
-              title="Make editable rebuilds the PDF's content as native objects, so it costs several times the file size and takes longer. Annotate PDF keeps the original and draws on top of it."
-            >
-              <option value="editable">Make editable</option>
-              <option value="annotations">Annotate PDF</option>
-            </select>
-            <button class="new-note-btn" id="new-note-btn">
-              ${icon("plus", 16)}
-              New Note
-            </button>
-          </div>
-        </header>
-
-        <p class="library-section-label">${escapeHtml(libraryHeading())} (${visibleNotes.length})</p>
-        <div class="note-grid">
-          ${visibleNotes.length ? visibleNotes.map((n) => noteCard(n, activeFolder)).join("") : `<div class="library-empty">${emptyMessage()}</div>`}
-        </div>
-
-        <button class="fab" id="fab-new-note" title="Create New Note">
-          ${icon("plus", 22)}
-        </button>
-      </section>
-    </div>
-  `;
+  return renderLibraryHtml({
+    notes,
+    folders,
+    activeFolder,
+    visibleNotes: notesInCurrentView(),
+    heading: libraryHeading(),
+    emptyMsg: emptyMessage(),
+    noteCount,
+    folderPrefix: FOLDER_PREFIX,
+  });
 }
 
 function sidebar() {
-  const folderList = folders
-    .map(
-      (f) => `
-      <button class="side ${activeFolder === FOLDER_PREFIX + f.id ? "active" : ""}" data-folder="${FOLDER_PREFIX}${escapeHtml(f.id)}">
-        ${icon("folder", 16)}
-        <span>${escapeHtml(f.name)}</span>
-        <span class="side-badge">${notes.filter((n) => !n.trashed && n.folderId === f.id).length}</span>
-        <button class="side-remove" data-remove-folder="${escapeHtml(f.id)}" title="Delete folder">${icon("close", 12)}</button>
-      </button>`,
-    )
-    .join("");
-
-  return `
-    <div class="profile">
-      <div class="profile-avatar">O</div>
-      <span class="profile-name">OmniNote</span>
-      <span class="profile-chevron">${icon("chevronDown", 14)}</span>
-    </div>
-
-    <div class="nav-section-title">
-      <span>Notebooks</span>
-      ${icon("chevronDown", 12)}
-    </div>
-
-    <nav>
-      <button class="side ${activeFolder === "unfiled" ? "active" : ""}" data-folder="unfiled">
-        ${icon("folder", 16)}
-        <span>Unfiled</span>
-        <span class="side-badge">${noteCount("unfiled")}</span>
-      </button>
-      <button class="side ${activeFolder === "pinned" ? "active" : ""}" data-folder="pinned">
-        ${icon("star", 16)}
-        <span>Pinned</span>
-        <span class="side-badge">${noteCount("pinned")}</span>
-      </button>
-      <button class="side ${activeFolder === "trashed" ? "active" : ""}" data-folder="trashed">
-        ${icon("trash", 16)}
-        <span>Trashed</span>
-        <span class="side-badge">${noteCount("trashed")}</span>
-      </button>
-    </nav>
-
-    <div class="side-divider"></div>
-
-    <div class="nav-section-title">
-      <span>Folders</span>
-    </div>
-    <nav>
-      ${folders.length === 0 ? `<button class="side side-disabled" disabled>${icon("folder", 16)}<span>No folders yet</span></button>` : folderList}
-      <button class="side side-add" id="new-folder-btn" title="Create a new folder">
-        ${icon("plus", 16)}
-        <span>New folder</span>
-      </button>
-    </nav>
-  `;
+  return renderSidebarHtml({
+    notes,
+    folders,
+    activeFolder,
+    noteCount,
+    folderPrefix: FOLDER_PREFIX,
+  });
 }
 
 function noteCard(note, view) {
-  const firstPage = note.pages?.[0];
-  const pageCount = note.pages?.length || 1;
-  const thumbAssetId = firstPage?.thumbnailAssetId || note.thumbnailAssetId;
-  // Legacy notes may still carry an inline dataURL thumbnail.
-  const legacyThumb =
-    typeof firstPage?.thumbnail === "string" ? firstPage.thumbnail : null;
-
-  let thumbMarkup = `<span style="font-size: 28px; opacity: 0.3;">✦</span>`;
-  if (thumbAssetId) {
-    thumbMarkup = `<img data-thumb="${escapeHtml(thumbAssetId)}" alt="" />`;
-  } else if (legacyThumb) {
-    thumbMarkup = `<img src="${legacyThumb}" alt="" />`;
-  }
-
-  const inTrash = view === "trashed";
-  const folderOptions = [
-    `<option value="__none__"${!note.folderId ? " selected" : ""}>No folder</option>`,
-    ...folders.map(
-      (f) =>
-        `<option value="${escapeHtml(f.id)}"${note.folderId === f.id ? " selected" : ""}>${escapeHtml(f.name)}</option>`,
-    ),
-  ].join("");
-
-  // The trash icon doubles as "Move to trash" outside trash, "Delete forever"
-  // inside it (with confirm). "Restore" only appears in trash.
-  const trashTitle = inTrash ? "Delete forever" : "Move to trash";
-  const pinTitle = note.pinned ? "Unpin" : "Pin";
-  const folderSelect = inTrash
-    ? ""
-    : `<select class="card-folder-select" data-folder-select="${escapeHtml(note.id)}" title="Move to folder" aria-label="Move to folder">${folderOptions}</select>`;
-
-  return `
-    <div class="note-card-wrapper">
-      <button class="note-card" data-open="${escapeHtml(note.id)}">
-        <div class="preview ${firstPage?.paperStyle ? `paper-${firstPage.paperStyle}` : ""}">
-          ${note.isPdf ? `<span class="preview-badge">${pageCount} ${pageCount === 1 ? "Page" : "Pages"}</span>` : ""}
-          ${thumbMarkup}
-        </div>
-        <strong>${escapeHtml(note.title)}</strong>
-        <small>${pageCount} ${pageCount === 1 ? "page" : "pages"} · ${note.isPdf ? "PDF Document" : "Notebook"}</small>
-        ${folderSelect}
-      </button>
-      <div class="card-actions">
-        ${inTrash
-          ? `<button class="card-restore-btn" data-restore="${escapeHtml(note.id)}" title="Restore">${icon("restore", 14)}</button>`
-          : `<button class="card-pin-btn ${note.pinned ? "is-pinned" : ""}" data-pin="${escapeHtml(note.id)}" title="${pinTitle}">${icon(note.pinned ? "starFilled" : "star", 14)}</button>`}
-        <button class="card-delete-btn" data-delete-note="${escapeHtml(note.id)}" title="${trashTitle}">${icon("trash", 14)}</button>
-      </div>
-    </div>
-  `;
+  return renderNoteCardHtml(note, view, folders);
 }
 
-const STANDARD_FONTS = [
-  "DM Sans",
-  "Inter",
-  "Helvetica",
-  "Arial",
-  "Times New Roman",
-  "Georgia",
-  "Courier New",
-  "Fira Code",
-  "Caveat",
-];
-
 function renderFontOptions(note) {
-  const detected = note.detectedFonts || [];
   const engine = getActiveCanvasEngine();
-  const selectedFont = engine?.currentFont || note.defaultFont || "DM Sans";
-
-  let html = "";
-  if (detected.length > 0) {
-    html += `<optgroup label="Detected in Document">`;
-    for (const font of detected) {
-      const isSelected = font === selectedFont;
-      const isDefault = font === note.defaultFont;
-      html += `<option value="${escapeHtml(font)}" ${isSelected ? "selected" : ""}>${escapeHtml(font)}${isDefault ? " (Default)" : ""}</option>`;
-    }
-    html += `</optgroup>`;
-  }
-
-  html += `<optgroup label="Standard Fonts">`;
-  for (const font of STANDARD_FONTS) {
-    if (!detected.includes(font)) {
-      const isSelected = font === selectedFont;
-      html += `<option value="${escapeHtml(font)}" ${isSelected ? "selected" : ""}>${escapeHtml(font)}</option>`;
-    }
-  }
-  html += `</optgroup>`;
-
-  if (
-    !detected.includes(selectedFont) &&
-    !STANDARD_FONTS.includes(selectedFont)
-  ) {
-    html =
-      `<option value="${escapeHtml(selectedFont)}" selected>${escapeHtml(selectedFont)}</option>` +
-      html;
-  }
-
-  return html;
+  const selectedFont = engine?.currentFont || note?.defaultFont || "DM Sans";
+  return renderFontOptionsHtml(note, selectedFont);
 }
 
 function updateFontToolbarState(selected) {
@@ -1356,15 +833,15 @@ function editorView(note) {
 
         <div class="zoom-controls" title="Zoom">
           <button class="icon-btn zoom-btn" id="zoom-out-btn" title="Zoom Out (Cmd/Ctrl + -)">${icon("zoomOut", 14)}</button>
-          <input type="range" class="zoom-slider" id="zoom-slider" min="${Math.round(ZOOM_MIN * 100)}" max="${Math.round(ZOOM_MAX * 100)}" step="1" value="${Math.round(currentZoom * 100)}" title="Drag to zoom" aria-label="Zoom level" />
+          <input type="range" class="zoom-slider" id="zoom-slider" min="${Math.round(ZOOM_MIN * 100)}" max="${Math.round(ZOOM_MAX * 100)}" step="1" value="${Math.round(getCurrentZoom() * 100)}" title="Drag to zoom" aria-label="Zoom level" />
           <span class="zoom-label-btn" id="zoom-reset-btn" title="Reset to 100% (Cmd/Ctrl + 0) — or type an exact level">
-            <input class="zoom-value" id="zoom-value" type="text" inputmode="numeric" value="${Math.round(currentZoom * 100)}" aria-label="Zoom percentage" title="Type a zoom level and press Enter" />
+            <input class="zoom-value" id="zoom-value" type="text" inputmode="numeric" value="${Math.round(getCurrentZoom() * 100)}" aria-label="Zoom percentage" title="Type a zoom level and press Enter" />
             <span class="zoom-pct">%</span>
           </span>
           <button class="icon-btn zoom-btn" id="zoom-in-btn" title="Zoom In (Cmd/Ctrl + =)">${icon("zoomIn", 14)}</button>
           <button class="icon-btn zoom-btn" id="zoom-fit-width-btn" title="Fit Width (Cmd/Ctrl + 9)">${icon("fitWidth", 14)}</button>
           <button class="icon-btn zoom-btn" id="zoom-fit-page-btn" title="Fit Whole Page (Cmd/Ctrl + 8)">${icon("fitPage", 14)}</button>
-          <button class="icon-btn zoom-btn" id="zoom-lock-btn" title="Lock zoom">${icon(zoomLocked ? "lockClosed" : "lockOpen", 14)}</button>
+          <button class="icon-btn zoom-btn" id="zoom-lock-btn" title="Lock zoom">${icon(isZoomLocked() ? "lockClosed" : "lockOpen", 14)}</button>
         </div>
 
         <button class="icon-btn zw-toggle" id="zw-toggle" title="Zoom window — write magnified, ink lands on the page">${icon("zoomWindow", 14)}</button>
@@ -1558,62 +1035,16 @@ function editorView(note) {
    ========================================================================== */
 
 function pageManagerTilesHtml(note) {
-  return note.pages
-    .map((p, i) => {
-      const selected = pageManagerSelection.has(i);
-      const thumb = pageManagerThumbs[i] || "";
-      const thumbEl = thumb
-        ? `<img class="pm-thumb" src="${thumb}" alt="Page ${i + 1}" draggable="false" />`
-        : `<div class="pm-thumb pm-thumb-empty"></div>`;
-      const tags =
-        Array.isArray(p.tags) && p.tags.length
-          ? `<span class="pm-tags">${p.tags.map((t) => `<span class="pm-tag">${escapeHtml(t)}</span>`).join("")}</span>`
-          : "";
-      return `
-        <div class="pm-cell">
-          <span class="pm-num">Page ${i + 1}</span>
-          <button class="pm-tile ${selected ? "selected" : ""}" data-index="${i}" title="Page ${i + 1} — click to toggle, shift-click for a range, drag to reorder">
-            <span class="pm-check">✓</span>
-            ${thumbEl}
-            ${tags}
-          </button>
-        </div>`;
-    })
-    .join("");
+  return renderPageManagerTilesHtml(note, pageManagerSelection, pageManagerThumbs);
 }
 
 function pageManagerOverlay(note) {
-  const total = note.pages.length;
-  const sel = pageManagerSelection.size;
-  return `
-    <div class="page-manager-overlay" id="page-manager-overlay" role="dialog" aria-label="Page Manager">
-      <header class="pm-header">
-        <div class="pm-title">
-          <strong>Pages</strong>
-          <span class="pm-sub">${total} page${total !== 1 ? "s" : ""}${sel ? ` · ${sel} selected` : ""}</span>
-        </div>
-        <div class="pm-header-actions">
-          <button class="pm-text-btn" id="pm-select-all">Select all</button>
-          <button class="pm-text-btn" id="pm-clear">Clear</button>
-          <button class="icon-btn" id="pm-close" title="Close (Esc)">${icon("close", 18)}</button>
-        </div>
-      </header>
-      <div class="pm-grid" id="page-manager-grid">${pageManagerTilesHtml(note)}</div>
-      <footer class="pm-toolbar">
-        <button class="pm-op" id="pm-insert" title="Insert a blank page after the selection">${icon("plus", 16)}<span>Insert</span></button>
-        <button class="pm-op" id="pm-rotate" ${sel ? "" : "disabled"} title="Rotate selected pages 90°">${icon("rotate", 16)}<span>Rotate</span></button>
-        <span class="pm-sep"></span>
-        <button class="pm-op" id="pm-copy" ${sel ? "" : "disabled"} title="Copy selected pages">${icon("copy", 16)}<span>Copy</span></button>
-        <button class="pm-op" id="pm-cut" ${sel ? "" : "disabled"} title="Cut selected pages">${icon("cut", 16)}<span>Cut</span></button>
-        <button class="pm-op" id="pm-paste" ${pageClipboard.length ? "" : "disabled"} title="Paste copied/cut pages">${icon("paste", 16)}<span>Paste</span></button>
-        <button class="pm-op" id="pm-tag" ${sel ? "" : "disabled"} title="Tag selected pages">${icon("tag", 16)}<span>Tag</span></button>
-        <span class="pm-sep"></span>
-        <button class="pm-op pm-danger" id="pm-delete" ${sel ? "" : "disabled"} title="Delete selected pages">${icon("trash", 16)}<span>Delete</span></button>
-        <span class="pm-spacer"></span>
-        <button class="pm-op" id="pm-extract" ${sel ? "" : "disabled"} title="New notebook from selected pages">${icon("folder", 16)}<span>Extract</span></button>
-        <button class="pm-op" id="pm-share" ${sel ? "" : "disabled"} title="Export selected pages as PDF">${icon("download", 16)}<span>Share</span></button>
-      </footer>
-    </div>`;
+  return renderPageManagerOverlay(
+    note,
+    pageManagerSelection,
+    pageManagerThumbs,
+    pageClipboard.length,
+  );
 }
 
 function updatePageManagerSelectionUI() {
@@ -1697,7 +1128,7 @@ function reorderPages(from, to) {
   saveNotes();
   // The editor's page stack is rendered from `note.pages`, so it has to be
   // rebuilt for the new order to take effect. Hold the zoom across it.
-  zoomRestoreTarget = currentZoom;
+  zoomRestoreTarget = getCurrentZoom();
   render();
 }
 
@@ -1828,7 +1259,7 @@ async function openPageManager() {
   const note = getActiveNote();
   if (!note) return;
   saveActiveCanvasPage();
-  pageManagerPriorZoom = currentZoom;
+  pageManagerPriorZoom = getCurrentZoom();
   await regeneratePageManagerThumbs();
   pageManagerSelection = new Set();
   pageManagerAnchor = null;
@@ -1948,11 +1379,13 @@ async function pmDelete() {
     if (note.pages.length <= 1) break;
     const [removed] = note.pages.splice(i, 1);
     // Don't delete assets still referenced by other (e.g. copied) pages.
+    // The deep form matters here: a copy shares the source's embedded images
+    // through its object graph, not through the notebook record.
     const remainingIds = new Set();
     for (const p of note.pages) {
-      for (const id of collectPageAssetIds(p)) remainingIds.add(id);
+      for (const id of await collectPageAssetIdsDeep(p)) remainingIds.add(id);
     }
-    const ids = collectPageAssetIds(removed).filter(
+    const ids = (await collectPageAssetIdsDeep(removed)).filter(
       (id) => id && !remainingIds.has(id),
     );
     if (ids.length) await deleteAssets(ids);
@@ -2140,7 +1573,7 @@ async function initEditor(note) {
   // two transitions, so normal note opens still fit to width.
   const restoreZoom = zoomRestoreTarget != null;
   if (restoreZoom) {
-    currentZoom = zoomRestoreTarget;
+    setCurrentZoom(zoomRestoreTarget);
     zoomRestoreTarget = null;
   }
 
@@ -2214,7 +1647,7 @@ async function initEditor(note) {
       saveNotes();
     }
 
-    engine.zoomLocked = zoomLocked;
+    engine.zoomLocked = isZoomLocked();
 
     // Only pages near the viewport render at full quality; the rest are held
     // at 100% until scrolled to.
@@ -2245,8 +1678,8 @@ async function initEditor(note) {
 
   // Carry the global zoom across engines so each page renders at the current scale.
   for (const engine of canvasEngines) {
-    if (engine.currentZoom !== currentZoom) {
-      engine.setZoom(currentZoom, { force: true });
+    if (engine.currentZoom !== getCurrentZoom()) {
+      engine.setZoom(getCurrentZoom(), { force: true });
     }
   }
 
@@ -2413,27 +1846,19 @@ function bindEditorEvents(note) {
     ?.addEventListener("click", () => toggleZoomWindow(false));
   document
     .querySelector("#zw-down")
-    ?.addEventListener("click", () => zoomWindow?.nextLine());
+    ?.addEventListener("click", () => zoomWindowNextLine());
   document.querySelector("#zw-right")?.addEventListener("click", () => {
-    if (zoomWindow) zoomWindow.nudge(zoomWindow.box.w * 0.25);
+    zoomWindowNudge(1);
   });
   document.querySelector("#zw-left")?.addEventListener("click", () => {
-    if (zoomWindow) zoomWindow.nudge(-zoomWindow.box.w * 0.25);
+    zoomWindowNudge(-1);
   });
 
   // Alt/Option + click on the page drops the zoom window's target box there.
   document
     .querySelector("#canvas-scroll-container")
     ?.addEventListener("click", (e) => {
-      if (!zoomWindow?.visible || !e.altKey) return;
-      const engine = getActiveCanvasEngine();
-      if (!engine?.canvas.upperCanvasEl) return;
-      const rect = engine.canvas.upperCanvasEl.getBoundingClientRect();
-      const z = engine.currentZoom;
-      zoomWindow.moveTo(
-        (e.clientX - rect.left - engine.panX) / z,
-        (e.clientY - rect.top - engine.panY) / z,
-      );
+      if (e.altKey) zoomWindowMoveTo(e.clientX, e.clientY);
     });
 
   // Slider: `input` fires continuously while dragging, so zoom tracks the drag.
@@ -2457,7 +1882,7 @@ function bindEditorEvents(note) {
     if (!zoomValue) return;
     const n = Number.parseFloat(zoomValue.value);
     if (Number.isFinite(n) && n > 0) setZoom(n / 100);
-    else updateZoomUI(currentZoom);
+    else updateZoomUI(getCurrentZoom());
   };
   zoomValue?.addEventListener("keydown", (e) => {
     if (e.key === "Enter") {
@@ -2465,7 +1890,7 @@ function bindEditorEvents(note) {
       commitZoomValue();
       zoomValue.blur();
     } else if (e.key === "Escape") {
-      updateZoomUI(currentZoom);
+      updateZoomUI(getCurrentZoom());
       zoomValue.blur();
     }
   });
@@ -2525,10 +1950,12 @@ function bindEditorEvents(note) {
         // Copied pages can share image assets with the page being deleted.
         const stillUsed = new Set();
         for (const p of note.pages) {
-          for (const id of collectPageAssetIds(p)) stillUsed.add(id);
+          for (const id of await collectPageAssetIdsDeep(p)) stillUsed.add(id);
         }
         await deleteAssets(
-          collectPageAssetIds(removed).filter((id) => id && !stillUsed.has(id)),
+          (await collectPageAssetIdsDeep(removed)).filter(
+            (id) => id && !stillUsed.has(id),
+          ),
         );
         if (note.currentPageIndex >= note.pages.length) {
           note.currentPageIndex = note.pages.length - 1;
@@ -3276,7 +2703,17 @@ function bindLibraryEvents() {
       if (!targetNote) return;
       if (activeFolder === "trashed") {
         if (!confirm(`Delete "${targetNote.title}" forever? This cannot be undone.`)) return;
-        await deleteAssets(collectNoteAssetIds(targetNote));
+        // A duplicated page or a shared source PDF can still be referenced by
+        // another notebook, so only the ids nothing else points at are removed.
+        const stillUsed = new Set();
+        for (const other of notes) {
+          if (other.id === noteId) continue;
+          for (const id of await collectNoteAssetIdsDeep(other)) stillUsed.add(id);
+        }
+        const orphaned = (await collectNoteAssetIdsDeep(targetNote)).filter(
+          (id) => id && !stillUsed.has(id),
+        );
+        await deleteAssets(orphaned);
         invalidatePdfDoc(targetNote?.pdfAssetId);
         notes = notes.filter((n) => n.id !== noteId);
         if (activeId === noteId) activeId = notes[0]?.id || null;
@@ -3527,156 +2964,6 @@ function isTypingTarget(el) {
   return tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT";
 }
 
-function escapeHtml(value) {
-  return String(value).replace(
-    /[&<>"']/g,
-    (c) =>
-      ({
-        "&": "&amp;",
-        "<": "&lt;",
-        ">": "&gt;",
-        '"': "&quot;",
-        "'": "&#039;",
-      })[c],
-  );
-}
-
-/**
- * Folds every page's import report into one notebook-level summary.
- *
- * Counts describe objects that were actually created, never operators that
- * were merely inspected — the whole point is that the report can be trusted.
- */
-function summarizeImport(pages) {
-  const report = {
-    pages: pages.length,
-    textObjects: 0,
-    vectorGroups: 0,
-    imageObjects: 0,
-    completePages: 0,
-    partialPages: 0,
-    fallbackPages: 0,
-    fallbackRegions: 0,
-    warnings: [],
-    errors: [],
-  };
-
-  for (const page of pages) {
-    const r = page.report;
-    if (!r) continue;
-
-    report.textObjects += r.textObjects || 0;
-    report.vectorGroups += r.vectorGroups || 0;
-    report.imageObjects += r.imageObjects || 0;
-    report.fallbackRegions += r.fallbackRegions || 0;
-
-    if (r.status === "complete") report.completePages++;
-    else if (r.status === "fallback") report.fallbackPages++;
-    else report.partialPages++;
-
-    for (const w of r.warnings || []) {
-      if (!report.warnings.includes(w)) report.warnings.push(w);
-    }
-    for (const e of r.errors || []) {
-      if (!report.errors.includes(e)) report.errors.push(e);
-    }
-  }
-
-  if (report.fallbackPages === report.pages) {
-    report.status = "fallback";
-  } else if (report.partialPages > 0 || report.fallbackPages > 0) {
-    report.status = "partial";
-  } else {
-    report.status = "complete";
-  }
-
-  return report;
-}
-
-const IMPORT_WARNING_TEXT = {
-  "unsupported-graphics-operators": "Some graphics could not be converted.",
-  "unsupported-annotations": "Some annotations stayed in the page image.",
-  "images-left-in-fallback": "Some images could not be extracted.",
-  "page-sized-images-kept-in-fallback": "Full-page images stayed in the page image.",
-  "low-confidence-regions-kept-in-fallback": "Uncertain regions were kept as an image.",
-  "text-colour-approximated": "Text colours were approximated.",
-  "text-extraction-failed": "Text could not be read on this page.",
-  "operator-stream-failed": "Part of the page could not be read.",
-  "fallback-render-failed": "The page image could not be rendered.",
-  "operator-list-unavailable": "The page content stream was unreadable.",
-  "annotation-scan-failed": "Annotations could not be inspected.",
-};
-
-/**
- * Non-blocking completion card.
- *
- * Deliberately a corner toast rather than a modal: the notebook is usable the
- * moment the import finishes, and nothing here waits for the user.
- */
-function showImportReport(report) {
-  // Only clears a previous *completion* toast; a storage warning is a
-  // different, more important message and must survive this.
-  document.querySelector(".import-report")?.remove();
-
-  const lines = [];
-  lines.push(`${report.pages} ${report.pages === 1 ? "page" : "pages"} imported`);
-
-  const recovered = [];
-  if (report.textObjects) recovered.push(`${report.textObjects} editable text`);
-  if (report.imageObjects) recovered.push(`${report.imageObjects} image${report.imageObjects === 1 ? "" : "s"}`);
-  if (report.vectorGroups) recovered.push(`${report.vectorGroups} ink group${report.vectorGroups === 1 ? "" : "s"}`);
-  lines.push(recovered.length ? recovered.join(" · ") : "No editable content recovered");
-
-  if (report.fallbackPages > 0) {
-    lines.push(
-      `${report.fallbackPages} ${report.fallbackPages === 1 ? "page kept" : "pages kept"} as an image`,
-    );
-  } else if (report.partialPages > 0) {
-    lines.push(
-      `${report.partialPages} partial ${report.partialPages === 1 ? "page" : "pages"} keep their original image underneath`,
-    );
-  }
-
-  const card = document.createElement("div");
-  card.className = `import-report import-report--${report.status}`;
-  card.setAttribute("role", "status");
-
-  const title = document.createElement("strong");
-  title.textContent =
-    report.status === "complete"
-      ? "Import complete"
-      : report.status === "fallback"
-        ? "Imported as page images"
-        : "Import finished with gaps";
-  card.appendChild(title);
-
-  for (const line of lines) {
-    const p = document.createElement("span");
-    p.textContent = line;
-    card.appendChild(p);
-  }
-
-  const notes = (report.warnings || [])
-    .map((w) => IMPORT_WARNING_TEXT[w] || w)
-    .filter(Boolean);
-  if (notes.length) {
-    const list = document.createElement("em");
-    list.textContent = notes.slice(0, 3).join(" ");
-    card.appendChild(list);
-  }
-
-  const close = document.createElement("button");
-  close.type = "button";
-  close.className = "import-report-close";
-  close.setAttribute("aria-label", "Dismiss");
-  close.textContent = "×";
-  close.addEventListener("click", () => card.remove());
-  card.appendChild(close);
-
-  document.body.appendChild(card);
-
-  setTimeout(() => card.remove(), 9000);
-}
 
 // Dev-only inspection hook for the browser regression harness. Vite replaces
 // `import.meta.env.DEV` with `false` in a production build, so this whole
@@ -3716,6 +3003,14 @@ if (import.meta.env.DEV) {
 }
 
 disableBrowserZoom();
+
+// Last chance to land a payload write. `pagehide` covers close/navigate;
+// `visibilitychange` covers mobile backgrounding, where `pagehide` may never
+// arrive while the process is still alive to finish the transaction.
+window.addEventListener("pagehide", flushPayloads);
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "hidden") flushPayloads();
+});
 
 // Every page's object graph lives in IndexedDB, so the first render has to
 // wait for it — rendering early would show blank imported pages.

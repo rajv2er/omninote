@@ -7,7 +7,7 @@ file is the **code map** (where and how).
 
 ## 1. Purpose
 
-OmniNote is a local-first, browser-only notebook app for macOS. Its reason to
+OmniNote is a local-first desktop application (built with Tauri v2 and Rust) as well as a web notebook app for macOS. Its reason to
 exist is migration: you export a notebook from Goodnotes/Notability as a PDF,
 import it here, and the page keeps its appearance while OmniNote tries to recover
 the content as editable objects instead of a dead bitmap.
@@ -29,31 +29,58 @@ explicitly out of scope per the README.
 
 | Layer | Choice | Notes |
 |---|---|---|
-| Build | Vite 8 (`npm run dev` / `build` / `preview`) | `vite.config.js` splits `fabric`, `pdfjs`, `pdflib` into separate chunks |
-| Language | Vanilla ES modules, no framework, no TypeScript | ~7.6k LOC of JS, plus 1.6k LOC of CSS |
+| Build | Vite (`npm run dev` / `build` / `preview`) | `vite.config.js` splits `fabric`, `pdfjs`, `pdflib` into separate vendor chunks |
+| Desktop App | Tauri v2 (`src-tauri/`) | Rust-based desktop shell for macOS / cross-platform |
+| Language | Vanilla ES modules, modular UI & CSS | ~8k LOC JS, ~1.8k LOC CSS across component sheets |
 | Canvas | `fabric` v7 | Owns the object graph, hit-testing, free-drawing brush, text editing |
 | PDF decode | `pdfjs-dist` v6 | Operator-list parsing (Level B) and page rasterization |
 | PDF write | `pdf-lib` | Export: each page is rasterized and embedded as one image |
-| Declared but unused | `perfect-freehand` | No import anywhere in `src/`; safe to drop |
-
-There is no backend, no service worker, and no test runner in the repo.
+| Test suite | Playwright Core (`npm test`) | Self-contained regression harness (`tests/run.mjs`, specs) |
+| Linter | ESLint (`npm run lint`) | Browser & Node global validation via `eslint.config.js` |
 
 ---
 
 ## 3. Repository map
 
 ```text
-index.html                 15    single <main id="app"> + module script
-vite.config.js             22    manual chunks for the three big vendors
-src/main.js              3185    app shell, state, both views, ALL event binding
-src/canvas/engine.js     1278    OmniCanvas: tools, undo/redo, zoom/pan, background
-src/canvas/zoomWindow.js  351    magnified writing strip (mirrors the live canvas)
-src/pdf/decomposer.js     723    Level-B: PDF operator stream -> editable objects
-src/pdf/exporter.js       217    PDF export + page thumbnails
-src/pdf/raster.js         110    on-demand re-raster of the source PDF at zoom
-src/storage/assets.js     144    IndexedDB blob store (backgrounds, thumbs, PDFs)
-src/style.css            1681    dark shell + white paper, plain CSS
-README.md                 352    product spec (authoritative for scope)
+index.html                  15    single <main id="app"> + module script
+vite.config.js              22    manual vendor chunks for fabric, pdfjs, pdflib
+eslint.config.js            50    ESLint flat config for src, scripts, and tests
+jsconfig.json               10    module resolution & editor IntelliSense config
+src/main.js               3019    app shell, state, view orchestration, event binding
+src/ui/
+  icons.js                  51    SVG icon lookup table (~30 crisp vector icons)
+  libraryView.js           215    library grid, sidebar, note card, font options
+  pageManagerView.js        67    page manager modal overlay & tile generator
+  dialogs.js               185    import completion toast, storage warnings
+  escapeHtml.js             16    HTML sanitization utility
+src/styles/
+  base.css                  50    variables (:root), reset, body, input styling
+  library.css              471    shell grid, sidebar, cards, card hover actions
+  editor.css               773    topbar, tool rail, presets, swatches, status pill
+  canvas.css               140    viewport container, zoom window, paper textures
+  dialogs.css              126    loading overlay, spinner, toasts, alerts
+  pageManager.css          235    page manager modal overlay & grid layout
+src/style.css                7    root stylesheet aggregator importing src/styles/
+src/canvas/engine.js      1368    OmniCanvas: tools, undo/redo, zoom/pan, background
+src/canvas/viewport.js     394    viewport controller: zoom math, anchors, gestures, window
+src/canvas/zoomWindow.js   351    magnified writing strip (mirrors live canvas)
+src/pdf/decomposer.js     1287    Level-B: PDF operator stream -> editable objects
+src/pdf/exporter.js        243    PDF export + page thumbnails
+src/pdf/grouping.js        410    spatial clustering of strokes into coherent ink groups
+src/pdf/importModel.js     351    decomposed object normalization & fallback layer
+src/pdf/canvasBlob.js       52    canvas to WebP/PNG blob conversion utilities
+src/pdf/raster.js           98    on-demand re-raster of the source PDF at zoom
+src/storage/assets.js      272    IndexedDB blob store with deep graph traversal
+tests/
+  run.mjs                  113    regression test runner (boots Vite & browser)
+  lib/harness.mjs                 Playwright test driver and evaluation helpers
+  specs/import.spec.mjs           Level-B extraction and reload survival assertions
+  specs/persistence.spec.mjs      Ink persistence, thumbnail refresh, asset cleanup
+scripts/make-fixtures.mjs  420    byte-deterministic PDF fixture generator
+src-tauri/                        Tauri 2 desktop wrapper configuration & Rust source
+archive/                          Non-app deliverables (synopsis docs, AI memory)
+README.md                  352    product spec (authoritative for scope)
 ```
 
 ---
@@ -62,19 +89,40 @@ README.md                 352    product spec (authoritative for scope)
 
 ### `src/main.js` — the application shell
 
-One module holds essentially all application state and every event listener.
-There is no store abstraction and no component system.
+One module holds application state and orchestrates views, persistence, and event listeners:
 
-* **State**: module-level `let` variables — `notes`, `activeId`, `canvasEngines`,
+* **State**: module-level variables — `notes`, `activeId`, `canvasEngines`,
   `currentTool/Color/Width/PenStyle`, `currentZoom`, `showPageManager`,
-  `pageManagerSelection`, `pageClipboard`, `zoomLocked`, …
-* **Views**: `libraryView()` and `editorView(note)` return HTML strings.
-  `render()` swaps `app.innerHTML` wholesale and then re-binds everything.
-  There is no diffing; the DOM is rebuilt on every state change.
+  `pageManagerSelection`, `pageClipboard`, `zoomLocked`, `inFlightPayloads`, …
+* **Views**: delegates HTML template generation to `src/ui/libraryView.js` and
+  `src/ui/pageManagerView.js`. `render()` updates `#app.innerHTML` and wires
+  event handlers.
 * **Orchestration**: `initEditor(note)` creates one `OmniCanvas` per page,
   loads each page, wires callbacks, sets up the IntersectionObserver and the
   zoom window.
-* **Icon set**: `icon(name, size)` is an inline SVG lookup table (~30 icons).
+* **Payload Safety**: tracks in-flight IndexedDB writes via `inFlightPayloads` and
+  flushes on `pagehide` and `visibilitychange` to prevent lost page data.
+
+### `src/ui/` — modular UI templates & components
+
+Decoupled view generators that produce clean HTML strings:
+
+* **`icons.js`**: `icon(name, size = 18)` returns SVG markup for ~30 toolbar and control icons.
+* **`libraryView.js`**: `libraryView()`, `sidebar()`, `noteCard()`, and `renderFontOptions()`.
+* **`pageManagerView.js`**: `pageManagerOverlay()` and `pageManagerTilesHtml()` grid generator.
+* **`dialogs.js`**: `showImportReport()` (completion toast), `showStorageWarning()`, and `clearStorageWarning()`.
+* **`escapeHtml.js`**: utility for escaping untrusted string content in templates.
+
+### `src/styles/` — component stylesheets
+
+CSS broken down by area, aggregated by `src/style.css`:
+
+* **`base.css`**: `:root` variables, reset, body layout, input styles.
+* **`library.css`**: App shell, sidebar, note card grid, folder selectors, card hover actions.
+* **`editor.css`**: Topbar, tool rail, thickness presets, color swatches, status pill, popovers.
+* **`canvas.css`**: Viewport container, zoom window writing strip, paper textures (`.paper-*`).
+* **`dialogs.css`**: Loading overlay, spinner, import report toasts, storage warnings.
+* **`pageManager.css`**: Page manager modal overlay, thumbnail grid, drag-drop drop markers.
 
 ### `src/canvas/engine.js` — `OmniCanvas`
 
@@ -109,6 +157,15 @@ One instance per page. Wraps a Fabric `Canvas` and owns:
   IndexedDB and drop the references — a 100-page import never holds 100
   backgrounds in memory.
 
+### `src/pdf/grouping.js` — ink grouping
+Spatial clustering algorithms that analyze extracted vector paths and cluster them into logical, selectable stroke groups based on proximity and stroke properties.
+
+### `src/pdf/importModel.js` — import normalization
+Normalizes extracted objects, validates schema versions, and composes page-sized fallback image layers when full object extraction is partial or lossy.
+
+### `src/pdf/canvasBlob.js` — canvas blob conversions
+Helper routines converting off-screen canvases into WebP or PNG blobs for storage and thumbnail rendering.
+
 ### `src/pdf/raster.js` — crisp zoom for imported pages
 
 The import snapshot is only ~1600px, so zooming in would magnify a bitmap.
@@ -118,10 +175,12 @@ viewport transform is instant, sharper pixels arrive ~180 ms later.
 
 ### `src/storage/assets.js` — IndexedDB blob store
 
-Database `omninote-assets`, single object store `assets`. Binary data is
-(Backgrounds, thumbnails, embedded images, the source PDF) stored as Blobs;
-only the generated id is persisted in `localStorage`. Object URLs are cached in
-a `Map` so re-rendering the library does not reload blobs.
+Database `omninote-assets`, single object store `assets`. Binary data
+(backgrounds, thumbnails, embedded images, source PDF) stored as Blobs;
+only generated IDs are kept in localStorage.
+* **Deep Asset Cleanup**: `collectNoteAssetIdsDeep`, `collectPageAssetIdsDeep`, and
+  `collectAssetIdsFromGraph` inspect serialized Fabric object graphs to ensure embedded
+  image blobs are never orphaned on delete while preserving shared assets across copies.
 
 ### `src/canvas/zoomWindow.js` — Noteful-style writing strip
 
@@ -268,23 +327,24 @@ CSS-only scale (`preview`), and re-render at full resolution on release.
 1. **One live Fabric engine per page.** `initEditor` instantiates an
    `OmniCanvas` for every page in the notebook, so memory is O(pages).
    `isActivePage` limits render *quality*, not engine count.
-2. **`saveNotes()` is a full synchronous serialize of every notebook** on every
-   edit. Only thumbnails are debounced. There is no `beforeunload` /
-   `visibilitychange` flush.
+2. [RESOLVED] **Unload write safety & in-flight tracking.** `inFlightPayloads` tracks
+   every asynchronous IndexedDB write, drained on `pagehide` and `visibilitychange`
+   (`flushPayloads()`). Deep asset collection ensures no orphaned blobs on delete.
 3. **Undo is full-canvas snapshots** (35 deep, per engine) rather than commands.
 4. **Eraser uses a bounding-box hit test** (`performErase`) — no partial erase.
-5. `icon("copy" | "cut" | "paste" | "tag")` are **not defined** in the icon
-   table, so those four Page Manager buttons render with no glyph (labels still
-   show).
+5. [RESOLVED] **Page Manager icons.** Glyphs for `copy`, `cut`, `paste`, and `tag`
+   are implemented in `src/ui/icons.js`.
 6. `document.addEventListener("click", …)` is re-bound on every `render()`
    (inside `bindEditorEvents`) and the IntersectionObserver is never
    disconnected — both accumulate across renders.
-7. **No tests, no linter.** Playwright scripts live outside the repo.
+7. [RESOLVED] **Regression tests & linter.** Self-contained Playwright test suite
+   under `tests/` (`npm test`) and ESLint validation (`npm run lint`).
 8. Export is **raster-only** — the output PDF is not searchable and does not
    contain recovered text.
 9. `render()` always resets `currentZoom = 1`; `zoomRestoreTarget` exists
    specifically to survive Page Manager round-trips.
-10. `perfect-freehand` is a declared dependency with zero imports.
+10. [RESOLVED] **Unused dependency dropped.** `perfect-freehand` was uninstalled
+    from `package.json`.
 
 ---
 
