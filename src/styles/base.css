@@ -1,0 +1,50 @@
+:root {
+  color-scheme: dark;
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "DM Sans", system-ui, sans-serif;
+  background: #090a0d;
+  color: #f1f5f9;
+  --bg-shell: #090a0d;
+  --bg-sidebar: #111217;
+  --bg-topbar: #14161d;
+  --bg-workspace: #1a1b23;
+  --bg-surface: #1e2029;
+  --bg-hover: #262934;
+  --border-subtle: #232530;
+  --accent-primary: #6366f1;
+  --accent-hover: #4f46e5;
+  --accent-soft: rgba(99, 102, 241, 0.15);
+  --text-muted: #94a3b8;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-width: 720px;
+  min-height: 100vh;
+  background: var(--bg-shell);
+  overflow: hidden;
+}
+
+button, input, select {
+  font: inherit;
+}
+
+button {
+  border: 0;
+  color: inherit;
+  cursor: pointer;
+}
+
+/* Hide native browser 'Choose File' button so custom icon labels work cleanly */
+input[type="file"] {
+  display: none !important;
+  opacity: 0 !important;
+  position: absolute !important;
+  pointer-events: none !important;
+  width: 0 !important;
+  height: 0 !important;
+}
+

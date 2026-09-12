@@ -1,6 +1,6 @@
 # OmniNote
 
-OmniNote is a deliberately small, local-first notebook app for macOS browsers.
+OmniNote is a local-first desktop application (packaged with **Tauri v2** and Rust) and web notebook app for macOS.
 
 Its purpose is simple: let someone move exported notebooks from Goodnotes, Notability, and similar apps into a clean canvas where they can keep writing and gradually make imported material editable.
 
@@ -65,19 +65,22 @@ Only these destinations exist in the first release:
 
 The UI must remain sparse. The tool rail is the primary way to switch modes; contextual actions appear only after selecting an object.
 
-## First-release scope
+## Scope & Capabilities
 
 ### Included
 
-- Local notebook library with create, rename, pin, and trash actions.
-- A one-page notebook canvas.
-- Pen, highlighter, object eraser, selection, text, and image tools.
-- Three visible colour choices and a stroke-width slider.
-- Pointer input (mouse, trackpad, stylus where available).
-- Imported PDF pages as writable backgrounds.
-- Local persistence.
-- Undo/redo once the object-command history is added.
-- Export to PDF once the canvas model is stable.
+- **Native Desktop App**: Packaged via **Tauri v2** (`src-tauri/`) with a native macOS window, capabilities, and system menu.
+- **Local Notebook Library**: Create, rename, pin, trash, restore, and folder organization.
+- **Multi-page Canvas**: Dynamic multi-page notebook model with Noteful-style Page Manager (reorder, rotate, cut/copy/paste, tag, extract).
+- **Tools**: Pen (4 styles: ballpoint, fountain, brush, monoline), marker/highlighter, object eraser, selection, text, and image tools.
+- **Color & Stroke Controls**: Custom color swatches, palette popup, color picker, and stroke-width presets.
+- **Input**: Pointer input (mouse, trackpad, stylus where available with pressure support).
+- **Editable PDF Import (Level B)**: Decomposes imported PDFs into editable text, vector stroke groups, and images, with fallback raster support and import diagnostic reports.
+- **Magnified Writing Strip**: Docked Noteful-style zoom window mirroring the live canvas.
+- **Storage & Offline Persistence**: Local persistence using browser storage and IndexedDB with unload transaction safety (`pagehide`/`visibilitychange` flushes). Deep garbage collection on delete.
+- **Undo / Redo**: Canvas history snapshots.
+- **Export to PDF**: High-resolution vector and image export via `pdf-lib`.
+- **Automated Regression Suite**: Playwright Core test suite (`npm test`) and ESLint (`npm run lint`).
 
 ### Explicitly out of scope
 
@@ -88,44 +91,30 @@ The UI must remain sparse. The tool rail is the primary way to switch modes; con
 - A promise that every PDF becomes perfectly editable.
 - Copying Noteful or Canva's proprietary implementation or visual identity.
 
-## Current prototype
+## Development & Execution
 
-The prototype is a Vite browser application.
+### Web Mode (Vite)
 
 ```bash
 npm install
-npm run dev
+npm run dev        # Starts Vite dev server at http://localhost:5173
+npm run build      # Builds web production bundle in dist/
+npm run lint       # Runs ESLint across src, scripts, and tests
+npm test           # Runs Playwright regression tests
 ```
 
-Build verification:
+### Desktop Mode (Tauri v2)
 
 ```bash
-npm run build
+npm run tauri dev    # Runs the native macOS desktop app with hot-reloading
+npm run tauri build  # Compiles native macOS binary / bundle
 ```
-
-What currently works:
-
-- Dark library and minimal notebook editor.
-- New notebook creation and renaming.
-- Local notebook metadata and canvas objects saved in `localStorage`.
-- Freehand pen and highlighter strokes.
-- Text and image insertion.
-- Moving text and image objects with Select mode.
-- PDF selection from the library. Every imported PDF page becomes its own note and is rasterized to a compressed WebP background.
-- Page backgrounds are kept in IndexedDB, not as duplicated PDF files.
-
-Prototype limitations to address next:
-
-- Imported PDF content is currently a visual background, not yet decomposed into editable source objects.
-- Erasing must be tested and improved to feel natural.
-- Resize, rotation, object grouping, pin/trash/folder interactions, undo/redo, and PDF export are not built yet.
-- The editor currently represents one page per notebook record. A real notebook/page model is required before the product grows.
 
 ## Technical approach
 
 ### Platform
 
-Start as a local-first web application optimized for macOS desktop. It works in a browser now and can later be packaged as a macOS application or adapted for iPad.
+Packaged as a native desktop application with Tauri v2 (Rust backend + WebKit/Vite frontend) while maintaining complete zero-install browser compatibility. Pointer Events are used natively for smooth stylus, trackpad, and mouse input.
 
 Use Pointer Events rather than mouse-only events so stylus support is not designed out of the canvas.
 

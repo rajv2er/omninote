@@ -6,6 +6,9 @@ node_modules/
 dist/
 .vite/
 
+# Generated test fixtures — deterministic, rebuilt by `npm run fixtures`
+tests/.fixtures/
+
 # Local scratch databases (better-sqlite3 / browser-profile dumps)
 *.db
 *.db-shm
@@ -27,6 +30,5 @@ npm-debug.log*
 .env.*
 !.env.example
 
-# AI tool scratch (not part of the project)
-.kilo/
-.workbuddy-ai/
+# Archive (non-app documents & AI assistant memory)
+archive/
