@@ -183,3 +183,43 @@ export function showStorageWarning(error) {
 export function clearStorageWarning() {
   document.querySelector(".storage-warning")?.remove();
 }
+
+/**
+ * Small non-blocking corner toast for an action that reports its own outcome.
+ *
+ * Deliberately its own class rather than reusing `.import-report`: that toast is
+ * cleared whenever a new import finishes, and the storage warning must survive
+ * one. This only replaces a previous toast of its own kind.
+ *
+ * @param {string} title  Headline, e.g. "Page rebuilt"
+ * @param {string} detail  Optional second line
+ * @param {"ok"|"warn"|"error"} tone  Drives the accent colour
+ */
+export function showToast(title, detail = "", tone = "ok") {
+  document.querySelector(".omni-toast")?.remove();
+
+  const card = document.createElement("div");
+  card.className = `omni-toast omni-toast--${tone}`;
+  card.setAttribute("role", "status");
+
+  const heading = document.createElement("strong");
+  heading.textContent = title;
+  card.appendChild(heading);
+
+  if (detail) {
+    const line = document.createElement("span");
+    line.textContent = detail;
+    card.appendChild(line);
+  }
+
+  const close = document.createElement("button");
+  close.type = "button";
+  close.className = "import-report-close";
+  close.setAttribute("aria-label", "Dismiss");
+  close.textContent = "×";
+  close.addEventListener("click", () => card.remove());
+  card.appendChild(close);
+
+  document.body.appendChild(card);
+  setTimeout(() => card.remove(), 6000);
+}

@@ -34,7 +34,8 @@
    IMPORT REPORT (non-blocking completion toast)
    ========================================================================== */
 .import-report,
-.storage-warning {
+.storage-warning,
+.omni-toast {
   position: fixed;
   right: 20px;
   bottom: 20px;
@@ -55,13 +56,15 @@
 }
 
 .import-report strong,
-.storage-warning strong {
+.storage-warning strong,
+.omni-toast strong {
   font-size: 14px;
   font-weight: 700;
 }
 
 .import-report span,
-.storage-warning span {
+.storage-warning span,
+.omni-toast span {
   color: var(--text-secondary, #94a3b8);
 }
 
@@ -91,6 +94,21 @@
 
 .storage-warning em {
   color: #fca5a5;
+}
+
+/* Generic corner toast, used for actions that report their own outcome rather
+   than an import summary. Its own class so neither import-report's "clear the
+   previous completion toast" nor the storage warning's dedupe touches it. */
+.omni-toast--ok {
+  border-left: 3px solid #34d399;
+}
+
+.omni-toast--warn {
+  border-left: 3px solid #fbbf24;
+}
+
+.omni-toast--error {
+  border-left: 3px solid #ef4444;
 }
 
 .import-report-close {
