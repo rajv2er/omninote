@@ -141,9 +141,12 @@ export const noteIds = (page) =>
  * removed and re-added around work, so counting notebooks is the only
  * unambiguous "the import finished" signal.
  */
-export async function importPdf(page, file, { timeout = 180000 } = {}) {
+export async function importPdf(page, file, { timeout = 180000, mode = null } = {}) {
   // The import control only exists in the library view.
   await openLibrary(page);
+  // "editable" is the default; "annotations" imports the page as a locked
+  // raster the user can promote one page at a time.
+  if (mode) await page.selectOption("#import-mode", mode);
   const before = await noteIds(page);
   await page.setInputFiles("#pdf-input", file);
   await page.waitForFunction(
@@ -187,6 +190,26 @@ export async function openNote(page, noteId) {
   await waitForEngine(page, 0);
 }
 
+/**
+ * Waits until every one of `count` pages has a live engine.
+ *
+ * `initEditor` builds engines one page at a time, so waiting on page 0 alone
+ * means a later `objectCensus` can silently stop at the first missing engine and
+ * under-report.
+ */
+export async function waitForEngines(page, count) {
+  await page.waitForFunction(
+    (n) => {
+      for (let i = 0; i < n; i++) {
+        if (!window.__omni.inspectPage(i)) return false;
+      }
+      return true;
+    },
+    count,
+    { timeout: 30000 },
+  );
+}
+
 /** Page-level facts that live in the notebook record, not the engine. */
 export const noteSummary = (page, noteId) =>
   page.evaluate((id) => {
@@ -203,6 +226,9 @@ export const noteSummary = (page, noteId) =>
       reports: n.pages.map((p) => p.importReport ?? null),
       backgroundAssetIds: n.pages.map((p) => p.backgroundAssetId ?? null),
       thumbnailAssetIds: n.pages.map((p) => p.thumbnailAssetId ?? null),
+      editModes: n.pages.map((p) => p.editMode ?? null),
+      conversionStates: n.pages.map((p) => p.conversionState ?? null),
+      decomposed: n.pages.map((p) => p.decomposedObjects === true),
     };
   }, noteId);
 
@@ -250,6 +276,41 @@ export async function deleteForever(page, noteId) {
   await page.waitForSelector(`[data-delete-note="${noteId}"]`);
   await page.click(`[data-delete-note="${noteId}"]`);
   await page.waitForTimeout(2200);
+}
+
+/* ------------------------------------------------------------------ *
+ * Promotion ("Make editable")
+ * ------------------------------------------------------------------ */
+
+/**
+ * Waits until no page of `noteId` is mid-conversion.
+ *
+ * Promotion runs asynchronously and updates the control in place rather than
+ * re-rendering, so the only trustworthy completion signal is the page records
+ * settling back out of "converting".
+ */
+export async function waitForPromotion(page, noteId, { timeout = 120000 } = {}) {
+  await page.waitForFunction(
+    (id) => {
+      const n = window.__omni.getNotes().find((x) => x.id === id);
+      if (!n) return false;
+      return n.pages.every((p) => p.conversionState !== "converting");
+    },
+    noteId,
+    { timeout },
+  );
+}
+
+/** Promotes the page currently on screen. */
+export async function makeEditableCurrentPage(page, noteId, opts = {}) {
+  await page.click("#make-editable-btn");
+  await waitForPromotion(page, noteId, opts);
+}
+
+/** Promotes every remaining annotated page. */
+export async function makeAllEditable(page, noteId, opts = {}) {
+  await page.click("#make-all-editable-btn");
+  await waitForPromotion(page, noteId, opts);
 }
 
 /** Collects page errors and console errors for the "nothing threw" assertion. */

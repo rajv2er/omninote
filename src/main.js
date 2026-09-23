@@ -30,6 +30,7 @@ import {
 
 import {
   decomposePdf,
+  decomposeStoredPdfPage,
   IMPORT_SCHEMA_VERSION,
   IMPORTED_OBJECT_VERSION,
 } from "./pdf/decomposer.js";
@@ -47,7 +48,7 @@ import {
   putPagePayload,
   getPagePayload,
 } from "./storage/assets.js";
-import { composePageSizedFallback } from "./pdf/importModel.js";
+import { composePageSizedFallback, PDF_IMPORT_SCALE } from "./pdf/importModel.js";
 import { icon } from "./ui/icons.js";
 import { escapeHtml } from "./ui/escapeHtml.js";
 import {
@@ -55,6 +56,7 @@ import {
   summarizeImport,
   showStorageWarning,
   clearStorageWarning,
+  showToast,
 } from "./ui/dialogs.js";
 import {
   libraryView as renderLibraryHtml,
@@ -293,6 +295,26 @@ function normalizeNote(n) {
     // defaulting to false keeps their re-rasterization behaviour unchanged.
     if (p.fallbackFromImage === undefined) p.fallbackFromImage = false;
 
+    // Which document owns this page. An imported page starts as a locked raster
+    // the user writes on top of ("annotate") and can be promoted in place to
+    // native objects ("notes"). A page that never came from a PDF is always
+    // native, so it never offers promotion.
+    if (p.pdfPageIndex == null) {
+      p.editMode = "notes";
+      p.decomposedObjects = true;
+    } else if (p.editMode !== "annotate" && p.editMode !== "notes") {
+      // Records written before the flag existed: anything already holding
+      // decomposed objects, or an unconsumed import handoff, was an editable
+      // import. Everything else was a raster-only import.
+      p.decomposedObjects =
+        p.decomposedObjects === true ||
+        Boolean(p.pendingImportData || p.pendingDecomposedData);
+      p.editMode = p.decomposedObjects ? "notes" : "annotate";
+    }
+    // A conversion in flight cannot survive a reload, so only a recorded
+    // failure is restored; any other value means the page is idle.
+    if (p.conversionState !== "failed") p.conversionState = "idle";
+
     const report = p.importReport;
     p.importReport =
       report && typeof report === "object" && typeof report.status === "string"
@@ -337,6 +359,11 @@ function normalizeNote(n) {
         importSchemaVersion: 1,
         fallbackVisible: true,
         importReport: null,
+        // A page invented for a notebook that has none is native, never an
+        // imported raster, so it is never a promotion candidate.
+        editMode: "notes",
+        conversionState: "idle",
+        decomposedObjects: true,
         tags: [],
       },
     ];
@@ -1023,6 +1050,7 @@ function editorView(note) {
           <button class="page-delete-btn" id="delete-page-btn" title="Delete Current Page" ${totalPages <= 1 ? "disabled" : ""}>
             ${icon("delete", 13)}
           </button>
+          ${promoteControlsHtml(note, page)}
         </div>
       </div>
       ${showPageManager ? pageManagerOverlay(note) : ""}
@@ -1562,6 +1590,324 @@ function pmTag() {
   refreshPageManagerGrid();
 }
 
+/**
+ * Writes one page's binary assets to IndexedDB and returns the page record with
+ * asset ids in place of blobs.
+ *
+ * Shared by the importer and by single-page promotion, so a promoted page ends
+ * up exactly the shape the importer produces. `createdAssetIds` collects
+ * everything written, so a failed operation can clean up after itself without
+ * touching an asset an existing notebook owns.
+ */
+async function persistPageAssets(page, createdAssetIds) {
+  const ids = {};
+
+  // When the only unrecovered content is the page's own backdrop, the extracted
+  // backdrop image replaces the whole-page render. The render also contains the
+  // content we recovered, so using it would paint everything twice — visibly,
+  // because the raster's substituted font and the text object's font do not
+  // share advance widths.
+  let fallbackBlob = page.backgroundBlob;
+  let fallbackFromImage = false;
+
+  if (page.fallbackImage?.blob) {
+    const composed = await composePageSizedFallback(
+      page.fallbackImage.blob,
+      page.fallbackImage,
+      page.width,
+      page.height,
+    );
+    if (composed) {
+      fallbackBlob = composed;
+      fallbackFromImage = true;
+    }
+  }
+
+  if (fallbackBlob) {
+    ids.backgroundAssetId = `bg-${crypto.randomUUID()}`;
+    await putAsset(ids.backgroundAssetId, fallbackBlob);
+    createdAssetIds.push(ids.backgroundAssetId);
+  }
+
+  if (page.thumbnailBlob) {
+    ids.thumbnailAssetId = `thumb-${crypto.randomUUID()}`;
+    await putAsset(ids.thumbnailAssetId, page.thumbnailBlob);
+    createdAssetIds.push(ids.thumbnailAssetId);
+  }
+
+  // Embedded images are often the heaviest part of an export, so they go to the
+  // asset store as real blobs rather than inline base64.
+  for (const obj of page.objects || []) {
+    if (obj.omniType === "image" && obj.blob) {
+      const assetId = `img-${crypto.randomUUID()}`;
+      await putAsset(assetId, obj.blob);
+      createdAssetIds.push(assetId);
+      obj.assetId = assetId;
+      // The blob is binary and must never reach localStorage.
+      delete obj.blob;
+    }
+  }
+
+  // Drop the page-level blobs so nothing binary ends up persisted.
+  return {
+    ...page,
+    ...ids,
+    fallbackFromImage,
+    backgroundBlob: undefined,
+    thumbnailBlob: undefined,
+  };
+}
+
+/**
+ * True when an asset id is still the background of some *other* page, in any
+ * notebook. Promotion replaces a page's raster, and deleting the old one
+ * without this check would blank the pages that share it — a page copy shares
+ * its source's asset ids by design.
+ */
+function isBackgroundAssetShared(assetId, exceptPage) {
+  if (!assetId) return false;
+  for (const note of notes) {
+    for (const page of note.pages || []) {
+      if (page !== exceptPage && page.backgroundAssetId === assetId) return true;
+    }
+  }
+  return false;
+}
+
+/** Deletes a raster a promoted page no longer uses, unless a page copy needs it. */
+function releaseReplacedBackground(previousAssetId, page) {
+  if (!previousAssetId || previousAssetId === page.backgroundAssetId) return;
+  if (isBackgroundAssetShared(previousAssetId, page)) return;
+  deleteAssets([previousAssetId]).catch(() => {});
+}
+
+/** True when a page still has an annotate-mode raster that could be rebuilt. */
+function isPromotablePage(page, note) {
+  return Boolean(
+    note?.pdfAssetId &&
+      page &&
+      Number.isInteger(page.pdfPageIndex) &&
+      page.editMode !== "notes",
+  );
+}
+
+/**
+ * Promotion controls for the floating status pill.
+ *
+ * "Make editable" rebuilds the current page's content as native objects.
+ * "Make all" is deliberately the cheap half only: it extracts the remaining
+ * pages and stores the handoff, and each page's objects appear when it is
+ * opened. Instantiating every page up front would stall a long notebook for no
+ * benefit, since only the pages near the viewport are ever shown.
+ */
+function promoteControlsHtml(note, page) {
+  const promotable = (note?.pages || []).filter((p) => isPromotablePage(p, note));
+  if (promotable.length === 0) return "";
+
+  const busy = page?.conversionState === "converting";
+  const currentIndex = note.currentPageIndex || 0;
+
+  const pageButton = isPromotablePage(page, note)
+    ? `<button class="page-promote-btn" id="make-editable-btn" data-promote-page="${currentIndex}" title="Rebuild this page's content as native objects you can select, move and edit. Anything that cannot be recovered stays visible underneath." ${busy ? "disabled" : ""}>${icon("sparkle", 13)}<span>${busy ? "Rebuilding…" : "Make editable"}</span></button>`
+    : "";
+
+  const allButton =
+    promotable.length > 1
+      ? `<button class="page-promote-btn is-quiet" id="make-all-editable-btn" data-promote-all="1" title="Rebuild all ${promotable.length} remaining annotated pages. Each page's content appears when you open it." ${busy ? "disabled" : ""}>${icon("sparkle", 13)}<span>All ${promotable.length}</span></button>`
+      : "";
+
+  return `<span class="promote-controls" id="promote-controls">${pageButton}${allButton}</span>`;
+}
+
+/**
+ * Repaints the promotion controls in place.
+ *
+ * Deliberately not `render()`: rendering rebuilds every canvas engine and
+ * resets the zoom, which is both wasteful and destructive mid-promotion.
+ */
+function refreshPromoteControls(note) {
+  const host = document.querySelector("#promote-controls");
+  if (!host) return;
+
+  const page = note?.pages?.[note.currentPageIndex || 0];
+  const html = promoteControlsHtml(note, page);
+  if (html) host.outerHTML = html;
+  else host.remove();
+}
+
+/**
+ * The extraction half of promotion for one page: rebuild its content, store the
+ * binaries, and record the result on the page record.
+ *
+ * `instantiate` additionally swaps the live canvas over now, which is what the
+ * single-page action does — the user asked for this page specifically and should
+ * see it happen. Batch leaves it off: instantiation is already lazy, so forcing
+ * it for pages nobody is looking at would only stall a long notebook.
+ *
+ * @returns {Promise<{status: "rebuilt"|"failed", restored: number}>}
+ */
+async function rebuildPageAsEditable(note, page, { instantiate = false } = {}) {
+  const createdAssetIds = [];
+
+  try {
+    const record = await decomposeStoredPdfPage(
+      note.pdfAssetId,
+      page.pdfPageIndex,
+      PDF_IMPORT_SCALE,
+    );
+
+    // A scan or a flattened export decomposes to nothing. Replacing a perfectly
+    // good raster with an empty page would be a visible regression, so this is
+    // reported and the page stays in annotate mode.
+    if (!record || !(record.objects || []).length) return { status: "failed", restored: 0 };
+
+    const persisted = await persistPageAssets(record, createdAssetIds);
+    const previousBackgroundId = page.backgroundAssetId;
+    const engine = instantiate ? canvasEngines[note.pages.indexOf(page)] : null;
+    // Capture the page's own content before the reload replaces the canvas.
+    const inkObjects = engine ? engine.serialize().objects || [] : null;
+
+    page.backgroundAssetId = persisted.backgroundAssetId || null;
+    page.thumbnailAssetId = persisted.thumbnailAssetId || page.thumbnailAssetId;
+    page.fallbackVisible = persisted.fallbackVisible !== false;
+    page.fallbackFromImage = persisted.fallbackFromImage === true;
+    page.importReport = persisted.report || page.importReport;
+    page.pendingImportData = {
+      objects: persisted.objects || [],
+      report: persisted.report || null,
+    };
+    page.pendingDecomposedData = null;
+    page.editMode = "notes";
+    page.decomposedObjects = true;
+
+    let restored = 0;
+
+    if (engine) {
+      await engine.loadPage(page);
+      restored = await engine.addObjectsFromJson(inkObjects);
+      // The live canvas is the authority from here on. Leaving the handoff in
+      // place would make the next open prefer it and drop the restored ink.
+      page.pendingImportData = null;
+      page.canvasJson = engine.toJSON();
+      engine.recordHistory();
+    }
+
+    page.conversionState = "idle";
+    releaseReplacedBackground(previousBackgroundId, page);
+    return { status: "rebuilt", restored };
+  } catch (err) {
+    await deleteAssets(createdAssetIds).catch(() => {});
+    throw err;
+  }
+}
+
+/**
+ * Promotes one annotate-mode page to native objects — the "Make editable"
+ * action.
+ *
+ * The page keeps its source PDF, so this re-runs extraction for that single page
+ * and swaps the locked raster for real objects. Whatever the user already drew
+ * on the raster is captured first and put back afterwards: promoting a page must
+ * never cost the user their own annotations.
+ */
+async function promotePageToEditable(pageIndex) {
+  const note = getActiveNote();
+  const page = note?.pages?.[pageIndex];
+  if (!note || !page || page.conversionState === "converting") return;
+  if (!isPromotablePage(page, note)) return;
+  if (!canvasEngines[pageIndex]) return;
+
+  page.conversionState = "converting";
+  refreshPromoteControls(note);
+
+  try {
+    const { status, restored } = await rebuildPageAsEditable(note, page, {
+      instantiate: true,
+    });
+
+    if (status === "failed") {
+      page.conversionState = "failed";
+      refreshPromoteControls(note);
+      showToast(
+        "This page could not be rebuilt",
+        "Its content is a scan or a flattened image, so it stays as an annotated PDF — you can still write on it.",
+        "warn",
+      );
+      return;
+    }
+
+    saveNotes();
+    refreshPromoteControls(note);
+    showToast(
+      "Page rebuilt",
+      restored > 0
+        ? `Its content is editable now, and the ${restored} object${restored === 1 ? "" : "s"} you had drawn are still here.`
+        : "Its content is editable now — pick the Select tool to move things around.",
+      "ok",
+    );
+  } catch (err) {
+    page.conversionState = "failed";
+    refreshPromoteControls(note);
+    console.error("Could not make this page editable:", err);
+    showToast("Could not rebuild this page", String(err?.message || err), "error");
+  }
+}
+
+/**
+ * Rebuilds every remaining annotated page.
+ *
+ * Sequential on purpose: pdf.js decoding is not free, and the app should stay
+ * responsive through a long notebook. The page on screen is instantiated now so
+ * the user sees the result; the rest are stored as handoffs and materialise when
+ * opened.
+ */
+async function makeAllPagesEditable() {
+  const note = getActiveNote();
+  if (!note) return;
+
+  // Make sure the page on screen is serialized before its record is rewritten.
+  saveActiveCanvasPage();
+
+  const targets = (note.pages || [])
+    .map((page, index) => ({ page, index }))
+    .filter(({ page }) => isPromotablePage(page, note));
+
+  if (targets.length === 0) return;
+
+  const currentIndex = note.currentPageIndex || 0;
+  let rebuilt = 0;
+  let failed = 0;
+
+  for (const { page, index } of targets) {
+    page.conversionState = "converting";
+    refreshPromoteControls(note);
+
+    try {
+      const { status } = await rebuildPageAsEditable(note, page, {
+        instantiate: index === currentIndex,
+      });
+      if (status === "rebuilt") rebuilt++;
+      else failed++;
+    } catch (err) {
+      page.conversionState = "failed";
+      failed++;
+      console.error("Could not make a page editable:", err);
+    }
+  }
+
+  saveNotes();
+  refreshPromoteControls(note);
+  showToast(
+    failed === 0
+      ? `${rebuilt} page${rebuilt === 1 ? "" : "s"} rebuilt`
+      : "Some pages could not be rebuilt",
+    failed === 0
+      ? "Each page's content becomes editable when you open it."
+      : `${rebuilt} rebuilt, ${failed} left as annotated PDF${failed === 1 ? "" : "s"}.`,
+    failed === 0 ? "ok" : "warn",
+  );
+}
+
 async function initEditor(note) {
   if (canvasEngines && canvasEngines.length > 0) {
     canvasEngines.forEach((e) => e.destroy());
@@ -1963,6 +2309,20 @@ function bindEditorEvents(note) {
         saveNotes();
         render();
       }
+    });
+
+  // Promotion ("Make editable"). Bound by delegation on the pill rather than on
+  // the buttons, because the controls are repainted in place as page state
+  // changes and re-binding individual listeners would go stale.
+  document
+    .querySelector(".floating-status-pill")
+    ?.addEventListener("click", (e) => {
+      const promotePage = e.target.closest("[data-promote-page]");
+      if (promotePage) {
+        promotePageToEditable(Number(promotePage.dataset.promotePage));
+        return;
+      }
+      if (e.target.closest("[data-promote-all]")) makeAllPagesEditable();
     });
 
   // Page Setup Toggle
@@ -2808,70 +3168,15 @@ function bindLibraryEvents() {
         // finishes.
         const pages = await decomposePdf(
           buffer,
-          1.333333,
+          PDF_IMPORT_SCALE,
           async (page, index) => {
-          const ids = {};
+            loadingMessage =
+              importMode === "annotations"
+                ? `Rendering page ${index + 1}...`
+                : `Recovering page ${index + 1}...`;
+            renderLoading();
 
-          // When the only unrecovered content is the page's own backdrop, the
-          // extracted backdrop image replaces the whole-page render. The render
-          // also contains the content we recovered, so using it would paint
-          // everything twice — visibly, because the raster's substituted font
-          // and the text object's font do not share advance widths.
-          let fallbackBlob = page.backgroundBlob;
-          let fallbackFromImage = false;
-
-          if (page.fallbackImage?.blob) {
-            const composed = await composePageSizedFallback(
-              page.fallbackImage.blob,
-              page.fallbackImage,
-              page.width,
-              page.height,
-            );
-            if (composed) {
-              fallbackBlob = composed;
-              fallbackFromImage = true;
-            }
-          }
-
-          if (fallbackBlob) {
-            ids.backgroundAssetId = `bg-${crypto.randomUUID()}`;
-            await putAsset(ids.backgroundAssetId, fallbackBlob);
-            createdAssetIds.push(ids.backgroundAssetId);
-          }
-
-          if (page.thumbnailBlob) {
-            ids.thumbnailAssetId = `thumb-${crypto.randomUUID()}`;
-            await putAsset(ids.thumbnailAssetId, page.thumbnailBlob);
-            createdAssetIds.push(ids.thumbnailAssetId);
-          }
-
-          // Embedded images are often the heaviest part of an export, so they
-          // go to the asset store as real blobs rather than inline base64.
-          for (const obj of page.objects || []) {
-            if (obj.omniType === "image" && obj.blob) {
-              const assetId = `img-${crypto.randomUUID()}`;
-              await putAsset(assetId, obj.blob);
-              createdAssetIds.push(assetId);
-              obj.assetId = assetId;
-              // The blob is binary and must never reach localStorage.
-              delete obj.blob;
-            }
-          }
-
-          loadingMessage =
-            importMode === "annotations"
-              ? `Rendering page ${index + 1}...`
-              : `Recovering page ${index + 1}...`;
-          renderLoading();
-
-          // Drop the page-level blobs so nothing binary ends up persisted.
-          return {
-            ...page,
-            ...ids,
-            fallbackFromImage,
-            backgroundBlob: undefined,
-            thumbnailBlob: undefined,
-          };
+            return persistPageAssets(page, createdAssetIds);
           },
           { mode: importMode },
         );
@@ -2923,10 +3228,21 @@ function bindLibraryEvents() {
             // must not be replaced by a full-page re-rasterization on zoom —
             // that would reintroduce the very doubling it exists to avoid.
             fallbackFromImage: page.fallbackFromImage === true,
-            pendingImportData: {
-              objects: page.objects || [],
-              report: page.report || null,
-            },
+            // "Make editable" has already run for every page, so the notebook
+            // opens with native objects. The annotate path leaves each page as a
+            // locked raster the user promotes one at a time.
+            editMode: importMode === "annotations" ? "annotate" : "notes",
+            decomposedObjects: importMode !== "annotations",
+            conversionState: "idle",
+            // An annotate page carries no native objects, so there is nothing to
+            // hand off — the locked raster loads straight from its asset id.
+            pendingImportData:
+              importMode === "annotations"
+                ? null
+                : {
+                    objects: page.objects || [],
+                    report: page.report || null,
+                  },
             tags: [],
           })),
         };

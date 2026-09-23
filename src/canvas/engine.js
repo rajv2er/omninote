@@ -9,6 +9,7 @@ import {
   Triangle,
   Line,
   PencilBrush,
+  util,
 } from "fabric";
 import { getAssetUrl } from "../storage/assets.js";
 import { renderPdfPageBlob } from "../pdf/raster.js";
@@ -799,40 +800,39 @@ export class OmniCanvas {
     // it and are converted rather than re-imported.
     const pending = page.pendingImportData || page.pendingDecomposedData;
 
+    if (page.canvasJson) {
+      const canvasData = await hydrateCanvasJson(
+        page.canvasJson.canvasData || page.canvasJson,
+      );
+      await this.canvas.loadFromJSON(canvasData);
+      this.canvas.requestRenderAll();
+    }
+
+    // A page carries two independent layers of content and both can be present
+    // at once: the saved object graph holds what the page already had (the
+    // user's own ink, anything they moved), while the handoff holds content
+    // recovered from the PDF. A promoted page has exactly that shape — its
+    // annotations in the graph, the freshly recovered objects in the handoff —
+    // so the graph is restored first and the recovered objects land on top.
     if (pending) {
       const objects = Array.isArray(pending.objects)
         ? pending.objects
         : legacyCandidatesFromDecomposed(pending);
 
       await this.loadImportObjects(objects);
-
-      // The importer decides whether the locked raster stays visible. Partial
-      // pages keep it so nothing unsupported disappears; fully recovered pages
-      // drop it so recovered objects are not drawn over their own raster.
-      this.backgroundVisible = page.fallbackVisible !== false;
-
-      if (this.backgroundVisible && page.backgroundAssetId) {
-        await this.loadBackgroundAsset(page.backgroundAssetId);
-      } else {
-        this.backgroundImage = null;
-        this.applyBackground();
-      }
-
       if (pending.report) this.importReport = pending.report;
-    } else if (page.canvasJson) {
-      const canvasData = await hydrateCanvasJson(
-        page.canvasJson.canvasData || page.canvasJson,
-      );
-      await this.canvas.loadFromJSON(canvasData);
-      this.canvas.requestRenderAll();
+    }
 
-      this.backgroundVisible = page.fallbackVisible !== false;
-      if (this.backgroundVisible && page.backgroundAssetId) {
-        await this.loadBackgroundAsset(page.backgroundAssetId);
-      } else {
-        this.backgroundImage = null;
-        this.applyBackground();
-      }
+    // The importer decides whether the locked raster stays visible. Partial
+    // pages keep it so nothing unsupported disappears; fully recovered pages
+    // drop it so recovered objects are not drawn over their own raster. An
+    // annotate-mode page has this layer and nothing else, so it is always shown.
+    this.backgroundVisible = page.fallbackVisible !== false;
+    if (this.backgroundVisible && page.backgroundAssetId) {
+      await this.loadBackgroundAsset(page.backgroundAssetId);
+    } else {
+      this.backgroundImage = null;
+      this.applyBackground();
     }
 
     // Honour the current zoom so it carries across pages. Always applied, not
@@ -866,6 +866,32 @@ export class OmniCanvas {
     }
 
     this.canvas.requestRenderAll();
+  }
+
+  /**
+   * Re-attaches already-serialized objects to the current canvas.
+   *
+   * Promotion reloads a page to bring in freshly recovered objects, which wipes
+   * the canvas. The annotations the user had already drawn on the raster are
+   * captured before that reload and put back through here, so promoting a page
+   * never costs the user their own ink.
+   *
+   * @returns {Promise<number>} how many objects were restored
+   */
+  async addObjectsFromJson(objects) {
+    if (!Array.isArray(objects) || objects.length === 0) return 0;
+
+    const restored = await util.enlivenObjects(objects);
+    let added = 0;
+
+    for (const object of restored) {
+      if (!object) continue;
+      this.canvas.add(object);
+      added++;
+    }
+
+    this.canvas.requestRenderAll();
+    return added;
   }
 
   async buildImportObject(candidate) {

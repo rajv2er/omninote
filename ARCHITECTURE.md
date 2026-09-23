@@ -47,36 +47,37 @@ index.html                  15    single <main id="app"> + module script
 vite.config.js              22    manual vendor chunks for fabric, pdfjs, pdflib
 eslint.config.js            50    ESLint flat config for src, scripts, and tests
 jsconfig.json               10    module resolution & editor IntelliSense config
-src/main.js               3019    app shell, state, view orchestration, event binding
+src/main.js               3335    app shell, state, view orchestration, event binding
 src/ui/
   icons.js                  51    SVG icon lookup table (~30 crisp vector icons)
   libraryView.js           215    library grid, sidebar, note card, font options
   pageManagerView.js        67    page manager modal overlay & tile generator
-  dialogs.js               185    import completion toast, storage warnings
+  dialogs.js               225    import completion toast, generic toast, storage warnings
   escapeHtml.js             16    HTML sanitization utility
 src/styles/
   base.css                  50    variables (:root), reset, body, input styling
   library.css              471    shell grid, sidebar, cards, card hover actions
-  editor.css               773    topbar, tool rail, presets, swatches, status pill
+  editor.css               821    topbar, tool rail, presets, swatches, status pill
   canvas.css               140    viewport container, zoom window, paper textures
-  dialogs.css              126    loading overlay, spinner, toasts, alerts
+  dialogs.css              144    loading overlay, spinner, toasts, alerts
   pageManager.css          235    page manager modal overlay & grid layout
 src/style.css                7    root stylesheet aggregator importing src/styles/
-src/canvas/engine.js      1368    OmniCanvas: tools, undo/redo, zoom/pan, background
+src/canvas/engine.js      1394    OmniCanvas: tools, undo/redo, zoom/pan, background
 src/canvas/viewport.js     394    viewport controller: zoom math, anchors, gestures, window
 src/canvas/zoomWindow.js   351    magnified writing strip (mirrors live canvas)
-src/pdf/decomposer.js     1287    Level-B: PDF operator stream -> editable objects
+src/pdf/decomposer.js     1343    Level-B: PDF operator stream -> editable objects
 src/pdf/exporter.js        243    PDF export + page thumbnails
 src/pdf/grouping.js        410    spatial clustering of strokes into coherent ink groups
-src/pdf/importModel.js     351    decomposed object normalization & fallback layer
+src/pdf/importModel.js     361    decomposed object normalization & fallback layer
 src/pdf/canvasBlob.js       52    canvas to WebP/PNG blob conversion utilities
-src/pdf/raster.js           98    on-demand re-raster of the source PDF at zoom
+src/pdf/raster.js          107    on-demand re-raster of the source PDF at zoom
 src/storage/assets.js      272    IndexedDB blob store with deep graph traversal
 tests/
-  run.mjs                  113    regression test runner (boots Vite & browser)
-  lib/harness.mjs                 Playwright test driver and evaluation helpers
+  run.mjs                  117    regression test runner (boots Vite & browser)
+  lib/harness.mjs          324    Playwright test driver and evaluation helpers
   specs/import.spec.mjs           Level-B extraction and reload survival assertions
   specs/persistence.spec.mjs      Ink persistence, thumbnail refresh, asset cleanup
+  specs/annotate.spec.mjs         Annotate-first import and per-page promotion
 scripts/make-fixtures.mjs  420    byte-deterministic PDF fixture generator
 src-tauri/                        Tauri 2 desktop wrapper configuration & Rust source
 archive/                          Non-app deliverables (synopsis docs, AI memory)
@@ -102,6 +103,10 @@ One module holds application state and orchestrates views, persistence, and even
   zoom window.
 * **Payload Safety**: tracks in-flight IndexedDB writes via `inFlightPayloads` and
   flushes on `pagehide` and `visibilitychange` to prevent lost page data.
+* **PDF page promotion** (§10): `promotePageToEditable()` and
+  `makeAllPagesEditable()` rebuild an annotate-mode page as native objects.
+  `persistPageAssets()` is shared with the importer, so a promoted page is
+  exactly the shape an import produces.
 
 ### `src/ui/` — modular UI templates & components
 
@@ -110,7 +115,7 @@ Decoupled view generators that produce clean HTML strings:
 * **`icons.js`**: `icon(name, size = 18)` returns SVG markup for ~30 toolbar and control icons.
 * **`libraryView.js`**: `libraryView()`, `sidebar()`, `noteCard()`, and `renderFontOptions()`.
 * **`pageManagerView.js`**: `pageManagerOverlay()` and `pageManagerTilesHtml()` grid generator.
-* **`dialogs.js`**: `showImportReport()` (completion toast), `showStorageWarning()`, and `clearStorageWarning()`.
+* **`dialogs.js`**: `showImportReport()` (import completion toast), `showToast()` (generic action toast), `showStorageWarning()`, and `clearStorageWarning()`.
 * **`escapeHtml.js`**: utility for escaping untrusted string content in templates.
 
 ### `src/styles/` — component stylesheets
@@ -135,13 +140,24 @@ One instance per page. Wraps a Fabric `Canvas` and owns:
 * **Zoom/pan**: see §6.
 * **The locked background**: `backgroundImage` is held *outside* the object
   graph so it is never serialized into undo history or into `canvasJson`.
+* **`loadPage()` layering**: the saved graph (`canvasJson`) is restored first,
+  then any import handoff (`pendingImportData`) is layered on top, and the locked
+  raster is applied last. Both sources can be present at once — that is exactly a
+  promoted page, whose own annotations live in the graph and whose recovered
+  objects arrive through the handoff.
+* **`addObjectsFromJson(objects)`**: re-enlivens previously serialized objects.
+  Promotion reloads a page to bring in recovered objects, and this is how the
+  annotations that were already on the canvas get put back.
 * **`loadPage(page)`**: the fork between first import
   (`pendingDecomposedData` → build objects) and reopening (`canvasJson` → `loadFromJSON`).
 
 ### `src/pdf/decomposer.js` — Level B extraction
 
-`decomposePdf(buffer, scale, onPage)` walks every page and returns
-`{ textObjects, pathObjects, imageObjects, backgroundBlob, thumbnailBlob, fonts }`.
+`decomposePdf(buffer, scale, onPage, { mode })` walks every page. `mode` is
+`"editable"` (default: full extraction) or `"annotations"` (raster only — the
+operator list is never parsed at all). Each page becomes a record carrying the
+grouped `objects`, an `importReport`, a `fallbackVisible` decision, and the
+`backgroundBlob` / `thumbnailBlob` pair.
 
 * **Text**: `getTextContent()` items are grouped into lines by baseline
   proximity and font, fonts normalized through `normalizeFontFamily()`
@@ -156,6 +172,12 @@ One instance per page. Wraps a Fabric `Canvas` and owns:
 * `onPage` is called per page so the caller can push blobs straight into
   IndexedDB and drop the references — a 100-page import never holds 100
   backgrounds in memory.
+* **`decomposeStoredPdfPage(assetId, pageIndex, scale)`** is the single-page
+  entry point behind "Make editable" (§10). It obtains its page from
+  `raster.js`'s cached document via `getPdfDoc` — never `pdfjs.getDocument` — so
+  a notebook still has exactly one worker, one parse, and one cache that
+  `invalidatePdfDoc` can clear. It returns the same record shape `decomposePdf`
+  hands to `onPage`.
 
 ### `src/pdf/grouping.js` — ink grouping
 Spatial clustering algorithms that analyze extracted vector paths and cluster them into logical, selectable stroke groups based on proximity and stroke properties.
@@ -172,6 +194,11 @@ The import snapshot is only ~1600px, so zooming in would magnify a bitmap.
 This module keeps the parsed `PDFDocumentProxy` in a `Map` and re-renders the
 visible page with pdf.js at the current zoom (Google Drive behaviour): the
 viewport transform is instant, sharper pixels arrive ~180 ms later.
+
+`getPdfDoc(assetId)` is exported because this module is the **single owner** of
+the pdf.js document: re-rasterization here and single-page promotion in
+`decomposer.js` both go through it. A second opener would mean a second worker
+and a cache that `invalidatePdfDoc` could no longer clear.
 
 ### `src/storage/assets.js` — IndexedDB blob store
 
@@ -212,9 +239,20 @@ Notebook
         width, height, paperStyle, pageSize,
         backgroundAssetId, thumbnailAssetId,        → IndexedDB
         canvasJson: { width, height, paperStyle, canvasData },
-        pendingDecomposedData,                       → consumed on first load
-        decomposedObjects, tags[]
+        pendingImportData,                           → consumed on first load
+        importReport, fallbackVisible, fallbackFromImage,
+        editMode: "annotate" | "notes",              → §10
+        conversionState: "idle" | "converting" | "failed",
+        decomposedObjects, importSchemaVersion, tags[]
 ```
+
+`editMode` says which document owns the page. An imported page starts as
+`"annotate"` — a locked raster with nothing selectable — and becomes `"notes"`
+once its content has been rebuilt as native objects, either at import
+(`editable` mode) or later per page (`Make editable`, §10). A page that never
+came from a PDF is always `"notes"`. `conversionState` is transient except for
+`"failed"`, which records a page whose content turned out to be unrecoverable so
+the UI can explain rather than silently retry.
 
 Page sizes: a4 800×1130, letter 800×1035, slide 1200×675, square 800×800.
 Imported pages keep the PDF's own dimensions at 96 DPI (`scale = 1.3333`).
@@ -230,10 +268,11 @@ layer, invoked from `loadNotes()` and from `getActiveNote()` on all ~21 call sit
 ### Import
 
 ```text
-file.pdf
-  → decomposePdf(buffer)
+file.pdf + mode ("editable" | "annotations")
+  → decomposePdf(buffer, scale, onPage, { mode })
       → per page: text / paths / images  +  WebP background + thumbnail
-      → onPage(): putAsset() blobs → IndexedDB, return ids only
+        ("annotations" skips extraction entirely — raster + thumbnail only)
+      → onPage(): persistPageAssets() → putAsset() blobs to IndexedDB, ids only
   → putAsset(pdfAssetId, file)        (source kept for crisp re-raster)
   → new Notebook{ pages[] } pushed to `notes`, saveNotes(), render()
 ```
@@ -242,14 +281,34 @@ file.pdf
 
 ```text
 loadPage(page)
-  → pendingDecomposedData?
-        yes → loadDecomposedPdf(): IText + Path + FabricImage objects
-              if objects were produced → background hidden, decomposedObjects = true
-              else                     → load the WebP fallback as locked background
-        no  → loadFromJSON(page.canvasJson.canvasData)
-  → delete page.pendingDecomposedData   (one-shot)
-  → setPdfBackgroundSource({ assetId, pageIndex })
+  → canvasJson?        → hydrateCanvasJson() → loadFromJSON()   (the page's own content)
+  → pendingImportData? → loadImportObjects() → IText / Path / group / FabricImage
+  → fallbackVisible && backgroundAssetId?
+        yes → loadBackgroundAsset() as the locked raster
+        no  → backgroundImage = null
+  → applyTransform() → _scheduleBackgroundRaster(0) → history reset
+  → initEditor() clears the one-shot handoff once the page has loaded
 ```
+
+### Promote one page to native objects ("Make editable")
+
+```text
+promotePageToEditable(index)
+  → ink = engine.serialize().objects        (the user's own content, captured first)
+  → decomposeStoredPdfPage(pdfAssetId, pdfPageIndex)   (reuses the cached document)
+  → nothing recovered?  → conversionState = "failed"; the page stays annotate
+  → persistPageAssets() → new background / thumbnail / embedded-image ids
+  → page.pendingImportData = { objects, report }
+  → engine.loadPage(page)                   (the raster is replaced by objects)
+  → engine.addObjectsFromJson(ink)          (the annotations go back on top)
+  → pendingImportData = null; canvasJson = engine.toJSON(); editMode = "notes"
+  → the old raster is deleted unless a page copy still shares that asset
+```
+
+Batch (`makeAllPagesEditable`) runs the same extraction for the remaining pages
+but with `instantiate: false` for every page except the one on screen: the
+objects materialise when a page is next opened, so a long notebook is never
+stalled by instantiating pages nobody is looking at.
 
 ### Edit → save
 
@@ -319,6 +378,16 @@ CSS-only scale (`preview`), and re-render at full resolution on release.
 * Zoom anchors are stored as **fractions** of the page box, never pixels.
 * Global keyboard handlers must bail out through `isTypingTarget(e.target)` —
   on macOS the key labelled Delete reports `e.key === "Backspace"`.
+* **Vite's default host is `localhost`, which resolves to `::1` on a dual-stack
+  machine.** The server then binds IPv6 only, and `http://127.0.0.1:<port>` is
+  refused — which looks exactly like a crashed app. `tests/run.mjs` names
+  `host: "127.0.0.1"` so the URL it hands the browser is the address the server
+  actually holds. (This is why the suite failed with `ERR_CONNECTION_REFUSED`
+  after having passed the day before.)
+* **Asset ids are shared by design.** A copied page (Page Manager copy/extract)
+  shares its source's `backgroundAssetId` and image ids, so code that replaces a
+  page's assets must allocate a new id rather than overwrite in place, and must
+  check `isBackgroundAssetShared()` before deleting the old one.
 
 ---
 
@@ -350,80 +419,93 @@ CSS-only scale (`preview`), and re-render at full resolution on release.
 
 ## 10. PDF page modes: Annotations vs Notes
 
-### Where the code actually stands (verified 2026-09-10)
+### Status: implemented (2026-09-16)
 
-* Import is **eager**: `main.js:3069` runs `decomposePdf(buffer, 1.333333, onPage)`
-  over the *whole document* before the notebook object exists (`main.js:3117`).
-  Cost is O(pages) operator-list walks plus one background raster per page.
-* The source PDF is **already retained** (`main.js:3113`), and `raster.js` already
-  re-renders any page crisply at the current zoom — `renderPdfPageBlob`
-  (`raster.js:70`), driven by `engine._rasterizeBackground` (`engine.js:1001`)
-  and scheduled on zoom (`engine.js:992`).
-* `setPdfBackgroundSource({ assetId, pageIndex })` is already wired for every
-  imported page (`main.js:1952`).
-* ⇒ **Annotations mode is roughly 80% built already.** The locked, crisp,
-  on-demand PDF background exists. The missing piece is only *starting* a page in
-  that state instead of decomposing everything up front.
+Import-time mode choice, per-page promotion, and batch promotion all ship.
+`tests/specs/annotate.spec.mjs` covers them (22 checks), falsified by stashing
+`src/`.
 
-### Proposed model
+### The model
 
-Two new persisted fields per page; `decomposedObjects` survives as an internal
-compatibility flag so existing notebooks keep working. `normalizeNote()` backfills
-`editMode = decomposedObjects ? "notes" : "annotate"`.
+Two persisted fields per page, plus the legacy `decomposedObjects` flag so older
+notebooks keep opening. `normalizeNote()` backfills all three additively.
 
 ```text
-page.editMode        = "annotate" | "notes"
-page.conversionState = "idle" | "converting" | "failed"
+page.editMode          = "annotate" | "notes"
+page.conversionState   = "idle" | "converting" | "failed"
+page.decomposedObjects = boolean            (compatibility flag)
 ```
 
-* **annotate** (default) — `backgroundAssetId` snapshot for instant paint,
-  `renderPdfPageBlob` for sharpness, no `pendingDecomposedData`. Pen, highlighter,
-  shapes and text already work on top; no engine change required.
-* **notes** — produced by promoting a single page via `decomposeStoredPdfPage()`.
+* **annotate** — the locked `backgroundAssetId` raster for instant paint, plus
+  `renderPdfPageBlob` for sharpness at any zoom. No native objects at all, so
+  nothing is selectable; pen, highlighter, shapes and text work on top unchanged.
+* **notes** — native objects, produced either at import (`editable` mode) or by
+  promoting a single page with `decomposeStoredPdfPage()`.
 
-### Decisions (resolved)
+The mode is chosen in the library (`#import-mode`) and read once, before any
+`await`, so a change mid-import cannot produce a half-and-half notebook.
 
-1. **A lightweight import must still learn real page dimensions.** Today
-   `decomposePdf` supplies them (`main.js:3130`). Add `getPdfPageInfo(assetId)` to
-   `raster.js` returning `{ numPages, pages: [{ width, height, rotation }] }` via
-   `getPage()` + `getViewport()` — no operator-list parse, no raster. Reuse the
-   existing `docs` cache (`raster.js:26`) so it costs essentially nothing.
-2. **One pdf.js document, one owner.** `decomposeStoredPdfPage(assetId, pageIndex)`
-   belongs in `decomposer.js`, but it must import `getPdfDoc` from `raster.js`
-   rather than calling `pdfjs.getDocument` itself. Two independent openers means
-   two workers, two parses, and a cache `invalidatePdfDoc` can no longer clear.
-3. **Annotation preservation on promote.** Never load `canvasJson` over a freshly
-   decomposed canvas — `loadDecomposedPdf` clears it (`engine.js:824`). Sequence:
-   `const ink = engine.canvas.toObject()` → `await engine.loadPage(page)` with the
-   fresh `pendingDecomposedData` → `util.enlivenObjects(ink.objects)` → `add()`
-   each → `requestRenderAll()` → `recordHistory()` → persist.
-4. **Lossy-extraction guard.** Flattened or scanned PDFs decompose badly. Gate
-   promotion on the same `hasObjects` test already in `loadPage` (`engine.js:776`):
-   if a page yields no text/path/image objects, leave it in `annotate` and say so
-   rather than silently producing a near-empty page. Also surface
-   `setBackgroundVisible()` (`engine.js:1060`, currently with no UI) as a
-   "show original" escape hatch — the source PDF is kept forever, so the raster
+### Where the code lives
+
+| Concern | Location |
+|---|---|
+| Mode read + notebook construction | `main.js` import handler |
+| Raster-only page record | `decomposer.js` `decomposePdf({ mode: "annotations" })` |
+| Single-page extraction | `decomposer.js` `decomposeStoredPdfPage()` |
+| Blob persistence (shared with import) | `main.js` `persistPageAssets()` |
+| Promotion and batch | `main.js` `promotePageToEditable()`, `makeAllPagesEditable()` |
+| Page layering | `engine.js` `loadPage()`, `addObjectsFromJson()` |
+| Controls | `main.js` `promoteControlsHtml()`, in the floating status pill |
+
+### Decisions, and how they landed
+
+1. **A lightweight import must still learn real page dimensions.** *Resolved
+   without the planned probe.* The design called for a `getPdfPageInfo(assetId)`
+   reading `getPage()` + `getViewport()` with no operator parse. It turned out to
+   be unnecessary: annotate mode already calls `decomposePage(…, {extract:false})`,
+   which skips `getOperatorList()` entirely and still reports exact `width`/`height`
+   alongside the raster it must render anyway. The probe would have duplicated that
+   for no saving, so it was dropped rather than left as dead code.
+2. **One pdf.js document, one owner.** `getPdfDoc` is exported from `raster.js`
+   and `decomposeStoredPdfPage` imports it; it never calls `pdfjs.getDocument`
+   itself. A notebook therefore still has one worker, one parse, and one cache
+   that `invalidatePdfDoc` can clear.
+3. **Annotation preservation on promote.** The user's own content is captured with
+   `engine.serialize()` *before* anything touches the canvas, and re-applied
+   through `addObjectsFromJson()` after the reload. The suite asserts a
+   pre-promotion stroke is still present — and still present again after a reopen.
+4. **Lossy-extraction guard.** If a page yields no objects — a scan, a flattened
+   export — promotion leaves it in `annotate`, sets `conversionState = "failed"`,
+   and says why in a toast. A good raster is never replaced by an empty page.
+   `setBackgroundVisible()` remains the documented "show original" escape hatch
+   and still has no UI of its own; the source PDF is kept forever, so the raster
    can always be restored.
-5. **Batch "make all editable".** Extraction and Fabric instantiation are separate
-   costs. Batch should only *extract* (write `pendingDecomposedData` + assets to
-   IndexedDB) and never instantiate, because instantiation is already lazy in
-   `loadPage`. Run sequentially with progress and cancellation. It remains O(pages),
-   so it stays opt-in and never the default.
-6. **Export is still raster-only.** `exporter.js:64-163` uses `pdf-lib` purely as a
-   bitmap container, so the original text and vectors are lost. For annotate-mode
-   pages the fix is `PDFDocument.load()` the source, copy the page in untouched,
-   and draw only a transparent annotation PNG on top. Notes pages keep the current
-   composed behaviour.
+5. **Batch "make all editable".** Batch extracts only. Every page except the one
+   on screen is left with a `pendingImportData` handoff and no instantiation,
+   because instantiation is already lazy in `loadPage`. Sequential, so a long
+   notebook stays responsive; opt-in, never the default.
+6. **Export is still raster-only.** Untouched by this work — see defect 8 in §9.
+   An annotate-aware export (copy the source page through untouched, draw only a
+   transparent annotation layer on top) remains outstanding.
+
+### One-shot handoff, two layers
+
+`loadPage()` restores `canvasJson` first and layers `pendingImportData` on top.
+Both can be present at once, and that is precisely a promoted page: its own
+annotations live in the graph, the recovered objects arrive through the handoff.
+`promotePageToEditable()` serializes the live canvas straight away and clears the
+handoff, so a later open cannot prefer the handoff and drop the restored ink.
 
 ### Explicitly out of scope here
 
-The O(n) engine-per-page defect (`initEditor` loop, `main.js:1887`) is a separate
-change. `isActivePage` (`main.js:1951`) already limits *raster quality* for distant
-pages, but not the number of live Fabric engines.
+The O(n) engine-per-page defect (`initEditor` loops every page) is a separate
+change, tracked in `MEMORY_OPTIMIZATION.md`. `isActivePage` limits *raster
+quality* for distant pages, not the number of live Fabric engines.
 
 ---
 
 ## 11. Git history
 
-Seven commits, latest `10a9026 "Fix invisible strokes in imported PDFs"`.
-Both `README.md` and package build verify clean (`npm run build`).
+Eleven commits, latest `91d450d "refactor: modularize styles, extract UI views &
+viewport controller, update docs"`. `README.md` and `npm run build` verify clean,
+as do `npm run lint` (0 errors) and `npm test` (52 checks across three specs).

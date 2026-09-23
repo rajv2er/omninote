@@ -2,6 +2,10 @@ import * as pdfjs from "pdfjs-dist";
 import pdfWorker from "pdfjs-dist/build/pdf.worker.mjs?url";
 import { groupPageCandidates } from "./grouping.js";
 import { canvasToBlob } from "./canvasBlob.js";
+import { PDF_IMPORT_SCALE } from "./importModel.js";
+// One pdf.js document per notebook, owned by the raster module. Promotion must
+// reuse it rather than opening the file a second time.
+import { getPdfDoc } from "./raster.js";
 
 pdfjs.GlobalWorkerOptions.workerSrc = pdfWorker;
 
@@ -1200,7 +1204,7 @@ export async function decomposePage(page, scale = 1.333333, options = {}) {
  * holding every page's background in memory until the whole document finishes.
  * Whatever it returns replaces the page record.
  */
-export async function decomposePdf(arrayBuffer, scale = 1.333333, onPage, options = {}) {
+export async function decomposePdf(arrayBuffer, scale = PDF_IMPORT_SCALE, onPage, options = {}) {
   // "annotations" keeps the PDF as the document and only rasterizes each page;
   // "editable" additionally rebuilds its content as native objects.
   const mode = options.mode === "annotations" ? "annotations" : "editable";
@@ -1284,4 +1288,56 @@ export async function decomposePdf(arrayBuffer, scale = 1.333333, onPage, option
   pages.detectedFonts = Object.keys(globalFontUsage);
 
   return pages;
+}
+
+/**
+ * Decomposes one page of an already-stored PDF — the "Make editable"
+ * promotion behind annotate-first import.
+ *
+ * An annotate-mode page keeps the source PDF as its document and a raster as
+ * its visible content. Promotion runs exactly the extraction the editable
+ * importer would have run, but for a single page, and without reopening the
+ * file: the pdf.js document comes from the raster module's cache, so there is
+ * still only one worker and one parse for the whole notebook.
+ *
+ * The returned record has the same shape `decomposePdf` hands to `onPage`.
+ * Binary stays binary — the caller decides where the blobs are written.
+ *
+ * @param {string} assetId  IndexedDB id of the source PDF file
+ * @param {number} pageIndex  Zero-based page index
+ * @param {number} scale  Points-to-pixels factor; defaults to the import scale
+ * @returns {Promise<object|null>} page record, or null when the PDF is gone
+ */
+export async function decomposeStoredPdfPage(
+  assetId,
+  pageIndex,
+  scale = PDF_IMPORT_SCALE,
+) {
+  if (!assetId) return null;
+
+  const doc = await getPdfDoc(assetId);
+  const page = await doc.getPage((pageIndex || 0) + 1);
+
+  try {
+    const decomposed = await decomposePage(page, scale, { extract: true });
+    const grouped = groupPageCandidates(decomposed);
+
+    return {
+      pageNumber: (pageIndex || 0) + 1,
+      width: decomposed.width,
+      height: decomposed.height,
+      importSchemaVersion: IMPORT_SCHEMA_VERSION,
+      importedObjectVersion: IMPORTED_OBJECT_VERSION,
+      ...grouped,
+      backgroundBlob: decomposed.backgroundBlob,
+      thumbnailBlob: decomposed.thumbnailBlob,
+      detectedFonts: decomposed.detectedFonts,
+      mostUsedFont: decomposed.mostUsedFont,
+      fontUsage: decomposed.fontUsage,
+    };
+  } finally {
+    // The document stays open for crisp re-rasterization; only this page's
+    // decode buffers are released.
+    page.cleanup();
+  }
 }
