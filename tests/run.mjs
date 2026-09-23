@@ -31,6 +31,7 @@ const FIXTURE_DIR = join(ROOT, "tests", ".fixtures");
 const ALL_SPECS = [
   "import.spec.mjs",
   "persistence.spec.mjs",
+  "annotate.spec.mjs",
 ];
 
 const filter = process.argv[2];
@@ -59,7 +60,11 @@ try {
   server = await createServer({
     root: ROOT,
     logLevel: "warn",
-    server: { port: PORT, strictPort: true },
+    // Bind IPv4 explicitly. Vite's default host is `localhost`, which on a
+    // dual-stack machine resolves to `::1` only — the server then binds IPv6
+    // and the `http://127.0.0.1` URL below is refused. Naming the host makes
+    // the address the browser is given the address the server actually holds.
+    server: { host: "127.0.0.1", port: PORT, strictPort: true },
   });
   await server.listen();
   const baseUrl = `http://127.0.0.1:${PORT}/`;

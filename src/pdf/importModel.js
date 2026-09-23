@@ -28,6 +28,16 @@ import { getAssetUrl } from "../storage/assets.js";
 import { canvasToBlob } from "./canvasBlob.js";
 
 /**
+ * The one scale at which PDF pages become notebook pages.
+ *
+ * PDF coordinates are 72 DPI points; the canvas is 96 DPI CSS pixels. Every
+ * path that turns a PDF page into a page — the importer, a single-page
+ * promotion, and the lightweight geometry probe — must use this same value, or
+ * a promoted page would not line up with the annotate-mode raster it replaces.
+ */
+export const PDF_IMPORT_SCALE = 1.333333;
+
+/**
  * Non-default Fabric properties that must survive `toJSON()`/`loadFromJSON()`.
  * Fabric only serialises properties it knows about unless they are listed.
  */

@@ -30,7 +30,16 @@ const docs = new Map();
 const MAX_SCALE = 10;
 const MIN_SCALE = 0.1;
 
-async function getPdfDoc(assetId) {
+/**
+ * Opens (or reuses) the one pdf.js document for a stored PDF.
+ *
+ * Exported deliberately. Everything that needs the source document — crisp
+ * re-rasterization here and single-page promotion in `decomposer.js` — must go
+ * through this cache. A second `pdfjs.getDocument` call would spin up a second
+ * worker and a second parse, and `invalidatePdfDoc` could then only ever clear
+ * one of them.
+ */
+export async function getPdfDoc(assetId) {
   if (docs.has(assetId)) return docs.get(assetId);
 
   const pending = (async () => {
