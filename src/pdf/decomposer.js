@@ -18,6 +18,14 @@ export const IMPORT_SCHEMA_VERSION = 2;
 /** Bumped whenever the shape of a single imported object changes. */
 export const IMPORTED_OBJECT_VERSION = 1;
 
+/** Render backgrounds for every page during import (the historical behaviour). */
+export const BACKGROUNDS_EAGER = "eager";
+/**
+ * Render page 1's background during import; later pages ship thumbnail-only and
+ * are re-rendered from the source PDF the first time they are opened.
+ */
+export const BACKGROUNDS_LAZY = "lazy";
+
 /**
  * Normalizes raw PDF font names to clean web/system font names.
  * Strips subset prefixes (e.g. "ABCDEF+Helvetica-Bold" -> "Helvetica").
@@ -1135,36 +1143,61 @@ export async function decomposePage(page, scale = 1.333333, options = {}) {
 
   try {
     if (typeof document !== "undefined") {
+      const includeBackground = options.includeBackground !== false;
       const bgFactor = Math.min(1, BACKGROUND_MAX_EDGE / Math.max(width, height));
       const bgViewport = page.getViewport({ scale: scale * bgFactor });
 
-      const bgCanvas = document.createElement("canvas");
-      bgCanvas.width = Math.max(1, Math.round(bgViewport.width));
-      bgCanvas.height = Math.max(1, Math.round(bgViewport.height));
+      // The background snapshot is what makes a page viewable before it has
+      // been opened. In lazy mode only page 1 needs it; the rest are rendered
+      // from the source PDF by the canvas engine on first open.
+      if (includeBackground) {
+        const bgCanvas = document.createElement("canvas");
+        bgCanvas.width = Math.max(1, Math.round(bgViewport.width));
+        bgCanvas.height = Math.max(1, Math.round(bgViewport.height));
 
-      await page.render({
-        canvasContext: bgCanvas.getContext("2d"),
-        viewport: bgViewport,
-        // Annotations are drawn into the raster by default — that is what keeps
-        // a page whose ink lives in annotations from losing it. They are only
-        // suppressed when every annotation was promoted to a native object, so
-        // the same ink is never painted twice.
-        annotationMode: suppressAnnotationsInFallback
-          ? (pdfjs.AnnotationMode?.DISABLE ?? 0)
-          : (pdfjs.AnnotationMode?.ENABLE ?? 1),
-      }).promise;
+        await page.render({
+          canvasContext: bgCanvas.getContext("2d"),
+          viewport: bgViewport,
+          // Annotations are drawn into the raster by default — that is what keeps
+          // a page whose ink lives in annotations from losing it. They are only
+          // suppressed when every annotation was promoted to a native object, so
+          // the same ink is never painted twice.
+          annotationMode: suppressAnnotationsInFallback
+            ? (pdfjs.AnnotationMode?.DISABLE ?? 0)
+            : (pdfjs.AnnotationMode?.ENABLE ?? 1),
+        }).promise;
 
-      backgroundBlob = await canvasToBlob(bgCanvas, 0.8);
+        backgroundBlob = await canvasToBlob(bgCanvas, 0.8);
 
-      const thumbFactor = Math.min(1, THUMBNAIL_MAX_EDGE / bgCanvas.width);
-      const thumbCanvas = document.createElement("canvas");
-      thumbCanvas.width = Math.max(1, Math.round(bgCanvas.width * thumbFactor));
-      thumbCanvas.height = Math.max(1, Math.round(bgCanvas.height * thumbFactor));
-      const thumbCtx = thumbCanvas.getContext("2d");
-      thumbCtx.imageSmoothingQuality = "high";
-      thumbCtx.drawImage(bgCanvas, 0, 0, thumbCanvas.width, thumbCanvas.height);
+        const thumbFactor = Math.min(1, THUMBNAIL_MAX_EDGE / bgCanvas.width);
+        const thumbCanvas = document.createElement("canvas");
+        thumbCanvas.width = Math.max(1, Math.round(bgCanvas.width * thumbFactor));
+        thumbCanvas.height = Math.max(1, Math.round(bgCanvas.height * thumbFactor));
+        const thumbCtx = thumbCanvas.getContext("2d");
+        thumbCtx.imageSmoothingQuality = "high";
+        thumbCtx.drawImage(bgCanvas, 0, 0, thumbCanvas.width, thumbCanvas.height);
 
-      thumbnailBlob = await canvasToBlob(thumbCanvas, 0.7);
+        thumbnailBlob = await canvasToBlob(thumbCanvas, 0.7);
+      } else {
+        // Thumbnail-only: render at thumbnail size directly so the library grid
+        // and Page Manager have an image without paying for a 1600px raster.
+        const thumbFactor = Math.min(
+          1,
+          THUMBNAIL_MAX_EDGE / Math.max(bgViewport.width, bgViewport.height),
+        );
+        const thumbViewport = page.getViewport({ scale: scale * bgFactor * thumbFactor });
+        const thumbCanvas = document.createElement("canvas");
+        thumbCanvas.width = Math.max(1, Math.round(thumbViewport.width));
+        thumbCanvas.height = Math.max(1, Math.round(thumbViewport.height));
+
+        await page.render({
+          canvasContext: thumbCanvas.getContext("2d"),
+          viewport: thumbViewport,
+          annotationMode: pdfjs.AnnotationMode?.ENABLE ?? 1,
+        }).promise;
+
+        thumbnailBlob = await canvasToBlob(thumbCanvas, 0.7);
+      }
     }
   } catch (err) {
     warnings.push("fallback-render-failed");
@@ -1209,6 +1242,11 @@ export async function decomposePdf(arrayBuffer, scale = PDF_IMPORT_SCALE, onPage
   // "editable" additionally rebuilds its content as native objects.
   const mode = options.mode === "annotations" ? "annotations" : "editable";
   const extract = mode === "editable";
+  // Annotate-first imports can defer the per-page background snapshot: page 1
+  // is rendered up front so the notebook opens instantly, and the rest are
+  // filled from the source PDF the first time each page is opened.
+  const lazyBackgrounds =
+    options.lazyBackgrounds === true && mode === "annotations";
 
   const bytes = new Uint8Array(arrayBuffer);
   const pdf = await pdfjs.getDocument({ data: bytes }).promise;
@@ -1217,7 +1255,10 @@ export async function decomposePdf(arrayBuffer, scale = PDF_IMPORT_SCALE, onPage
 
   for (let num = 1; num <= pdf.numPages; num++) {
     const page = await pdf.getPage(num);
-    const decomposed = await decomposePage(page, scale, { extract });
+    const decomposed = await decomposePage(page, scale, {
+      extract,
+      includeBackground: !lazyBackgrounds || num === 1,
+    });
 
     // Turn the raw operator-level candidates into the objects the editor will
     // actually receive: grouped where the evidence is strong, dropped into the
@@ -1340,4 +1381,56 @@ export async function decomposeStoredPdfPage(
     // decode buffers are released.
     page.cleanup();
   }
+}
+
+/**
+ * Renders a small thumbnail of every page, for the import-time page picker.
+ *
+ * Opens the document once and walks it sequentially, so the picker is ready in
+ * roughly the time a thumbnail-only annotate import would take. Returns one
+ * object URL per page, in page order; the caller owns `URL.revokeObjectURL`.
+ *
+ * @param {ArrayBuffer} arrayBuffer
+ * @param {number} [maxEdge=160]  Longest thumbnail edge in CSS pixels
+ * @returns {Promise<string[]>}
+ */
+export async function renderPdfPageThumbnails(arrayBuffer, maxEdge = 160) {
+  const bytes = new Uint8Array(arrayBuffer);
+  const loadingTask = pdfjs.getDocument({ data: bytes });
+  const pdf = await loadingTask.promise;
+  const urls = [];
+
+  try {
+    for (let num = 1; num <= pdf.numPages; num++) {
+      const page = await pdf.getPage(num);
+      try {
+        const base = page.getViewport({ scale: 1 });
+        const scale = Math.min(1, maxEdge / Math.max(base.width, base.height));
+        const viewport = page.getViewport({ scale });
+
+        const canvas = document.createElement("canvas");
+        canvas.width = Math.max(1, Math.round(viewport.width));
+        canvas.height = Math.max(1, Math.round(viewport.height));
+        await page.render({
+          canvasContext: canvas.getContext("2d"),
+          viewport,
+        }).promise;
+
+        const blob = await canvasToBlob(canvas, 0.7);
+        urls.push(blob ? URL.createObjectURL(blob) : "");
+      } finally {
+        page.cleanup();
+      }
+    }
+  } finally {
+    // Release the worker and its parse; the picker document is one-shot and is
+    // not the cached document the raster module owns for the notebook.
+    try {
+      await loadingTask.destroy();
+    } catch {
+      // Already torn down; nothing to release.
+    }
+  }
+
+  return urls;
 }
