@@ -191,8 +191,9 @@ export function libraryView({
               class="import-mode-select"
               title="Make editable rebuilds the PDF's content as native objects, so it costs several times the file size and takes longer. Annotate PDF keeps the original and draws on top of it."
             >
+              <option value="annotations" selected>Annotate PDF</option>
+              <option value="choose">Choose pages…</option>
               <option value="editable">Make editable</option>
-              <option value="annotations">Annotate PDF</option>
             </select>
             <button class="new-note-btn" id="new-note-btn">
               ${icon("plus", 16)}

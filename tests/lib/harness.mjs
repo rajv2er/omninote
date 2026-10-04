@@ -144,9 +144,10 @@ export const noteIds = (page) =>
 export async function importPdf(page, file, { timeout = 180000, mode = null } = {}) {
   // The import control only exists in the library view.
   await openLibrary(page);
-  // "editable" is the default; "annotations" imports the page as a locked
-  // raster the user can promote one page at a time.
-  if (mode) await page.selectOption("#import-mode", mode);
+  // Default the suite to the explicit "editable" mode so existing specs keep
+  // exercising full extraction; the app's import default is now "annotations"
+  // (annotate-first), which is covered by its own spec.
+  await page.selectOption("#import-mode", mode || "editable");
   const before = await noteIds(page);
   await page.setInputFiles("#pdf-input", file);
   await page.waitForFunction(

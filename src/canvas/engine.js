@@ -61,6 +61,11 @@ export class OmniCanvas {
     this.isStrikethrough = false;
     this.penStyle = "ballpoint";
 
+    // Fired after a lazy background render lands, so the caller can persist
+    // the blob and the next open reads it from the asset store instead of
+    // re-rendering. Optional; undefined outside an annotate-first import.
+    this.onBackgroundRaster = options.onBackgroundRaster || null;
+
     // Zoom / Pan state. `currentZoom` is the only zoom variable — it is what
     // `setZoom` writes and `applyTransform` reads. `panX`/`panY` are the
     // viewport offset in screen pixels.
@@ -1166,6 +1171,17 @@ export class OmniCanvas {
       this.backgroundImage = img;
       this.applyBackground();
       this.canvas.requestRenderAll();
+
+      // A lazy-imported page had no background snapshot at import time. Offer
+      // the freshly rendered blob to the caller so it can be persisted and the
+      // next open reads it from the asset store instead of re-rendering.
+      if (this.onBackgroundRaster) {
+        try {
+          this.onBackgroundRaster(result.blob, result.width, result.height);
+        } catch {
+          // Persistence is a best-effort optimisation; never break the render.
+        }
+      }
     } catch (err) {
       console.warn("Background re-rasterization failed:", err);
     } finally {
