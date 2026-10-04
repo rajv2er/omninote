@@ -51,9 +51,16 @@ export default async function run({ page, fixtures, check }) {
     summary.statuses.every((s) => s === "fallback"),
     JSON.stringify(summary.statuses),
   );
+  // Lazy import: only page 1 carries an import-time background snapshot; the
+  // rest are rendered from the source PDF the first time each page is opened.
   check(
-    "every annotated page has a raster in the asset store",
-    summary.backgroundAssetIds.every(Boolean),
+    "page 1 has its import-time raster",
+    Boolean(summary.backgroundAssetIds[0]),
+  );
+  check(
+    "later pages defer their background until first open",
+    summary.backgroundAssetIds.slice(1).every((id) => id == null),
+    JSON.stringify(summary.backgroundAssetIds),
   );
 
   await openNote(page, noteId);
@@ -70,6 +77,24 @@ export default async function run({ page, fixtures, check }) {
     "the annotated page has no native objects at all",
     live.objects.length === 0,
     `${live.objects.length} object(s)`,
+  );
+
+  // Lazy backgrounds fill in from the source PDF on open: the active page
+  // renders immediately and the adjacent page follows through the active-page
+  // window, and both persist back to the notebook record.
+  await page.waitForFunction(
+    (id) => {
+      const n = window.__omni.getNotes().find((x) => x.id === id);
+      return Boolean(n && n.pages[0].backgroundAssetId && n.pages[1].backgroundAssetId);
+    },
+    noteId,
+    { timeout: 30000 },
+  );
+  summary = await noteSummary(page, noteId);
+  check(
+    "opening the notebook fills the deferred backgrounds from the source PDF",
+    Boolean(summary.backgroundAssetIds[0]) && Boolean(summary.backgroundAssetIds[1]),
+    JSON.stringify(summary.backgroundAssetIds),
   );
 
   /* --- the promotion control is offered, and says what it will do --------- */

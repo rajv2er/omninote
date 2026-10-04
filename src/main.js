@@ -31,6 +31,7 @@ import {
 import {
   decomposePdf,
   decomposeStoredPdfPage,
+  renderPdfPageThumbnails,
   IMPORT_SCHEMA_VERSION,
   IMPORTED_OBJECT_VERSION,
 } from "./pdf/decomposer.js";
@@ -53,6 +54,7 @@ import { icon } from "./ui/icons.js";
 import { escapeHtml } from "./ui/escapeHtml.js";
 import {
   showImportReport,
+  showImportPagePicker,
   summarizeImport,
   showStorageWarning,
   clearStorageWarning,
@@ -1067,11 +1069,17 @@ function pageManagerTilesHtml(note) {
 }
 
 function pageManagerOverlay(note) {
+  // How many pages could still be rebuilt as editable objects. The op only
+  // appears for a PDF notebook that has annotate-mode pages left.
+  const promotableCount = (note?.pages || []).filter((p) =>
+    isPromotablePage(p, note),
+  ).length;
   return renderPageManagerOverlay(
     note,
     pageManagerSelection,
     pageManagerThumbs,
     pageClipboard.length,
+    promotableCount,
   );
 }
 
@@ -1098,6 +1106,7 @@ function updatePageManagerSelectionUI() {
     "pm-copy",
     "pm-cut",
     "pm-tag",
+    "pm-make-editable",
   ].forEach((id) => {
     const b = document.querySelector("#" + id);
     if (b) b.disabled = !hasSel;
@@ -1268,6 +1277,9 @@ function bindPageManagerControls() {
   document.querySelector("#pm-cut")?.addEventListener("click", pmCut);
   document.querySelector("#pm-paste")?.addEventListener("click", pmPaste);
   document.querySelector("#pm-tag")?.addEventListener("click", pmTag);
+  document
+    .querySelector("#pm-make-editable")
+    ?.addEventListener("click", pmMakeEditable);
 }
 
 async function regeneratePageManagerThumbs() {
@@ -1533,6 +1545,70 @@ function refreshPageManagerGrid() {
   updatePageManagerSelectionUI();
 }
 
+/**
+ * Rebuilds the selected annotate-mode pages as editable objects, in place.
+ *
+ * The Page Manager stays open and the user keeps annotating; the current page
+ * is instantiated so the result is visible immediately, the rest are stored as
+ * handoffs that materialise when each page is opened. This is the in-editor
+ * counterpart to the import-time "Choose pages…" picker.
+ */
+async function pmMakeEditable() {
+  const note = getActiveNote();
+  if (!note || !pageManagerSelection.size) return;
+
+  // Persist any in-flight edits before records are rewritten.
+  saveActiveCanvasPage();
+
+  const indices = Array.from(pageManagerSelection).sort((a, b) => a - b);
+  const currentIndex = note.currentPageIndex || 0;
+
+  const btn = document.querySelector("#pm-make-editable");
+  if (btn) {
+    btn.disabled = true;
+    btn.querySelector("span").textContent = "Rebuilding…";
+  }
+
+  let rebuilt = 0;
+  let failed = 0;
+
+  for (const index of indices) {
+    const page = note.pages[index];
+    if (!isPromotablePage(page, note)) continue;
+
+    page.conversionState = "converting";
+    try {
+      const { status } = await rebuildPageAsEditable(note, page, {
+        instantiate: index === currentIndex,
+      });
+      if (status === "rebuilt") rebuilt++;
+      else failed++;
+    } catch (err) {
+      page.conversionState = "failed";
+      failed++;
+      console.error("Could not make a page editable:", err);
+    }
+  }
+
+  saveNotes();
+  await regeneratePageManagerThumbs();
+  // Full render so the toolbar's promotable count and button state update; the
+  // overlay stays open because `showPageManager` is module-level state.
+  zoomRestoreTarget = pageManagerPriorZoom;
+  render();
+  refreshPromoteControls(note);
+
+  showToast(
+    failed === 0
+      ? `${rebuilt} page${rebuilt === 1 ? "" : "s"} rebuilt`
+      : "Some pages could not be rebuilt",
+    failed === 0
+      ? "Each page's content is editable when you open it."
+      : `${rebuilt} rebuilt, ${failed} left as annotated PDF${failed === 1 ? "" : "s"}.`,
+    failed === 0 ? "ok" : "warn",
+  );
+}
+
 function pmCopy() {
   const note = getActiveNote();
   if (!pageManagerSelection.size) return;
@@ -1668,7 +1744,10 @@ function isBackgroundAssetShared(assetId, exceptPage) {
   if (!assetId) return false;
   for (const note of notes) {
     for (const page of note.pages || []) {
-      if (page !== exceptPage && page.backgroundAssetId === assetId) return true;
+      // A lazy page has not rendered its background yet; its null id is not a
+      // shareable reference and must not pin anything.
+      if (page === exceptPage) continue;
+      if (page.backgroundAssetId === assetId) return true;
     }
   }
   return false;
@@ -1959,6 +2038,19 @@ async function initEditor(note) {
       onZoomStart: (clientX, clientY) => beginZoomGesture(clientX, clientY),
       onZoomEnd: () => endZoomGesture(),
       onZoomRequest: (percent, preview) => setZoom(percent / 100, { preview }),
+      // A lazy-imported page renders its background from the source PDF on
+      // first open. Once it lands, persist the blob so the next open reads it
+      // from IndexedDB instead of re-rendering.
+      onBackgroundRaster: (blob) => {
+        if (page.backgroundAssetId || !blob) return;
+        const assetId = `bg-${crypto.randomUUID()}`;
+        putAsset(assetId, blob)
+          .then(() => {
+            page.backgroundAssetId = assetId;
+            saveNotes();
+          })
+          .catch(() => {});
+      },
     });
 
     engine.setColor(currentColor);
@@ -3145,125 +3237,243 @@ function bindLibraryEvents() {
       const file = e.target.files?.[0];
       if (!file) return;
 
-      isLoading = true;
-      loadingMessage = `Reading '${file.name}'...`;
-      renderLoading();
-
-      // Every asset this import creates, so a failure can clean up after
-      // itself without touching anything an existing notebook owns.
-      const createdAssetIds = [];
-
       // Read the mode once, before any await, so a change mid-import cannot
       // produce a notebook that is half one thing and half the other.
+      const modeValue = document.querySelector("#import-mode")?.value;
       const importMode =
-        document.querySelector("#import-mode")?.value === "annotations"
-          ? "annotations"
-          : "editable";
+        modeValue === "editable"
+          ? "editable"
+          : modeValue === "choose"
+            ? "choose"
+            : "annotations";
 
-      try {
-        const buffer = await file.arrayBuffer();
-
-        // Persist each page's binary assets as soon as it is decomposed instead
-        // of holding every page's background in memory until the document
-        // finishes.
-        const pages = await decomposePdf(
-          buffer,
-          PDF_IMPORT_SCALE,
-          async (page, index) => {
-            loadingMessage =
-              importMode === "annotations"
-                ? `Rendering page ${index + 1}...`
-                : `Recovering page ${index + 1}...`;
-            renderLoading();
-
-            return persistPageAssets(page, createdAssetIds);
-          },
-          { mode: importMode },
-        );
-
-        if (pages.length === 0) {
-          throw new Error("No pages found in this PDF.");
-        }
-
-        const baseName = file.name.replace(/\.pdf$/i, "");
-
-        // Keep the original file. The per-page snapshot taken at import is only
-        // ~1600px, which turns to mush once you zoom in; holding on to the
-        // source lets the visible page be re-rendered at the current zoom.
-        const pdfAssetId = `pdf-${crypto.randomUUID()}`;
-        await putAsset(pdfAssetId, file);
-        createdAssetIds.push(pdfAssetId);
-
-        const report = summarizeImport(pages);
-
-        // Built in memory first and committed only once every page succeeded.
-        const newNotebook = {
-          id: crypto.randomUUID(),
-          title: baseName,
-          createdAt: Date.now(),
-          isPdf: true,
-          pdfAssetId,
-          importSchemaVersion: IMPORT_SCHEMA_VERSION,
-          importReport: report,
-          defaultFont: pages.mostUsedFont || "DM Sans",
-          detectedFonts: pages.detectedFonts || [],
-          currentPageIndex: 0,
-          pages: pages.map((page, idx) => ({
-            id: crypto.randomUUID(),
-            pageNumber: idx + 1,
-            pdfPageIndex: idx,
-            width: page.width, // Exact native PDF page dimensions
-            height: page.height,
-            paperStyle: "plain",
-            pageSize: "custom",
-            thumbnail: null,
-            backgroundAssetId: page.backgroundAssetId || null,
-            thumbnailAssetId: page.thumbnailAssetId || null,
-            canvasJson: null,
-            importSchemaVersion: IMPORT_SCHEMA_VERSION,
-            importedObjectVersion: page.importedObjectVersion ?? IMPORTED_OBJECT_VERSION,
-            importReport: page.report || null,
-            fallbackVisible: page.fallbackVisible !== false,
-            // The fallback is the extracted backdrop, not a page render, so it
-            // must not be replaced by a full-page re-rasterization on zoom —
-            // that would reintroduce the very doubling it exists to avoid.
-            fallbackFromImage: page.fallbackFromImage === true,
-            // "Make editable" has already run for every page, so the notebook
-            // opens with native objects. The annotate path leaves each page as a
-            // locked raster the user promotes one at a time.
-            editMode: importMode === "annotations" ? "annotate" : "notes",
-            decomposedObjects: importMode !== "annotations",
-            conversionState: "idle",
-            // An annotate page carries no native objects, so there is nothing to
-            // hand off — the locked raster loads straight from its asset id.
-            pendingImportData:
-              importMode === "annotations"
-                ? null
-                : {
-                    objects: page.objects || [],
-                    report: page.report || null,
-                  },
-            tags: [],
-          })),
-        };
-
-        notes.unshift(newNotebook);
-        activeId = newNotebook.id;
-        saveNotes();
-
-        showImportReport(report);
-      } catch (err) {
-        // Nothing was committed, so delete only what this attempt created and
-        // leave every existing notebook exactly as it was.
-        await deleteAssets(createdAssetIds).catch(() => {});
-        alert("Could not import this PDF: " + err.message);
-        console.error(err);
-      } finally {
-        isLoading = false;
+      // "Choose pages…" first asks which pages to decompose, then imports as
+      // annotate-first and promotes only the chosen subset. Everything else
+      // imports straight away.
+      if (importMode === "choose") {
+        await importPdfChoosePages(file);
         e.target.value = "";
-        render();
+        return;
       }
+
+      await importPdfFile(file, importMode);
+      e.target.value = "";
     });
+}
+
+/**
+ * Imports a PDF as a notebook. Shared by the annotate and editable paths; the
+ * "choose pages" flow routes here with `promoteIndices` once the user has
+ * picked a subset.
+ *
+ * @param {File} file
+ * @param {"annotations"|"editable"} importMode
+ * @param {number[]|null} [promoteIndices]  Zero-based pages to decompose on
+ *   import; the rest stay annotate-mode and promote on demand.
+ */
+async function importPdfFile(file, importMode, promoteIndices = null) {
+  isLoading = true;
+  loadingMessage = `Reading '${file.name}'...`;
+  renderLoading();
+
+  // Every asset this import creates, so a failure can clean up after itself
+  // without touching anything an existing notebook owns.
+  const createdAssetIds = [];
+
+  try {
+    const buffer = await file.arrayBuffer();
+
+    // Persist each page's binary assets as soon as it is decomposed instead of
+    // holding every page's background in memory until the document finishes.
+    const pages = await decomposePdf(
+      buffer,
+      PDF_IMPORT_SCALE,
+      async (page, index) => {
+        loadingMessage =
+          importMode === "annotations"
+            ? `Rendering page ${index + 1}...`
+            : `Recovering page ${index + 1}...`;
+        renderLoading();
+
+        return persistPageAssets(page, createdAssetIds);
+      },
+      {
+        mode: importMode,
+        // Annotate-first import is the default, and the per-page snapshot is
+        // the expensive half of it. Page 1 keeps its snapshot so the notebook
+        // opens instantly; the rest are rendered from the source PDF by the
+        // canvas engine the first time each page is opened.
+        lazyBackgrounds: importMode === "annotations",
+      },
+    );
+
+    if (pages.length === 0) {
+      throw new Error("No pages found in this PDF.");
+    }
+
+    const baseName = file.name.replace(/\.pdf$/i, "");
+
+    // Keep the original file. The per-page snapshot taken at import is only
+    // ~1600px, which turns to mush once you zoom in; holding on to the source
+    // lets the visible page be re-rendered at the current zoom.
+    const pdfAssetId = `pdf-${crypto.randomUUID()}`;
+    await putAsset(pdfAssetId, file);
+    createdAssetIds.push(pdfAssetId);
+
+    const report = summarizeImport(pages);
+
+    // Built in memory first and committed only once every page succeeded.
+    const newNotebook = {
+      id: crypto.randomUUID(),
+      title: baseName,
+      createdAt: Date.now(),
+      isPdf: true,
+      pdfAssetId,
+      importSchemaVersion: IMPORT_SCHEMA_VERSION,
+      importReport: report,
+      defaultFont: pages.mostUsedFont || "DM Sans",
+      detectedFonts: pages.detectedFonts || [],
+      currentPageIndex: 0,
+      pages: pages.map((page, idx) => ({
+        id: crypto.randomUUID(),
+        pageNumber: idx + 1,
+        pdfPageIndex: idx,
+        width: page.width, // Exact native PDF page dimensions
+        height: page.height,
+        paperStyle: "plain",
+        pageSize: "custom",
+        thumbnail: null,
+        backgroundAssetId: page.backgroundAssetId || null,
+        thumbnailAssetId: page.thumbnailAssetId || null,
+        canvasJson: null,
+        importSchemaVersion: IMPORT_SCHEMA_VERSION,
+        importedObjectVersion: page.importedObjectVersion ?? IMPORTED_OBJECT_VERSION,
+        importReport: page.report || null,
+        fallbackVisible: page.fallbackVisible !== false,
+        // The fallback is the extracted backdrop, not a page render, so it must
+        // not be replaced by a full-page re-rasterization on zoom — that would
+        // reintroduce the very doubling it exists to avoid.
+        fallbackFromImage: page.fallbackFromImage === true,
+        // "Make editable" has already run for every page, so the notebook opens
+        // with native objects. The annotate path leaves each page as a locked
+        // raster the user promotes one at a time.
+        editMode: importMode === "annotations" ? "annotate" : "notes",
+        decomposedObjects: importMode !== "annotations",
+        conversionState: "idle",
+        // An annotate page carries no native objects, so there is nothing to
+        // hand off — the locked raster loads straight from its asset id.
+        pendingImportData:
+          importMode === "annotations"
+            ? null
+            : {
+                objects: page.objects || [],
+                report: page.report || null,
+              },
+        tags: [],
+      })),
+    };
+
+    notes.unshift(newNotebook);
+    activeId = newNotebook.id;
+    saveNotes();
+
+    // A subset import promotes only the pages the user chose; the rest stay
+    // annotate-mode and are rebuilt on demand.
+    if (Array.isArray(promoteIndices) && promoteIndices.length > 0) {
+      await promotePagesByIndex(newNotebook, promoteIndices);
+    }
+
+    showImportReport(report);
+  } catch (err) {
+    // Nothing was committed, so delete only what this attempt created and leave
+    // every existing notebook exactly as it was.
+    await deleteAssets(createdAssetIds).catch(() => {});
+    alert("Could not import this PDF: " + err.message);
+    console.error(err);
+  } finally {
+    isLoading = false;
+    render();
+  }
+}
+
+/**
+ * The "Choose pages…" flow: render thumbnails, ask which pages to decompose,
+ * then import annotate-first and promote only that subset.
+ */
+async function importPdfChoosePages(file) {
+  isLoading = true;
+  loadingMessage = `Preparing pages from '${file.name}'...`;
+  renderLoading();
+
+  let thumbnails = [];
+  try {
+    const buffer = await file.arrayBuffer();
+    thumbnails = await renderPdfPageThumbnails(buffer);
+  } catch (err) {
+    isLoading = false;
+    render();
+    alert("Could not read this PDF: " + err.message);
+    console.error(err);
+    return;
+  } finally {
+    isLoading = false;
+    render();
+  }
+
+  showImportPagePicker({
+    fileName: file.name,
+    thumbnails,
+    onDone: (indices) => {
+      for (const url of thumbnails) {
+        if (url) URL.revokeObjectURL(url);
+      }
+      // null = the user chose "Annotate only" (or closed the picker): import
+      // without promoting anything. An array promotes exactly those pages.
+      importPdfFile(file, "annotations", indices);
+    },
+  });
+}
+
+/**
+ * Decomposes a chosen subset of pages right after an annotate-first import.
+ * Reuses the same single-page extraction as "Make editable", but runs while the
+ * notebook is still closed, so the recovered objects are stored as a handoff
+ * and materialise when each page is first opened.
+ */
+async function promotePagesByIndex(note, indices) {
+  const targets = (note.pages || [])
+    .map((page, index) => ({ page, index }))
+    .filter(({ index }) => indices.includes(index))
+    .filter(({ page }) => isPromotablePage(page, note));
+
+  if (targets.length === 0) return;
+
+  let rebuilt = 0;
+  let failed = 0;
+
+  for (const { page } of targets) {
+    page.conversionState = "converting";
+    try {
+      const { status } = await rebuildPageAsEditable(note, page, {
+        instantiate: false,
+      });
+      if (status === "rebuilt") rebuilt++;
+      else failed++;
+    } catch (err) {
+      page.conversionState = "failed";
+      failed++;
+      console.error("Could not make a page editable:", err);
+    }
+  }
+
+  saveNotes();
+  if (failed > 0) {
+    showToast(
+      "Some pages could not be rebuilt",
+      `${rebuilt} rebuilt, ${failed} left as annotated PDF${failed === 1 ? "" : "s"}.`,
+      "warn",
+    );
+  }
 }
 
 /**

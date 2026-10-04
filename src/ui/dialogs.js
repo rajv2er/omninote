@@ -185,6 +185,133 @@ export function clearStorageWarning() {
 }
 
 /**
+ * Import-time page picker: a modal grid of page thumbnails the user checks to
+ * choose which pages are decomposed into editable objects on import.
+ *
+ * Pure view + DOM wiring; the caller supplies the thumbnails and receives the
+ * chosen zero-based page indices (or null when the user imports as annotate).
+ *
+ * @param {object} opts
+ * @param {string} opts.fileName
+ * @param {string[]} opts.thumbnails  Object URLs, one per page
+ * @param {(indices: number[] | null) => void} opts.onDone
+ * @returns {HTMLDivElement} the overlay element (already appended to body)
+ */
+export function showImportPagePicker({ fileName, thumbnails, onDone }) {
+  document.querySelector(".import-picker-overlay")?.remove();
+
+  const overlay = document.createElement("div");
+  overlay.className = "import-picker-overlay";
+  overlay.id = "import-picker-overlay";
+  overlay.setAttribute("role", "dialog");
+  overlay.setAttribute("aria-label", "Choose pages to make editable");
+
+  const selected = new Set();
+
+  const tiles = thumbnails
+    .map((url, i) => {
+      const img = url
+        ? `<img class="ip-thumb" src="${url}" alt="Page ${i + 1}" draggable="false" />`
+        : `<div class="ip-thumb ip-thumb-empty"></div>`;
+      return `
+        <button type="button" class="ip-tile" data-index="${i}" title="Page ${i + 1} — click to toggle">
+          <span class="ip-check">${iconCheck()}</span>
+          ${img}
+          <span class="ip-num">Page ${i + 1}</span>
+        </button>`;
+    })
+    .join("");
+
+  overlay.innerHTML = `
+    <div class="import-picker">
+      <header class="ip-header">
+        <div class="ip-title">
+          <strong>Choose pages to make editable</strong>
+          <span class="ip-sub">${escapeHtmlText(fileName)} · ${thumbnails.length} page${thumbnails.length !== 1 ? "s" : ""}</span>
+        </div>
+        <button type="button" class="icon-btn ip-close" title="Cancel">${iconClose()}</button>
+      </header>
+      <p class="ip-hint">Every page imports as an annotated PDF you can write on. Checked pages are also rebuilt as editable objects now — the rest can be rebuilt one at a time later.</p>
+      <div class="ip-actions-row">
+        <button type="button" class="ip-text-btn" id="ip-select-all">Select all</button>
+        <button type="button" class="ip-text-btn" id="ip-clear">Clear</button>
+        <span class="ip-count" id="ip-count">0 selected</span>
+      </div>
+      <div class="ip-grid" id="ip-grid">${tiles}</div>
+      <footer class="ip-footer">
+        <button type="button" class="ip-btn ip-btn-quiet" id="ip-annotate">Annotate only</button>
+        <button type="button" class="ip-btn ip-btn-primary" id="ip-import" disabled>Make 0 editable</button>
+      </footer>
+    </div>`;
+
+  const grid = overlay.querySelector("#ip-grid");
+  const countEl = overlay.querySelector("#ip-count");
+  const importBtn = overlay.querySelector("#ip-import");
+
+  const sync = () => {
+    const n = selected.size;
+    countEl.textContent = `${n} selected`;
+    importBtn.disabled = n === 0;
+    importBtn.textContent = `Make ${n} editable`;
+  };
+
+  const finish = (indices) => {
+    overlay.remove();
+    onDone(indices);
+  };
+
+  grid.addEventListener("click", (e) => {
+    const tile = e.target.closest(".ip-tile");
+    if (!tile) return;
+    const i = Number(tile.dataset.index);
+    if (selected.has(i)) selected.delete(i);
+    else selected.add(i);
+    tile.classList.toggle("selected", selected.has(i));
+    sync();
+  });
+
+  overlay.querySelector("#ip-select-all").addEventListener("click", () => {
+    thumbnails.forEach((_, i) => selected.add(i));
+    grid.querySelectorAll(".ip-tile").forEach((t) => t.classList.add("selected"));
+    sync();
+  });
+  overlay.querySelector("#ip-clear").addEventListener("click", () => {
+    selected.clear();
+    grid.querySelectorAll(".ip-tile").forEach((t) => t.classList.remove("selected"));
+    sync();
+  });
+
+  overlay.querySelector("#ip-annotate").addEventListener("click", () => finish(null));
+  importBtn.addEventListener("click", () => {
+    if (selected.size === 0) return;
+    finish([...selected].sort((a, b) => a - b));
+  });
+  overlay.querySelector(".ip-close").addEventListener("click", () => finish(null));
+  overlay.addEventListener("click", (e) => {
+    if (e.target === overlay) finish(null);
+  });
+
+  document.body.appendChild(overlay);
+  sync();
+  return overlay;
+}
+
+/* Local icon helpers so the picker does not depend on the toolbar icon set. */
+function iconCheck() {
+  return `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>`;
+}
+function iconClose() {
+  return `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>`;
+}
+function escapeHtmlText(s) {
+  return String(s)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+/**
  * Small non-blocking corner toast for an action that reports its own outcome.
  *
  * Deliberately its own class rather than reusing `.import-report`: that toast is

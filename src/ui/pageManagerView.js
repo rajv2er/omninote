@@ -31,10 +31,18 @@ export function pageManagerTilesHtml(note, selection, thumbs) {
 
 /**
  * Renders the Page Manager modal overlay structure.
+ *
+ * `promotableCount` is how many selected pages are still annotate-mode and can
+ * be rebuilt as editable objects; the "Make editable" op only appears for a
+ * PDF notebook that still has such pages.
  */
-export function pageManagerOverlay(note, selection, thumbs, clipboardLength = 0) {
+export function pageManagerOverlay(note, selection, thumbs, clipboardLength = 0, promotableCount = 0) {
   const total = note.pages.length;
   const sel = selection.size;
+  const promoteBtn =
+    promotableCount > 0
+      ? `<button class="pm-op" id="pm-make-editable" ${sel ? "" : "disabled"} title="Rebuild selected pages as editable objects">${icon("sparkle", 16)}<span>Make editable</span></button>`
+      : "";
   return `
     <div class="page-manager-overlay" id="page-manager-overlay" role="dialog" aria-label="Page Manager">
       <header class="pm-header">
@@ -58,6 +66,7 @@ export function pageManagerOverlay(note, selection, thumbs, clipboardLength = 0)
         <button class="pm-op" id="pm-paste" ${clipboardLength ? "" : "disabled"} title="Paste copied/cut pages">${icon("paste", 16)}<span>Paste</span></button>
         <button class="pm-op" id="pm-tag" ${sel ? "" : "disabled"} title="Tag selected pages">${icon("tag", 16)}<span>Tag</span></button>
         <span class="pm-sep"></span>
+        ${promoteBtn}
         <button class="pm-op pm-danger" id="pm-delete" ${sel ? "" : "disabled"} title="Delete selected pages">${icon("trash", 16)}<span>Delete</span></button>
         <span class="pm-spacer"></span>
         <button class="pm-op" id="pm-extract" ${sel ? "" : "disabled"} title="New notebook from selected pages">${icon("folder", 16)}<span>Extract</span></button>
