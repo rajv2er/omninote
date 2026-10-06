@@ -349,3 +349,66 @@
   cursor: not-allowed;
 }
 
+/* ==========================================================================
+   CONFIRM / PROMPT DIALOG (in-app replacement for alert/confirm/prompt)
+   ========================================================================== */
+.omni-confirm-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(9, 10, 13, 0.72);
+  backdrop-filter: blur(6px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1400;
+  animation: import-report-in 160ms ease-out;
+}
+
+.omni-confirm {
+  width: min(420px, calc(100vw - 48px));
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  padding: 24px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border-subtle);
+  border-radius: 14px;
+  box-shadow: 0 24px 64px rgba(0, 0, 0, 0.5);
+}
+
+.omni-confirm-msg {
+  margin: 0;
+  font-size: 14px;
+  line-height: 1.5;
+  color: var(--text-primary, #f1f5f9);
+}
+
+.omni-confirm-label {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  font-size: 14px;
+  color: var(--text-primary, #f1f5f9);
+}
+
+.omni-confirm-input {
+  padding: 10px 12px;
+  border-radius: 8px;
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-workspace);
+  color: var(--text-primary, #f1f5f9);
+  font-size: 14px;
+  outline: none;
+  transition: border-color 120ms;
+}
+
+.omni-confirm-input:focus {
+  border-color: var(--accent-primary);
+}
+
+.omni-confirm-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+}
+

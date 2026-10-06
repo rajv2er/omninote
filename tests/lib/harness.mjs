@@ -175,11 +175,11 @@ export async function importPdf(page, file, { timeout = 180000, mode = null } = 
  * `inspectPage` returns null in that window — inspecting too early reads as
  * "the page is empty" and silently passes every emptiness assertion.
  */
-export async function waitForEngine(page, index = 0) {
+export async function waitForEngine(page, index = 0, { timeout = 30000 } = {}) {
   await page.waitForFunction(
     (i) => Boolean(window.__omni.inspectPage(i)),
     index,
-    { timeout: 30000 },
+    { timeout },
   );
 }
 
@@ -192,22 +192,25 @@ export async function openNote(page, noteId) {
 }
 
 /**
- * Waits until every one of `count` pages has a live engine.
+ * Waits until pages `0..count-1` all have a live engine *at the same time*.
  *
- * `initEditor` builds engines one page at a time, so waiting on page 0 alone
- * means a later `objectCensus` can silently stop at the first missing engine and
- * under-report.
+ * With a window radius of one, `count` pages can only be live together while
+ * the middle one is current, so the view is parked there at the end. Each page
+ * is scrolled to first, which proves it mounts on demand.
  */
 export async function waitForEngines(page, count) {
+  for (let i = 0; i < count; i++) {
+    await focusPage(page, i);
+  }
+  await focusPage(page, Math.floor((count - 1) / 2));
   await page.waitForFunction(
     (n) => {
-      for (let i = 0; i < n; i++) {
-        if (!window.__omni.inspectPage(i)) return false;
-      }
+      const engines = window.__omni.getEngines();
+      for (let i = 0; i < n; i++) if (!engines[i]) return false;
       return true;
     },
     count,
-    { timeout: 30000 },
+    { timeout: 15000 },
   );
 }
 
@@ -237,23 +240,88 @@ export const noteSummary = (page, noteId) =>
 export const inspectPage = (page, index) =>
   page.evaluate((i) => window.__omni.inspectPage(i), index);
 
-/** Counts live objects by `omniType` across the currently open notebook. */
-export const objectCensus = (page) =>
-  page.evaluate(() => {
-    const counts = {};
-    for (let i = 0; i < 64; i++) {
-      const info = window.__omni.inspectPage(i);
-      if (!info) break;
-      for (const o of info.objects) {
-        const k = o.omniType || o.type;
-        counts[k] = (counts[k] || 0) + 1;
-      }
+/**
+ * Scrolls a page to the top of the viewport and waits for its engine to mount.
+ *
+ * The scroll is written directly rather than through `scrollIntoView`, which
+ * inherits `scroll-behavior: smooth` from the workspace. A smooth scroll is an
+ * animation, so the sliding window observes a stream of intermediate positions
+ * and can settle on a neighbouring page — the requested engine then never
+ * mounts and the wait times out.
+ */
+export async function focusPage(page, index = 0) {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    await page.evaluate((i) => {
+      const container = document.querySelector("#canvas-scroll-container");
+      const el = document.querySelector(`#page-wrapper-${i}`);
+      if (!container || !el) return;
+      const prev = container.style.scrollBehavior;
+      container.style.scrollBehavior = "auto";
+      container.scrollTop = el.offsetTop - 40;
+      container.style.scrollBehavior = prev;
+    }, index);
+    try {
+      await page.waitForFunction(
+        (i) => {
+          const note = window.__omni.getNotes().find(
+            (n) => n.id === window.__omni.getActiveId(),
+          );
+          return note?.currentPageIndex === i && Boolean(window.__omni.inspectPage(i));
+        },
+        index,
+        { timeout: 8000 },
+      );
+      return;
+    } catch {
+      // A stale layout can make the observer pick a neighbour; nudge it again.
     }
-    return counts;
-  });
+  }
+  throw new Error(`page ${index} engine never mounted`);
+}
+
+/**
+ * Counts live objects by `omniType` across the whole open notebook.
+ *
+ * With the sliding window only `current ± 1` pages have a live engine, so a
+ * single DOM pass would count just the pages near the viewport. Each page is
+ * mounted and counted in turn, and the reader's position is restored at the
+ * end so counting never moves the view under a later assertion.
+ */
+export async function objectCensus(page) {
+  const { total, scrollTop } = await page.evaluate(() => ({
+    total: document.querySelectorAll(".page-container").length,
+    scrollTop: document.querySelector("#canvas-scroll-container")?.scrollTop ?? 0,
+  }));
+
+  const counts = {};
+  for (let i = 0; i < total; i++) {
+    await focusPage(page, i);
+    const info = await inspectPage(page, i);
+    if (!info) continue;
+    for (const o of info.objects) {
+      const k = o.omniType || o.type;
+      counts[k] = (counts[k] || 0) + 1;
+    }
+  }
+
+  await page.evaluate((top) => {
+    const container = document.querySelector("#canvas-scroll-container");
+    if (!container) return;
+    const prev = container.style.scrollBehavior;
+    container.style.scrollBehavior = "auto";
+    container.scrollTop = top;
+    container.style.scrollBehavior = prev;
+  }, scrollTop);
+  await page.waitForTimeout(300);
+
+  return counts;
+}
 
 /** Draws a stroke on page `index` with the pen tool. */
 export async function drawStroke(page, index = 0, { dx = 14, steps = 12 } = {}) {
+  // The page has to be the mounted, on-screen one or the pointer events land
+  // on a placeholder instead of a canvas.
+  await focusPage(page, index);
   await page.click('[data-tool="pen"]');
   const box = await page.locator(`#omni-canvas-${index}`).boundingBox();
   const x0 = box.x + 120;
@@ -276,6 +344,7 @@ export async function deleteForever(page, noteId) {
   await page.click('.side[data-folder="trashed"]');
   await page.waitForSelector(`[data-delete-note="${noteId}"]`);
   await page.click(`[data-delete-note="${noteId}"]`);
+  await confirmDialog(page); // "Delete forever" confirm
   await page.waitForTimeout(2200);
 }
 
@@ -312,6 +381,25 @@ export async function makeEditableCurrentPage(page, noteId, opts = {}) {
 export async function makeAllEditable(page, noteId, opts = {}) {
   await page.click("#make-all-editable-btn");
   await waitForPromotion(page, noteId, opts);
+}
+
+/**
+ * Clicks the confirm button in the in-app confirm dialog (replaces native confirm()).
+ * The dialog has class .omni-confirm-overlay with a primary button.
+ */
+export async function confirmDialog(page) {
+  await page.waitForSelector(".omni-confirm-overlay", { state: "visible" });
+  await page.click(".omni-confirm .ip-btn-primary");
+  await page.waitForSelector(".omni-confirm-overlay", { state: "hidden" });
+}
+
+/**
+ * Clicks the cancel button in the in-app confirm dialog.
+ */
+export async function cancelDialog(page) {
+  await page.waitForSelector(".omni-confirm-overlay", { state: "visible" });
+  await page.click(".omni-confirm .ip-btn-quiet");
+  await page.waitForSelector(".omni-confirm-overlay", { state: "hidden" });
 }
 
 /** Collects page errors and console errors for the "nothing threw" assertion. */

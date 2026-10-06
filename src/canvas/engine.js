@@ -138,6 +138,13 @@ export class OmniCanvas {
     // Every page gets an engine, so only the visible one is worth re-rendering.
     this.isActivePage = true;
 
+    // The notebook page record this engine is showing. Saving must go through
+    // this reference, never through the engine's position in `canvasEngines`:
+    // inserting, deleting or reordering pages shifts every index after the
+    // change, and an index-keyed save then writes one page's content onto
+    // another.
+    this.page = null;
+
     // Undo / Redo history tracking
     this.history = [];
     this.historyIndex = -1;
@@ -400,6 +407,28 @@ export class OmniCanvas {
       canUndo: this.canUndo(),
       canRedo: this.canRedo(),
     });
+  }
+
+  /** Snapshot of the undo/redo stack for engine persistence across the window. */
+  getHistoryState() {
+    return {
+      history: this.history.slice(),
+      historyIndex: this.historyIndex,
+    };
+  }
+
+  /**
+   * Restores a previously saved undo/redo stack.
+   *
+   * Used when the sliding window remounts an engine for a page that had one
+   * before. The canvas JSON itself is loaded normally; this just brings back
+   * the user's edit history so undo/redo keep working after scrolling away.
+   */
+  setHistoryState({ history, historyIndex }) {
+    if (!Array.isArray(history) || !Number.isInteger(historyIndex)) return;
+    this.history = history.slice();
+    this.historyIndex = Math.max(0, Math.min(historyIndex, history.length - 1));
+    this.notifyHistory();
   }
 
   canUndo() {
@@ -792,6 +821,7 @@ export class OmniCanvas {
    * Automatically adapts canvas width & height to the page's exact dimensions.
    */
   async loadPage(page) {
+    this.page = page || null;
     this.isHistoryProcessing = true;
     this.canvas.clear();
 

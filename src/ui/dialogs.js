@@ -350,3 +350,132 @@ export function showToast(title, detail = "", tone = "ok") {
   document.body.appendChild(card);
   setTimeout(() => card.remove(), 6000);
 }
+
+/**
+ * Blocking confirmation dialog — the in-app replacement for `confirm()`.
+ *
+ * Returns a promise that resolves to true when the user confirms, false when
+ * they cancel. The overlay is removed either way.
+ *
+ * @param {string} message  The question to ask
+ * @param {string} [confirmLabel]  Label for the confirm button (default: "Delete")
+ * @param {string} [cancelLabel]  Label for the cancel button (default: "Cancel")
+ * @returns {Promise<boolean>}
+ */
+export function showConfirm(message, confirmLabel = "Delete", cancelLabel = "Cancel") {
+  document.querySelector(".omni-confirm-overlay")?.remove();
+
+  const overlay = document.createElement("div");
+  overlay.className = "omni-confirm-overlay";
+  overlay.setAttribute("role", "alertdialog");
+  overlay.setAttribute("aria-label", "Confirmation");
+
+  const box = document.createElement("div");
+  box.className = "omni-confirm";
+
+  const msg = document.createElement("p");
+  msg.className = "omni-confirm-msg";
+  msg.textContent = message;
+  box.appendChild(msg);
+
+  const actions = document.createElement("div");
+  actions.className = "omni-confirm-actions";
+
+  const cancelBtn = document.createElement("button");
+  cancelBtn.type = "button";
+  cancelBtn.className = "ip-btn ip-btn-quiet";
+  cancelBtn.textContent = cancelLabel;
+
+  const confirmBtn = document.createElement("button");
+  confirmBtn.type = "button";
+  confirmBtn.className = "ip-btn ip-btn-primary";
+  confirmBtn.textContent = confirmLabel;
+
+  actions.appendChild(cancelBtn);
+  actions.appendChild(confirmBtn);
+  box.appendChild(actions);
+  overlay.appendChild(box);
+
+  return new Promise((resolve) => {
+    const done = (val) => {
+      overlay.remove();
+      resolve(val);
+    };
+    cancelBtn.addEventListener("click", () => done(false));
+    confirmBtn.addEventListener("click", () => done(true));
+    overlay.addEventListener("click", (e) => {
+      if (e.target === overlay) done(false);
+    });
+    document.body.appendChild(overlay);
+  });
+}
+
+/**
+ * Blocking text-input dialog — the in-app replacement for `prompt()`.
+ *
+ * Returns a promise that resolves to the entered string (trimmed), or null
+ * when the user cancels. The overlay is removed either way.
+ *
+ * @param {string} message  The prompt label
+ * @param {string} [defaultValue]  Pre-filled value (default: "")
+ * @returns {Promise<string|null>}
+ */
+export function showPrompt(message, defaultValue = "") {
+  document.querySelector(".omni-confirm-overlay")?.remove();
+
+  const overlay = document.createElement("div");
+  overlay.className = "omni-confirm-overlay";
+  overlay.setAttribute("role", "dialog");
+  overlay.setAttribute("aria-label", message);
+
+  const box = document.createElement("div");
+  box.className = "omni-confirm";
+
+  const label = document.createElement("label");
+  label.className = "omni-confirm-label";
+  label.textContent = message;
+
+  const input = document.createElement("input");
+  input.type = "text";
+  input.className = "omni-confirm-input";
+  input.value = defaultValue;
+
+  const actions = document.createElement("div");
+  actions.className = "omni-confirm-actions";
+
+  const cancelBtn = document.createElement("button");
+  cancelBtn.type = "button";
+  cancelBtn.className = "ip-btn ip-btn-quiet";
+  cancelBtn.textContent = "Cancel";
+
+  const confirmBtn = document.createElement("button");
+  confirmBtn.type = "button";
+  confirmBtn.className = "ip-btn ip-btn-primary";
+  confirmBtn.textContent = "OK";
+
+  label.appendChild(input);
+  box.appendChild(label);
+  box.appendChild(actions);
+  actions.appendChild(cancelBtn);
+  actions.appendChild(confirmBtn);
+  overlay.appendChild(box);
+
+  return new Promise((resolve) => {
+    const done = (val) => {
+      overlay.remove();
+      resolve(val);
+    };
+    cancelBtn.addEventListener("click", () => done(null));
+    confirmBtn.addEventListener("click", () => done(input.value.trim()));
+    input.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") done(input.value.trim());
+      else if (e.key === "Escape") done(null);
+    });
+    overlay.addEventListener("click", (e) => {
+      if (e.target === overlay) done(null);
+    });
+    document.body.appendChild(overlay);
+    input.focus();
+    input.select();
+  });
+}

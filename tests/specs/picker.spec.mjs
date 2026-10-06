@@ -14,6 +14,8 @@ import {
   noteSummary,
   objectCensus,
   openNote,
+  focusPage,
+  waitForEngine,
   waitForEngines,
 } from "../lib/harness.mjs";
 
@@ -89,6 +91,7 @@ export default async function run({ page, fixtures, check }) {
 
   /* --- the chosen page's objects are real after a reopen ------------------ */
   await openNote(page, noteId);
+  // Scroll through all pages so each engine mounts for inspection.
   await waitForEngines(page, 3);
 
   const page1 = await inspectPage(page, 1);
@@ -103,7 +106,6 @@ export default async function run({ page, fixtures, check }) {
   );
 
   await openNote(page, noteId);
-  await waitForEngines(page, 3);
   summary = await noteSummary(page, noteId);
   check(
     "the chosen page stays editable across a reopen",

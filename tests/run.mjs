@@ -34,6 +34,7 @@ const ALL_SPECS = [
   "annotate.spec.mjs",
   "picker.spec.mjs",
   "editorSelect.spec.mjs",
+  "slidingWindow.spec.mjs",
 ];
 
 const filter = process.argv[2];
