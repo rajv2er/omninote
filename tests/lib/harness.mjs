@@ -344,6 +344,7 @@ export async function deleteForever(page, noteId) {
   await page.click('.side[data-folder="trashed"]');
   await page.waitForSelector(`[data-delete-note="${noteId}"]`);
   await page.click(`[data-delete-note="${noteId}"]`);
+  await confirmDialog(page); // "Delete forever" confirm
   await page.waitForTimeout(2200);
 }
 
@@ -380,6 +381,25 @@ export async function makeEditableCurrentPage(page, noteId, opts = {}) {
 export async function makeAllEditable(page, noteId, opts = {}) {
   await page.click("#make-all-editable-btn");
   await waitForPromotion(page, noteId, opts);
+}
+
+/**
+ * Clicks the confirm button in the in-app confirm dialog (replaces native confirm()).
+ * The dialog has class .omni-confirm-overlay with a primary button.
+ */
+export async function confirmDialog(page) {
+  await page.waitForSelector(".omni-confirm-overlay", { state: "visible" });
+  await page.click(".omni-confirm .ip-btn-primary");
+  await page.waitForSelector(".omni-confirm-overlay", { state: "hidden" });
+}
+
+/**
+ * Clicks the cancel button in the in-app confirm dialog.
+ */
+export async function cancelDialog(page) {
+  await page.waitForSelector(".omni-confirm-overlay", { state: "visible" });
+  await page.click(".omni-confirm .ip-btn-quiet");
+  await page.waitForSelector(".omni-confirm-overlay", { state: "hidden" });
 }
 
 /** Collects page errors and console errors for the "nothing threw" assertion. */

@@ -19,6 +19,7 @@ import {
   openNote,
   drawStroke,
   waitForEngines,
+  confirmDialog,
 } from "../lib/harness.mjs";
 
 export const name = "Sliding window";
@@ -266,6 +267,7 @@ export default async function run({ page, fixtures, check }) {
   await section("delete a page", async () => {
     await settle(page, 2, 4);
     await page.click("#delete-page-btn");
+    await confirmDialog(page);
     await page.waitForFunction(
       () => document.querySelectorAll(".page-container").length === 3,
     );

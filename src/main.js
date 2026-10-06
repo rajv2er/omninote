@@ -60,6 +60,8 @@ import {
   showStorageWarning,
   clearStorageWarning,
   showToast,
+  showConfirm,
+  showPrompt,
 } from "./ui/dialogs.js";
 import {
   libraryView as renderLibraryHtml,
@@ -1556,9 +1558,11 @@ async function pmDelete() {
   const note = getActiveNote();
   if (note.pages.length <= 1) return;
   if (
-    !confirm(
+    !(await showConfirm(
       `Delete ${pageManagerSelection.size} selected page(s)? This cannot be undone.`,
-    )
+      "Delete",
+      "Cancel",
+    ))
   )
     return;
   const indices = Array.from(pageManagerSelection).sort((a, b) => b - a);
@@ -1701,7 +1705,7 @@ async function pmShare() {
       indices,
     );
   } catch (err) {
-    alert("Export failed: " + err.message);
+    showToast("Export failed", String(err?.message || err), "error");
     console.error(err);
   } finally {
     isLoading = false;
@@ -1853,10 +1857,10 @@ async function pmPaste() {
   render();
 }
 
-function pmTag() {
+async function pmTag() {
   const note = getActiveNote();
   if (!pageManagerSelection.size) return;
-  const tag = (prompt("Tag the selected pages (single tag):") || "").trim();
+  const tag = (await showPrompt("Tag the selected pages (single tag):", ""))?.trim();
   if (!tag) return;
   for (const i of pageManagerSelection) {
     const p = note.pages[i];
@@ -2800,7 +2804,7 @@ function bindEditorEvents(note) {
     .querySelector("#delete-page-btn")
     ?.addEventListener("click", async () => {
       if (note.pages.length <= 1) return;
-      if (confirm(`Delete Page ${note.currentPageIndex + 1}?`)) {
+      if (await showConfirm(`Delete Page ${note.currentPageIndex + 1}?`, "Delete", "Cancel")) {
         // Flush first: the page's asset ids are collected from its record right
         // after the splice, and unsaved edits would leave their assets behind.
         saveActiveCanvasPage();
@@ -2984,7 +2988,7 @@ function bindEditorEvents(note) {
           },
         );
       } catch (err) {
-        alert("Error exporting PDF: " + err.message);
+        showToast("Error exporting PDF", String(err?.message || err), "error");
         console.error(err);
       } finally {
         isLoading = false;
@@ -3085,8 +3089,8 @@ function bindEditorEvents(note) {
   };
   document.addEventListener("click", outsideClickHandler);
 
-  document.querySelector("#rename-btn")?.addEventListener("click", () => {
-    const newTitle = window.prompt("Notebook title:", note.title);
+  document.querySelector("#rename-btn")?.addEventListener("click", async () => {
+    const newTitle = await showPrompt("Notebook title:", note.title);
     if (newTitle && newTitle.trim()) {
       note.title = newTitle.trim();
       saveNotes();
@@ -3097,8 +3101,8 @@ function bindEditorEvents(note) {
 
   document
     .querySelector("#delete-notebook-btn")
-    ?.addEventListener("click", () => {
-      if (confirm(`Are you sure you want to delete "${note.title}"?`)) {
+    ?.addEventListener("click", async () => {
+      if (await showConfirm(`Are you sure you want to delete "${note.title}"?`, "Delete", "Cancel")) {
         notes = notes.filter((n) => n.id !== note.id);
         activeId = null;
         saveNotes();
@@ -3503,8 +3507,8 @@ function bindLibraryEvents() {
   });
 
   // "+ New folder" button — prompts for a name and creates the folder.
-  document.querySelector("#new-folder-btn")?.addEventListener("click", () => {
-    const name = (window.prompt("Folder name:") || "").trim();
+  document.querySelector("#new-folder-btn")?.addEventListener("click", async () => {
+    const name = (await showPrompt("Folder name:", ""))?.trim();
     if (!name) return;
     const folder = { id: crypto.randomUUID(), name, createdAt: Date.now() };
     folders = [...folders, folder];
@@ -3515,12 +3519,12 @@ function bindLibraryEvents() {
 
   // Per-folder × to remove (notes inside the folder become Unfiled).
   document.querySelectorAll("[data-remove-folder]").forEach((btn) => {
-    btn.addEventListener("click", (e) => {
+    btn.addEventListener("click", async (e) => {
       e.stopPropagation();
       const id = btn.dataset.removeFolder;
       const folder = folderById(id);
       if (!folder) return;
-      if (!confirm(`Delete folder "${folder.name}"? Notes inside will move to Unfiled.`)) return;
+      if (!(await showConfirm(`Delete folder "${folder.name}"? Notes inside will move to Unfiled.`, "Delete", "Cancel"))) return;
       const moved = notes.filter((n) => n.folderId === id).length;
       for (const n of notes) if (n.folderId === id) n.folderId = null;
       folders = folders.filter((f) => f.id !== id);
@@ -3582,7 +3586,7 @@ function bindLibraryEvents() {
       const targetNote = notes.find((n) => n.id === noteId);
       if (!targetNote) return;
       if (activeFolder === "trashed") {
-        if (!confirm(`Delete "${targetNote.title}" forever? This cannot be undone.`)) return;
+        if (!(await showConfirm(`Delete "${targetNote.title}" forever? This cannot be undone.`, "Delete forever", "Cancel"))) return;
         // A duplicated page or a shared source PDF can still be referenced by
         // another notebook, so only the ids nothing else points at are removed.
         const stillUsed = new Set();
@@ -3816,7 +3820,7 @@ async function importPdfFile(file, importMode, promoteIndices = null) {
     // Nothing was committed, so delete only what this attempt created and leave
     // every existing notebook exactly as it was.
     await deleteAssets(createdAssetIds).catch(() => {});
-    alert("Could not import this PDF: " + err.message);
+    showToast("Could not import this PDF", String(err?.message || err), "error");
     console.error(err);
   } finally {
     isLoading = false;
@@ -3840,7 +3844,7 @@ async function importPdfChoosePages(file) {
   } catch (err) {
     isLoading = false;
     render();
-    alert("Could not read this PDF: " + err.message);
+    showToast("Could not read this PDF", String(err?.message || err), "error");
     console.error(err);
     return;
   } finally {
