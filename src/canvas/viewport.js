@@ -14,6 +14,7 @@ let zoomGestureAnchor = null;
 let _getCanvasEngines = () => [];
 let _getActiveNote = () => null;
 let _getActiveCanvasEngine = () => null;
+let _onZoomApplied = () => {};
 
 /**
  * Connects the viewport controller to the application's active state.
@@ -22,10 +23,26 @@ export function configureViewport({
   getCanvasEngines,
   getActiveNote,
   getActiveCanvasEngine,
+  onZoomApplied,
 }) {
   if (getCanvasEngines) _getCanvasEngines = getCanvasEngines;
   if (getActiveNote) _getActiveNote = getActiveNote;
   if (getActiveCanvasEngine) _getActiveCanvasEngine = getActiveCanvasEngine;
+  if (onZoomApplied) _onZoomApplied = onZoomApplied;
+}
+
+/**
+ * Only the engines that are actually mounted.
+ *
+ * The app keeps engines in a page-indexed array so a page's engine can be
+ * looked up by index. With the sliding window that array is *sparse*: pages
+ * outside `current ± 1` are `null` or missing entirely. Iterating it directly
+ * (`for (const engine of engines)`) therefore hands out `null`, and every
+ * `engine.setZoom(...)` after the first gap throws. Everything that walks all
+ * engines must go through here instead.
+ */
+function liveEngines() {
+  return _getCanvasEngines().filter(Boolean);
 }
 
 export function getCurrentZoom() {
@@ -172,8 +189,7 @@ export function endZoomGesture() {
   // The gesture was tracked by scaling the existing bitmap so it could keep up
   // with the fingers; now that it has settled, re-render every page at the
   // final resolution so ink and text are crisp again.
-  const engines = _getCanvasEngines();
-  for (const engine of engines) engine.commitZoomPreview();
+  for (const engine of liveEngines()) engine.commitZoomPreview();
 }
 
 /**
@@ -248,18 +264,19 @@ export function setZoom(
   // fresh each time, which is stable because the anchor is zoom-invariant.
   const anchor = zoomGestureAnchor || captureZoomAnchor();
   updateZoomUI(next);
-  const engines = _getCanvasEngines();
-  for (const engine of engines) {
+  for (const engine of liveEngines()) {
     engine.setZoom(next, { resetPan, force, preview });
   }
   restoreZoomAnchor(anchor);
+  // Static previews for off-window pages are laid out at the page's display
+  // size, so they have to follow the zoom too.
+  _onZoomApplied(next);
 }
 
 /** Toggles the zoom freeze and pushes the state down to every engine. */
 export function toggleZoomLock() {
   zoomLocked = !zoomLocked;
-  const engines = _getCanvasEngines();
-  for (const engine of engines) engine.zoomLocked = zoomLocked;
+  for (const engine of liveEngines()) engine.zoomLocked = zoomLocked;
   const btn = document.querySelector("#zoom-lock-btn");
   if (btn) {
     btn.innerHTML = icon(zoomLocked ? "lockClosed" : "lockOpen", 14);

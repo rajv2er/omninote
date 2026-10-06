@@ -14,10 +14,32 @@ import {
   inspectPage,
   noteSummary,
   openNote,
+  focusPage,
+  waitForEngine,
   waitForEngines,
 } from "../lib/harness.mjs";
 
 export const name = "In-editor page selection (Page Manager)";
+
+/** A PDF preview must contain more than the all-white paper fallback. */
+async function previewsContainPageContent(page) {
+  return page.locator(".pm-thumb").evaluateAll((images) =>
+    images.every((image) => {
+      if (!(image instanceof HTMLImageElement) || !image.naturalWidth) return false;
+      const canvas = document.createElement("canvas");
+      canvas.width = image.naturalWidth;
+      canvas.height = image.naturalHeight;
+      const context = canvas.getContext("2d");
+      context.drawImage(image, 0, 0);
+      const pixels = context.getImageData(0, 0, canvas.width, canvas.height).data;
+      let nonWhite = 0;
+      for (let i = 0; i < pixels.length; i += 16) {
+        if (pixels[i] < 235 || pixels[i + 1] < 235 || pixels[i + 2] < 235) nonWhite++;
+      }
+      return nonWhite > 20;
+    }),
+  );
+}
 
 export default async function run({ page, fixtures, check }) {
   // Import as annotate-first: every page starts as a locked raster.
@@ -33,11 +55,17 @@ export default async function run({ page, fixtures, check }) {
   );
 
   await openNote(page, noteId);
-  await waitForEngines(page, 3);
+  // The window mounts only the current page and its neighbours on demand.
+  await waitForEngine(page, 0);
 
   /* --- open the Page Manager and select a subset --------------------------- */
   await page.click("#page-manager-btn");
   await page.waitForSelector("#page-manager-overlay", { timeout: 15000 });
+
+  check(
+    "lazy PDF pages have visible Page Manager previews before conversion",
+    await previewsContainPageContent(page),
+  );
 
   check(
     "the Page Manager offers 'Make editable' for an annotate notebook",
@@ -99,6 +127,7 @@ export default async function run({ page, fixtures, check }) {
   );
 
   await openNote(page, noteId);
+  // Mount each page by scrolling so all three can be inspected.
   await waitForEngines(page, 3);
 
   const p0 = await inspectPage(page, 0);

@@ -35,7 +35,8 @@ import {
   IMPORT_SCHEMA_VERSION,
   IMPORTED_OBJECT_VERSION,
 } from "./pdf/decomposer.js";
-import { invalidatePdfDoc } from "./pdf/raster.js";
+import { invalidatePdfDoc, renderPdfPageBlob } from "./pdf/raster.js";
+import { canvasToBlob } from "./pdf/canvasBlob.js";
 import { exportNotebookToPdf, renderPageThumbnail } from "./pdf/exporter.js";
 import {
   putAsset,
@@ -128,6 +129,18 @@ const sampleNote = {
 let notes = loadNotes();
 let activeId = notes[0]?.id || null;
 let canvasEngines = [];
+const pageHistoryCache = new Map(); // pageId -> { history, historyIndex }
+// Off-window pages render as a static preview. Re-rasterizing one on every
+// window change would make scrolling through a long notebook far more
+// expensive than the engines the window exists to avoid, so the preview is
+// cached per page and only dropped when that page's content changes.
+const staticThumbCache = new Map(); // pageId -> data URL
+const STATIC_THUMB_WIDTH = 320;
+// Bumped on every editor render so a superseded render's pending awaits can
+// bail out instead of writing engines into the view that replaced it.
+let editorInitToken = 0;
+// Sliding-window updates run one at a time; see `scheduleEngineWindow`.
+let engineWindowChain = Promise.resolve();
 let currentTool = "select";
 let currentColor = "#176a72";
 let currentWidth = 4;
@@ -501,13 +514,22 @@ function persistPayload(key, value) {
 function ensurePayloadsPersisted() {
   for (const note of notes) {
     for (const page of note.pages || []) {
-      // Pass null rather than skipping, so a cleared payload is deleted
-      // instead of being left to resurrect on the next load.
-      persistPayload(canvasKeyForPage(page), page.canvasJson ?? null);
-      persistPayload(
-        pendingKeyForPage(page),
-        page.pendingImportData ?? page.pendingDecomposedData ?? null,
-      );
+      // Missing means "not loaded yet" for notebooks outside the active one;
+      // null means "explicitly cleared" (e.g. an import handoff consumed on
+      // first open). Never turn an unloaded payload into a delete request:
+      // saving notebook A must not erase notebook B's IndexedDB data.
+      if (page.canvasJson !== undefined) {
+        persistPayload(canvasKeyForPage(page), page.canvasJson);
+      }
+      if (
+        page.pendingImportData !== undefined ||
+        page.pendingDecomposedData !== undefined
+      ) {
+        persistPayload(
+          pendingKeyForPage(page),
+          page.pendingImportData ?? page.pendingDecomposedData ?? null,
+        );
+      }
     }
   }
 }
@@ -534,57 +556,82 @@ function projectNotesForStorage() {
 /**
  * Loads every page's object graph back out of IndexedDB.
  *
- * Must finish before the first render, otherwise every imported page would
- * come up blank.
+ * Modern notebooks keep only the payload keys in localStorage, so the graph
+ * must be loaded before a notebook can render. To keep the library fast, this
+ * is now done lazily per-notebook instead of eagerly parsing every page in the
+ * library at startup. Legacy notebooks that still have an inline canvasJson or
+ * pendingImportData are migrated on first load.
  */
-async function hydrateNotes() {
+async function hydrateNote(note) {
+  if (!note || !Array.isArray(note.pages)) return;
+
   const jobs = [];
+  for (const page of note.pages) {
+    const canvasKey = canvasKeyForPage(page);
+    if (canvasKey && !page.canvasJson) {
+      jobs.push(
+        getPagePayload(canvasKey)
+          .then((json) => {
+            if (typeof json === "string") {
+              page.canvasJson = JSON.parse(json);
+              persistedPayloads.set(canvasKey, json);
+            }
+          })
+          .catch(() => {}),
+      );
+    }
 
-  for (const note of notes) {
-    for (const page of note.pages || []) {
-      const canvasKey = canvasKeyForPage(page);
-      if (canvasKey && !page.canvasJson) {
-        jobs.push(
-          getPagePayload(canvasKey)
-            .then((json) => {
-              if (typeof json === "string") {
-                page.canvasJson = JSON.parse(json);
-                // Seed the cache so the first save does not rewrite it.
-                persistedPayloads.set(canvasKey, json);
-              }
-            })
-            .catch(() => {}),
-        );
-      } else if (canvasKey && page.canvasJson) {
-        // Legacy inline graph: keep it, and let the next save move it across.
-        jobs.push(Promise.resolve());
-      }
-
-      // The import handoff is only a fallback for a page that has no persisted
-      // graph yet. Once one exists it is authoritative, so restoring the
-      // handoff would rebuild the page and throw away the user's edits.
-      const pendingKey = pendingKeyForPage(page);
-      if (
-        pendingKey &&
-        !page.canvasJson &&
-        !page.pendingImportData &&
-        !page.pendingDecomposedData
-      ) {
-        jobs.push(
-          getPagePayload(pendingKey)
-            .then((json) => {
-              if (typeof json === "string") {
-                page.pendingImportData = JSON.parse(json);
-                persistedPayloads.set(pendingKey, json);
-              }
-            })
-            .catch(() => {}),
-        );
-      }
+    const pendingKey = pendingKeyForPage(page);
+    if (
+      pendingKey &&
+      !page.canvasJson &&
+      !page.pendingImportData &&
+      !page.pendingDecomposedData
+    ) {
+      jobs.push(
+        getPagePayload(pendingKey)
+          .then((json) => {
+            if (typeof json === "string") {
+              page.pendingImportData = JSON.parse(json);
+              persistedPayloads.set(pendingKey, json);
+            }
+          })
+          .catch(() => {}),
+      );
     }
   }
 
   await Promise.all(jobs);
+}
+
+/**
+ * One-shot migration path for legacy notebooks that still store the object
+ * graph inline in localStorage. Modern notebooks keep only payload keys, so
+ * this is usually a no-op.
+ */
+async function hydrateNotes() {
+  const jobs = [];
+  for (const note of notes) {
+    for (const page of note.pages || []) {
+      if (page.canvasJson || page.pendingImportData || page.pendingDecomposedData) {
+        // This data belongs in IndexedDB; leave the migration in place without
+        // re-parsing anything. The next save will strip it from localStorage.
+        continue;
+      }
+    }
+  }
+  await Promise.all(jobs);
+}
+
+/** True when the notebook's page payloads have already been loaded. */
+function isNoteHydrated(note) {
+  return (note.pages || []).every(
+    (p) =>
+      p.canvasJson ||
+      p.pendingImportData ||
+      p.pendingDecomposedData ||
+      !canvasKeyForPage(p),
+  );
 }
 
 function saveNotes() {
@@ -628,28 +675,41 @@ function getCurrentPage() {
 
 function getActiveCanvasEngine() {
   const note = getActiveNote();
-  if (!note || canvasEngines.length === 0) return null;
-  return canvasEngines[note.currentPageIndex] || canvasEngines[0];
+  if (!note || !canvasEngines) return null;
+  return canvasEngines[note.currentPageIndex] || null;
 }
 
 configureViewport({
   getCanvasEngines: () => canvasEngines,
   getActiveNote,
   getActiveCanvasEngine,
+  // Static previews are laid out at the page's on-screen size, so they follow
+  // the zoom the same way a live canvas does.
+  onZoomApplied: () => layoutStaticThumbnails(),
 });
 
-function render() {
+async function render() {
   const app = document.querySelector("#app");
   const note = getActiveNote();
 
   if (note) {
+    // Lazy hydration: only load this notebook's page payloads when opening it.
+    if (!isNoteHydrated(note)) {
+      isLoading = true;
+      loadingMessage = "Opening notebook…";
+      renderLoading();
+      await hydrateNote(note);
+      isLoading = false;
+    }
     setCurrentZoom(1);
     app.innerHTML = editorView(note);
-    initEditor(note);
+    await initEditor(note);
   } else {
     hideZoomWindow();
-    canvasEngines.forEach((engine) => engine.destroy());
+    canvasEngines.forEach((engine) => engine?.destroy());
     canvasEngines = [];
+    pageHistoryCache.clear();
+    staticThumbCache.clear();
     app.innerHTML = libraryView();
     bindLibraryEvents();
   }
@@ -821,6 +881,26 @@ function updateFontToolbarState(selected) {
     underlineBtn?.classList.toggle("active", !!engine.isUnderline);
     strikethroughBtn?.classList.toggle("active", !!engine.isStrikethrough);
   }
+}
+
+/**
+ * Re-points the per-page toolbar at whichever page is now active.
+ *
+ * Undo/redo and the font controls describe the page being edited. Changing
+ * pages does not fire a history or selection event on the page you arrive at,
+ * so without this the buttons keep showing the state of the page you left —
+ * undo stays greyed out on a page that has plenty to undo, and vice versa.
+ */
+function syncToolbarForActivePage() {
+  const engine = getActiveCanvasEngine();
+
+  const undoBtn = document.querySelector("#undo-btn");
+  const redoBtn = document.querySelector("#redo-btn");
+  if (undoBtn) undoBtn.disabled = !engine?.canUndo?.();
+  if (redoBtn) redoBtn.disabled = !engine?.canRedo?.();
+
+  const selected = engine?.canvas?.getActiveObjects?.() || [];
+  updateFontToolbarState(selected);
 }
 
 function editorView(note) {
@@ -1019,6 +1099,7 @@ function editorView(note) {
               (p, i) => `
             <div class="page-container" id="page-wrapper-${i}" data-index="${i}">
               <canvas id="omni-canvas-${i}"></canvas>
+              <img id="omni-thumb-${i}" class="page-thumbnail" alt="Page ${i + 1}" hidden />
             </div>
           `,
             )
@@ -1287,7 +1368,9 @@ async function regeneratePageManagerThumbs() {
   pageManagerThumbs = [];
   for (let i = 0; i < note.pages.length; i++) {
     try {
-      pageManagerThumbs[i] = await renderPageThumbnail(note.pages[i], 260);
+      pageManagerThumbs[i] = await renderPageThumbnail(note.pages[i], 260, {
+        pdfAssetId: note.pdfAssetId,
+      });
     } catch {
       pageManagerThumbs[i] = null;
     }
@@ -1353,12 +1436,59 @@ function rotateObjectAbout(obj, oldW, oldH, newW, newH) {
   obj.setCoords();
 }
 
-async function rotateEnginePage90(engine, page) {
+async function rotateBackground90(page, note, oldW) {
+  if (page.fallbackVisible === false) return null;
+
+  // A PDF page imported as annotations may have no saved raster yet. Rasterize
+  // it on demand before rotating; otherwise the dimensions change but the
+  // unrotated source gets stretched over the new page on the next mount.
+  let url = page.backgroundAssetId
+    ? await getAssetUrl(page.backgroundAssetId)
+    : null;
+  let transient = false;
+  if (!url && note?.pdfAssetId && Number.isInteger(page.pdfPageIndex)) {
+    const source = await renderPdfPageBlob(
+      note.pdfAssetId,
+      page.pdfPageIndex,
+      Math.min(1600, Math.round(oldW)),
+    );
+    if (!source?.blob) throw new Error("Could not render PDF page before rotation");
+    url = URL.createObjectURL(source.blob);
+    transient = true;
+  }
+  if (!url) return null;
+
+  try {
+    const img = new Image();
+    img.src = url;
+    await img.decode();
+    const rotated = document.createElement("canvas");
+    rotated.width = img.naturalHeight;
+    rotated.height = img.naturalWidth;
+    const ctx = rotated.getContext("2d");
+    ctx.translate(rotated.width, 0);
+    ctx.rotate(Math.PI / 2);
+    ctx.drawImage(img, 0, 0);
+    const blob = await canvasToBlob(rotated);
+    if (!blob) throw new Error("Could not encode rotated PDF page");
+    const assetId = `bg-${crypto.randomUUID()}`;
+    await putAsset(assetId, blob);
+    return assetId;
+  } finally {
+    if (transient) URL.revokeObjectURL(url);
+  }
+}
+
+async function rotateEnginePage90(engine, page, note) {
   const canvas = engine.canvas;
   const oldW = engine.width;
   const oldH = engine.height;
   const newW = oldH;
   const newH = oldW;
+  // Prepare and store the rotated raster *before* changing page geometry, so
+  // an encode/store failure leaves the original page untouched.
+  const previousBackgroundId = page.backgroundAssetId;
+  const rotatedBackgroundId = await rotateBackground90(page, note, oldW);
   canvas.discardActiveObject();
   canvas
     .getObjects()
@@ -1371,11 +1501,18 @@ async function rotateEnginePage90(engine, page) {
   page.width = newW;
   page.height = newH;
   canvas.setDimensions({ width: newW, height: newH });
-  // Keep the rotated snapshot instead of re-rasterizing the source PDF at the
-  // original (now wrong) orientation.
-  try {
-    engine.pdfSource = null;
-  } catch {}
+  // Rotated pages need a durable raster, not just a transformed in-memory
+  // Fabric image. The PDF source still has its original orientation and must
+  // never replace this raster when the engine is mounted again.
+  if (rotatedBackgroundId) {
+    page.backgroundAssetId = rotatedBackgroundId;
+    page.pdfBackgroundRotated = true;
+    page.pdfRotation = ((page.pdfRotation || 0) + 90) % 360;
+    engine.setPdfBackgroundSource(null);
+    engine._bgRasterToken++;
+    await engine.loadBackgroundAsset(rotatedBackgroundId);
+    releaseReplacedBackground(previousBackgroundId, page);
+  }
   engine.setZoom(engine.currentZoom, { force: true, resetPan: true });
   canvas.requestRenderAll();
 }
@@ -1418,6 +1555,7 @@ async function pmDelete() {
   for (const i of indices) {
     if (note.pages.length <= 1) break;
     const [removed] = note.pages.splice(i, 1);
+    forgetPageCaches(removed);
     // Don't delete assets still referenced by other (e.g. copied) pages.
     // The deep form matters here: a copy shares the source's embedded images
     // through its object graph, not through the notebook record.
@@ -1439,14 +1577,66 @@ async function pmDelete() {
   render();
 }
 
+/**
+ * Runs `fn(engine)` against a page that currently has no live engine.
+ *
+ * The Page Manager acts on pages the user is not looking at, so the sliding
+ * window holds no engine for most of them. Rather than duplicating every
+ * object-graph transform in JSON space, the page is briefly mounted on its own
+ * (hidden) canvas, transformed, written back and torn down again — which keeps
+ * the transform on exactly the same code path as the on-screen case.
+ */
+async function withTemporaryEngine(page, index, fn) {
+  const note = getActiveNote();
+  if (!note || !page) return;
+
+  const existing = canvasEngines[index];
+  if (existing) {
+    await fn(existing);
+    saveEngineToPage(existing);
+    return;
+  }
+
+  const canvasEl = document.querySelector(`#omni-canvas-${index}`);
+  const thumbEl = document.querySelector(`#omni-thumb-${index}`);
+  if (!canvasEl) return;
+
+  const hadJson = Boolean(page.canvasJson);
+  const canvasWasHidden = canvasEl.hidden;
+  canvasEl.hidden = false;
+  if (thumbEl) thumbEl.hidden = true;
+
+  const { engine } = await createPageEngine(canvasEl, page, note, index);
+  try {
+    await fn(engine);
+  } finally {
+    // Only write back when there is something to write. An annotate-only page
+    // has no object graph, and inventing an empty one would make the Page
+    // Manager prefer it over the source-PDF preview.
+    if (hadJson || engine.canvas.getObjects().length > 0) {
+      saveEngineToPage(engine);
+    }
+    engine.destroy();
+    canvasEl.hidden = canvasWasHidden;
+    if (thumbEl && !canvasWasHidden) {
+      thumbEl.hidden = false;
+      setStaticPageThumbnail(thumbEl, page, note);
+    }
+  }
+}
+
 async function pmRotate() {
   const note = getActiveNote();
   const indices = Array.from(pageManagerSelection).sort((a, b) => a - b);
   if (!indices.length) return;
   for (const i of indices) {
-    const engine = canvasEngines[i];
     const page = note.pages[i];
-    if (engine && page) await rotateEnginePage90(engine, page);
+    if (!page) continue;
+    // Pages outside the sliding window have no engine; mount one for the
+    // rotation so selecting any page in the grid actually rotates it.
+    await withTemporaryEngine(page, i, (engine) =>
+      rotateEnginePage90(engine, page, note),
+    );
   }
   saveActiveCanvasPage();
   pageManagerSelection = new Set();
@@ -1625,7 +1815,8 @@ async function pmCut() {
   for (const i of indices) {
     if (note.pages.length <= 1) break;
     clones.unshift(clonePageData(note.pages[i]));
-    note.pages.splice(i, 1);
+    const [removed] = note.pages.splice(i, 1);
+    forgetPageCaches(removed);
   }
   pageClipboard = clones;
   if (note.currentPageIndex >= note.pages.length)
@@ -1987,11 +2178,71 @@ async function makeAllPagesEditable() {
   );
 }
 
-async function initEditor(note) {
-  if (canvasEngines && canvasEngines.length > 0) {
-    canvasEngines.forEach((e) => e.destroy());
-    canvasEngines = [];
+/**
+ * The set of page indexes that should have a live engine for `note`.
+ *
+ * The window is the current page plus one neighbour on each side, clamped to
+ * the notebook. Everything outside it renders as a static preview.
+ */
+function windowIndexes(note) {
+  const currentIndex = note.currentPageIndex || 0;
+  const radius = 1;
+  const live = new Set();
+  for (
+    let i = Math.max(0, currentIndex - radius);
+    i <= Math.min(note.pages.length - 1, currentIndex + radius);
+    i++
+  ) {
+    live.add(i);
   }
+  return live;
+}
+
+/**
+ * Writes one engine's current state back onto the page record it was loaded
+ * with.
+ *
+ * Saving through `engine.page` rather than through the engine's slot in
+ * `canvasEngines` is what makes page insert / delete / reorder safe: those
+ * operations shift every index after the change while the engines keep
+ * pointing at the pages they were actually loaded with. An index-keyed save
+ * would write one page's content onto its neighbour.
+ */
+function saveEngineToPage(engine) {
+  if (!engine || !engine.page) return;
+  const page = engine.page;
+  const json = engine.toJSON();
+  page.canvasJson = json;
+  page.width = json.width;
+  page.height = json.height;
+  page.paperStyle = json.paperStyle;
+  // The page changed, so its cached off-window preview is stale.
+  staticThumbCache.delete(page.id);
+}
+
+/** Drops the per-page caches for a page that is leaving the notebook. */
+function forgetPageCaches(page) {
+  if (!page) return;
+  pageHistoryCache.delete(page.id);
+  staticThumbCache.delete(page.id);
+}
+
+async function initEditor(note) {
+  // A newer render supersedes this one; its awaits must not write into the
+  // DOM the new view already replaced.
+  const token = ++editorInitToken;
+  engineWindowChain = Promise.resolve();
+
+  // Save whatever engines are currently alive before tearing them down. This
+  // is safe even when `note.pages` was just reshuffled, because each engine
+  // saves onto its own page record.
+  saveActiveCanvasPage();
+
+  // Build (or rebuild) the sliding window of engines around the current page.
+  for (const engine of canvasEngines) engine?.destroy();
+  canvasEngines = [];
+
+  const liveIndexes = windowIndexes(note);
 
   // When returning from the Page Manager we want to keep the zoom the user had,
   // rather than snapping back to fit-width. The flag is only set across those
@@ -2007,101 +2258,46 @@ async function initEditor(note) {
   for (let i = 0; i < note.pages.length; i++) {
     const page = note.pages[i];
     const canvasEl = document.querySelector(`#omni-canvas-${i}`);
-    if (!canvasEl) continue;
+    const thumbEl = document.querySelector(`#omni-thumb-${i}`);
+    if (!canvasEl || !thumbEl) continue;
 
-    const engine = new OmniCanvas(canvasEl, {
-      width: Math.round(page.width || 800),
-      height: Math.round(page.height || 1130),
-      paperStyle: page.paperStyle || "plain",
-      defaultFont: note.defaultFont || "DM Sans",
-      onModified: () => {
-        saveActiveCanvasPage();
-      },
-      onHistoryChange: ({ canUndo, canRedo }) => {
-        // Only update buttons if this is the active canvas
-        if (note.currentPageIndex === i) {
-          const undoBtn = document.querySelector("#undo-btn");
-          const redoBtn = document.querySelector("#redo-btn");
-          if (undoBtn) undoBtn.disabled = !canUndo;
-          if (redoBtn) redoBtn.disabled = !canRedo;
-        }
-      },
-      onSelectionChange: (selected) => {
-        if (note.currentPageIndex === i) {
-          updateFontToolbarState(selected);
-        }
-      },
-      onZoomChange: (z) => {
-        updateZoomUI(z);
-      },
-      // Pinch/wheel zoom takes the exact route the slider takes.
-      onZoomStart: (clientX, clientY) => beginZoomGesture(clientX, clientY),
-      onZoomEnd: () => endZoomGesture(),
-      onZoomRequest: (percent, preview) => setZoom(percent / 100, { preview }),
-      // A lazy-imported page renders its background from the source PDF on
-      // first open. Once it lands, persist the blob so the next open reads it
-      // from IndexedDB instead of re-rendering.
-      onBackgroundRaster: (blob) => {
-        if (page.backgroundAssetId || !blob) return;
-        const assetId = `bg-${crypto.randomUUID()}`;
-        putAsset(assetId, blob)
-          .then(() => {
-            page.backgroundAssetId = assetId;
-            saveNotes();
-          })
-          .catch(() => {});
-      },
-    });
-
-    engine.setColor(currentColor);
-    engine.setWidth(currentWidth);
-    engine.setTool(currentTool);
-    await engine.loadPage(page);
-
-    // The import handoff is one-shot: clear it only once the page has actually
-    // been loaded, so a failed load can still be retried on the next open.
-    if (page.pendingImportData || page.pendingDecomposedData) {
-      page.pendingImportData = null;
-      page.pendingDecomposedData = null;
-      needsSave = true;
+    if (!liveIndexes.has(i)) {
+      // Outside the window: no engine, just a static preview.
+      canvasEl.hidden = true;
+      thumbEl.hidden = false;
+      setStaticPageThumbnail(thumbEl, page, note);
+      continue;
     }
+
+    canvasEl.hidden = false;
+    thumbEl.hidden = true;
+    thumbEl.removeAttribute("src");
+
+    const mounted = await createPageEngine(canvasEl, page, note, i);
+    if (token !== editorInitToken) {
+      mounted.engine.destroy();
+      return;
+    }
+    canvasEngines[i] = mounted.engine;
+    if (mounted.clearedPending) needsSave = true;
 
     // Initial welcome text on first page
     if (
       i === 0 &&
       note.id === "welcome-note" &&
       !page.canvasJson &&
-      !page.pendingDecomposedData
+      !mounted.clearedPending
     ) {
-      engine.addTextAt("Welcome to OmniNote", 100, 100);
-      engine.addTextAt(
+      mounted.engine.addTextAt("Welcome to OmniNote", 100, 100);
+      mounted.engine.addTextAt(
         "Import any PDF using 'Import PDF' to edit text, images, and strokes!",
         100,
         170,
       );
-      engine.setTool("select");
-      const json = engine.toJSON();
-      page.canvasJson = json;
-      saveNotes();
+      mounted.engine.setTool("select");
+      page.canvasJson = mounted.engine.toJSON();
+      needsSave = true;
     }
-
-    engine.zoomLocked = isZoomLocked();
-
-    // Only pages near the viewport render at full quality; the rest are held
-    // at 100% until scrolled to.
-    engine.isActivePage = Math.abs(i - note.currentPageIndex) <= 1;
-    if (
-      note.pdfAssetId &&
-      Number.isInteger(page.pdfPageIndex) &&
-      !page.fallbackFromImage
-    ) {
-      engine.setPdfBackgroundSource({
-        assetId: note.pdfAssetId,
-        pageIndex: page.pdfPageIndex,
-      });
-    }
-
-    canvasEngines.push(engine);
   }
 
   // `saveActiveCanvasPage` refuses to run while `canvasEngines` is still being
@@ -2114,12 +2310,7 @@ async function initEditor(note) {
     saveNotes();
   }
 
-  // Carry the global zoom across engines so each page renders at the current scale.
-  for (const engine of canvasEngines) {
-    if (engine.currentZoom !== getCurrentZoom()) {
-      engine.setZoom(getCurrentZoom(), { force: true });
-    }
-  }
+  if (token !== editorInitToken) return;
 
   // Wide imported pages are the common case, so open pulled back to fit width.
   applyDefaultZoom();
@@ -2148,11 +2339,13 @@ async function initEditor(note) {
           if (prevBtn) prevBtn.disabled = note.currentPageIndex === 0;
           if (nextBtn)
             nextBtn.disabled = note.currentPageIndex === note.pages.length - 1;
-          // Full-quality rendering (and PDF re-rasterization) follows the viewport.
-          canvasEngines.forEach((eng, idx) =>
-            eng.setActivePage(Math.abs(idx - mostVisibleIndex) <= 1),
-          );
-          attachZoomWindow();
+          // Move the sliding window to follow the viewport. The page that is
+          // leaving is flushed inside the update, and the zoom window and
+          // toolbar can only be re-pointed once the incoming engine exists.
+          scheduleEngineWindow(note).then(() => {
+            attachZoomWindow();
+            syncToolbarForActivePage();
+          });
           saveNotes();
         }
       },
@@ -2174,23 +2367,243 @@ async function initEditor(note) {
       activeWrapper.scrollIntoView();
     }
   }
+  syncToolbarForActivePage();
   bindEditorEvents(note);
+}
+
+/**
+ * Builds a live engine for one page and restores anything the engine carries
+ * across the sliding window (undo history, zoom, PDF background source).
+ *
+ * Returns the engine plus whether the import handoff was consumed, so the
+ * caller can decide if a save is needed. The engine is *not* inserted into
+ * `canvasEngines` here — that is the caller's job once it has confirmed the
+ * view is still current.
+ */
+async function createPageEngine(canvasEl, page, note, index) {
+  const engine = new OmniCanvas(canvasEl, {
+    width: Math.round(page.width || 800),
+    height: Math.round(page.height || 1130),
+    paperStyle: page.paperStyle || "plain",
+    defaultFont: note.defaultFont || "DM Sans",
+    onModified: () => saveActiveCanvasPage(),
+    onHistoryChange: ({ canUndo, canRedo }) => {
+      // Only update buttons if this is the active canvas
+      if (note.currentPageIndex === index) {
+        const undoBtn = document.querySelector("#undo-btn");
+        const redoBtn = document.querySelector("#redo-btn");
+        if (undoBtn) undoBtn.disabled = !canUndo;
+        if (redoBtn) redoBtn.disabled = !canRedo;
+      }
+    },
+    onSelectionChange: (selected) => {
+      if (note.currentPageIndex === index) updateFontToolbarState(selected);
+    },
+    onZoomChange: (z) => updateZoomUI(z),
+    // Pinch/wheel zoom takes the exact route the slider takes.
+    onZoomStart: (clientX, clientY) => beginZoomGesture(clientX, clientY),
+    onZoomEnd: () => endZoomGesture(),
+    onZoomRequest: (percent, preview) => setZoom(percent / 100, { preview }),
+    // A lazy-imported page renders its background from the source PDF on first
+    // open. Once it lands, persist the blob so the next open reads it from
+    // IndexedDB instead of re-rendering.
+    onBackgroundRaster: (blob) => {
+      if (page.backgroundAssetId || !blob) return;
+      const assetId = `bg-${crypto.randomUUID()}`;
+      putAsset(assetId, blob)
+        .then(() => {
+          page.backgroundAssetId = assetId;
+          saveNotes();
+        })
+        .catch(() => {});
+    },
+  });
+
+  engine.setColor(currentColor);
+  engine.setWidth(currentWidth);
+  engine.setTool(currentTool);
+  await engine.loadPage(page);
+
+  // Restore the previous undo/redo stack if this page had an engine before.
+  const cachedHistory = pageHistoryCache.get(page.id);
+  if (cachedHistory) engine.setHistoryState(cachedHistory);
+
+  // The import handoff is one-shot: clear it only once the page has actually
+  // been loaded, so a failed load can still be retried on the next open.
+  let clearedPending = false;
+  if (page.pendingImportData || page.pendingDecomposedData) {
+    page.pendingImportData = null;
+    page.pendingDecomposedData = null;
+    clearedPending = true;
+  }
+
+  engine.zoomLocked = isZoomLocked();
+  // Every live engine is within one page of the viewport, so every live engine
+  // renders at full quality — the rule the pre-window code used for
+  // `currentPageIndex ± 1`. Only the pages outside the window are held back,
+  // and those have no engine at all.
+  engine.isActivePage = true;
+
+  if (
+    note.pdfAssetId &&
+    Number.isInteger(page.pdfPageIndex) &&
+    !page.fallbackFromImage &&
+    !page.pdfBackgroundRotated
+  ) {
+    engine.setPdfBackgroundSource({
+      assetId: note.pdfAssetId,
+      pageIndex: page.pdfPageIndex,
+    });
+  }
+
+  // Carry the global zoom across so a remounted page matches the others.
+  if (engine.currentZoom !== getCurrentZoom()) {
+    engine.setZoom(getCurrentZoom(), { force: true });
+  }
+
+  return { engine, clearedPending };
+}
+
+/** The on-screen size a live canvas for `page` would have right now. */
+function pageDisplaySize(page) {
+  const z = getCurrentZoom();
+  return {
+    width: Math.max(1, Math.round((page.width || 800) * z)),
+    height: Math.max(1, Math.round((page.height || 1130) * z)),
+  };
+}
+
+/**
+ * Sets a static, non-interactive page preview when the page is outside the
+ * sliding window. This keeps long notebooks memory-flat: only the current page
+ * and its neighbours get a full OmniCanvas engine.
+ *
+ * The preview doubles as the page's layout box — the engine has been disposed,
+ * so nothing else gives the wrapper its size. It is therefore laid out at the
+ * exact size a live canvas would have, and cached per page so scrolling does
+ * not re-rasterize every off-window page on every window change.
+ */
+async function setStaticPageThumbnail(imgEl, page, note) {
+  const { width, height } = pageDisplaySize(page);
+  imgEl.style.width = `${width}px`;
+  imgEl.style.height = `${height}px`;
+
+  const cached = staticThumbCache.get(page.id);
+  if (cached) {
+    if (imgEl.getAttribute("src") !== cached) imgEl.src = cached;
+    return;
+  }
+
+  try {
+    // `renderPageThumbnail(page, targetWidth, options)` — the second argument
+    // is the preview width in CSS pixels, and the PDF asset has to be passed
+    // through options so lazy annotated pages can still be previewed.
+    const url = await renderPageThumbnail(page, STATIC_THUMB_WIDTH, {
+      pdfAssetId: note?.pdfAssetId,
+    });
+    if (!url) return;
+    staticThumbCache.set(page.id, url);
+    imgEl.src = url;
+  } catch {
+    // A missing preview does not block scrolling; the wrapper keeps its box.
+  }
+}
+
+/** Re-sizes every visible static preview after the zoom changes. */
+function layoutStaticThumbnails() {
+  const note = getActiveNote();
+  if (!note) return;
+  for (let i = 0; i < note.pages.length; i++) {
+    const imgEl = document.querySelector(`#omni-thumb-${i}`);
+    if (!imgEl || imgEl.hidden) continue;
+    const { width, height } = pageDisplaySize(note.pages[i]);
+    imgEl.style.width = `${width}px`;
+    imgEl.style.height = `${height}px`;
+  }
+}
+
+/**
+ * Serializes sliding-window updates.
+ *
+ * The scroll observer can fire several times while a fast scroll is in flight,
+ * and an update destroys and mounts engines asynchronously. Two overlapping
+ * updates would both see the same empty slot and mount two engines onto one
+ * canvas — leaking one of them and racing on the DOM. Chaining them means the
+ * last one wins and every intermediate state is consistent.
+ */
+function scheduleEngineWindow(note) {
+  const token = editorInitToken;
+  engineWindowChain = engineWindowChain
+    .then(() => {
+      // A queued update belongs to the view that scheduled it. Once a newer
+      // render has taken over, running it would mount the old notebook's
+      // engines onto the new notebook's canvases.
+      if (token !== editorInitToken) return;
+      return updateEngineWindow(note);
+    })
+    .catch(() => {});
+  return engineWindowChain;
+}
+
+/**
+ * Recomputes which pages should have a live engine after the visible page
+ * changes. Pages entering the window are mounted; pages leaving it are saved,
+ * destroyed, and replaced by a static thumbnail.
+ */
+async function updateEngineWindow(note) {
+  const token = editorInitToken;
+  const liveIndexes = windowIndexes(note);
+
+  // Save and tear down the pages that just left the window. Each engine saves
+  // onto its own page record, so this is correct even mid-reorder.
+  for (let i = 0; i < note.pages.length; i++) {
+    const engine = canvasEngines[i];
+    if (!engine || liveIndexes.has(i)) continue;
+    // Keep undo/redo history alive while the engine is off-screen.
+    if (engine.page) pageHistoryCache.set(engine.page.id, engine.getHistoryState());
+    saveEngineToPage(engine);
+    engine.destroy();
+    canvasEngines[i] = null;
+  }
+
+  let needsSave = false;
+
+  for (let i = 0; i < note.pages.length; i++) {
+    const page = note.pages[i];
+    const canvasEl = document.querySelector(`#omni-canvas-${i}`);
+    const thumbEl = document.querySelector(`#omni-thumb-${i}`);
+    if (!canvasEl || !thumbEl) continue;
+
+    if (!liveIndexes.has(i)) {
+      canvasEl.hidden = true;
+      thumbEl.hidden = false;
+      setStaticPageThumbnail(thumbEl, page, note);
+      continue;
+    }
+
+    if (!canvasEngines[i]) {
+      const mounted = await createPageEngine(canvasEl, page, note, i);
+      if (token !== editorInitToken) {
+        mounted.engine.destroy();
+        return;
+      }
+      canvasEngines[i] = mounted.engine;
+      if (mounted.clearedPending) needsSave = true;
+    }
+
+    canvasEl.hidden = false;
+    thumbEl.hidden = true;
+    thumbEl.removeAttribute("src");
+  }
+
+  if (needsSave) saveActiveCanvasPage();
 }
 
 function saveActiveCanvasPage() {
   const note = getActiveNote();
-  if (!note || canvasEngines.length === 0) return;
+  if (!note) return;
 
-  canvasEngines.forEach((engine, i) => {
-    const page = note.pages[i];
-    if (page && engine) {
-      const json = engine.toJSON();
-      page.canvasJson = json;
-      page.width = json.width;
-      page.height = json.height;
-      page.paperStyle = json.paperStyle;
-    }
-  });
+  for (const engine of canvasEngines) saveEngineToPage(engine);
 
   saveNotes();
   scheduleThumbnailRefresh(note.id);
@@ -2212,22 +2625,14 @@ async function refreshNoteThumbnail(noteId) {
 
   const note = getActiveNote();
   const page = note?.pages?.[0];
-  const engine = canvasEngines[0];
-  if (!note || !page || !engine) return;
+  if (!note || !page) return;
 
   try {
-    // The canvas is sized to (page x render zoom), so a fixed multiplier would
-    // yield a different thumbnail size at every zoom level. Solve for the
-    // intended width instead.
-    const pageW = page.width || engine.width || 800;
-    const renderZoom = engine.getRenderZoom ? engine.getRenderZoom() : 1;
-    const dpr = Math.max(1, Math.min(3, window.devicePixelRatio || 1));
-    const multiplier = Math.min(1, 320 / Math.max(1, pageW * renderZoom * dpr));
-
-    const dataUrl = engine.canvas.toDataURL({
-      format: "jpeg",
-      quality: 0.35,
-      multiplier,
+    // Render from the page record rather than from a live engine. With the
+    // sliding window, page 0 often has no engine while the user edits a later
+    // page, and an engine-indexed read silently stops updating the card.
+    const dataUrl = await renderPageThumbnail(page, 320, {
+      pdfAssetId: note.pdfAssetId,
     });
     if (!dataUrl) return;
 
@@ -2384,7 +2789,11 @@ function bindEditorEvents(note) {
     ?.addEventListener("click", async () => {
       if (note.pages.length <= 1) return;
       if (confirm(`Delete Page ${note.currentPageIndex + 1}?`)) {
+        // Flush first: the page's asset ids are collected from its record right
+        // after the splice, and unsaved edits would leave their assets behind.
+        saveActiveCanvasPage();
         const [removed] = note.pages.splice(note.currentPageIndex, 1);
+        forgetPageCaches(removed);
         // Copied pages can share image assets with the page being deleted.
         const stillUsed = new Set();
         for (const p of note.pages) {
@@ -2624,7 +3033,7 @@ function bindEditorEvents(note) {
       const flyout = document.querySelector("#shapes-flyout");
       if (flyout) flyout.style.display = "none";
       currentTool = "select";
-      canvasEngines.forEach((e) => e.setTool("select"));
+      canvasEngines.forEach((e) => e?.setTool("select"));
       document
         .querySelectorAll("[data-tool]")
         .forEach((b) => b.classList.remove("selected"));
@@ -2684,7 +3093,7 @@ function bindEditorEvents(note) {
   document.querySelectorAll("[data-tool]").forEach((btn) => {
     btn.addEventListener("click", () => {
       currentTool = btn.dataset.tool;
-      canvasEngines.forEach((e) => e.setTool(currentTool));
+      canvasEngines.forEach((e) => e?.setTool(currentTool));
 
       document
         .querySelectorAll("[data-tool]")
@@ -2717,11 +3126,11 @@ function bindEditorEvents(note) {
   document.querySelectorAll("[data-pen-style]").forEach((btn) => {
     btn.addEventListener("click", () => {
       currentPenStyle = btn.dataset.penStyle;
-      canvasEngines.forEach((e) => e.setPenStyle(currentPenStyle));
+      canvasEngines.forEach((e) => e?.setPenStyle(currentPenStyle));
 
       // Also switch to pen tool
       currentTool = "pen";
-      canvasEngines.forEach((e) => e.setTool("pen"));
+      canvasEngines.forEach((e) => e?.setTool("pen"));
       document
         .querySelectorAll("[data-tool]")
         .forEach((b) => b.classList.remove("selected"));
@@ -2744,7 +3153,7 @@ function bindEditorEvents(note) {
   if (thicknessSlider) {
     thicknessSlider.addEventListener("input", (e) => {
       currentWidth = Number(e.target.value);
-      canvasEngines.forEach((e) => e.setWidth(currentWidth));
+      canvasEngines.forEach((e) => e?.setWidth(currentWidth));
       if (thicknessPreview) {
         const size = Math.min(currentWidth, 16);
         thicknessPreview.style.width = size + "px";
@@ -2763,7 +3172,7 @@ function bindEditorEvents(note) {
   /** Applies `hex` everywhere and marks `btn` (if given) as the chosen swatch. */
   const useColor = (hex, btn) => {
     currentColor = hex;
-    canvasEngines.forEach((eng) => eng.setColor(hex));
+    canvasEngines.forEach((eng) => eng?.setColor(hex));
     updateThicknessPreview();
     document
       .querySelectorAll(".swatch-dot")
@@ -2904,7 +3313,7 @@ function bindEditorEvents(note) {
       if (file && engine) {
         await engine.addImageFile(file);
         currentTool = "select";
-        canvasEngines.forEach((e) => e.setTool("select"));
+        canvasEngines.forEach((e) => e?.setTool("select"));
         document
           .querySelectorAll("[data-tool]")
           .forEach((b) => b.classList.remove("selected"));

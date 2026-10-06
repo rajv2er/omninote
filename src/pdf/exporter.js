@@ -2,6 +2,7 @@ import { PDFDocument } from "pdf-lib";
 import { StaticCanvas } from "fabric";
 import { getAssetUrl } from "../storage/assets.js";
 import { hydrateCanvasJson } from "./importModel.js";
+import { renderPdfPageBlob } from "./raster.js";
 
 /**
  * True when the page should render its locked imported raster underneath the
@@ -207,7 +208,7 @@ function drawImageToContext(ctx, dataUrl, width, height) {
  * at roughly `targetWidth` CSS pixels. Used by the Page Manager grid, which is
  * independent of the live Fabric engines so it stays correct even mid-edit.
  */
-export async function renderPageThumbnail(page, targetWidth = 320) {
+export async function renderPageThumbnail(page, targetWidth = 320, options = {}) {
   const width = page.width || 800;
   const height = page.height || 1130;
   const paperStyle = page.paperStyle || "plain";
@@ -219,25 +220,55 @@ export async function renderPageThumbnail(page, targetWidth = 320) {
   const ctx = out.getContext("2d");
   ctx.scale(scale, scale);
 
-  const backgroundUrl = await resolveFallbackUrl(page);
+  let backgroundUrl = await resolveFallbackUrl(page);
+  let transientBackgroundUrl = null;
 
-  if (backgroundUrl) {
-    await drawImageToContext(ctx, backgroundUrl, width, height);
-  } else {
-    drawPaperPattern(ctx, width, height, paperStyle);
-  }
-
-  const canvasData = page.canvasJson?.canvasData || page.canvasJson;
-  if (canvasData) {
-    const staticCanvas = await renderStoredCanvas(page.canvasJson, width, height);
-    if (staticCanvas) {
-      // PNG keeps the ink's transparency so the paper underneath shows through
-      // instead of the JPEG's no-alpha black background masking the page.
-      const inkUrl = staticCanvas.toDataURL({ format: "png" });
-      staticCanvas.dispose();
-      await drawImageToContext(ctx, inkUrl, width, height);
+  // Lazy annotated imports intentionally do not retain a full-page raster for
+  // every page. A promoted page can also be waiting to materialise its native
+  // objects, which means it has neither a raster nor canvas JSON yet. The Page
+  // Manager must still show the document, not a misleading blank sheet.
+  // Render a small one-shot preview from the source PDF for precisely those
+  // states. Once a fully recovered page has serialized canvas JSON, that JSON
+  // remains authoritative and is rendered over ordinary paper below.
+  const hasCanvasJson = Boolean(page.canvasJson?.canvasData || page.canvasJson);
+  const canUseSourcePdf =
+    !backgroundUrl &&
+    options.pdfAssetId &&
+    Number.isInteger(page.pdfPageIndex) &&
+    (page.fallbackVisible !== false || !hasCanvasJson);
+  if (canUseSourcePdf) {
+    const raster = await renderPdfPageBlob(
+      options.pdfAssetId,
+      page.pdfPageIndex,
+      Math.max(1, Math.round(targetWidth)),
+    );
+    if (raster?.blob) {
+      transientBackgroundUrl = URL.createObjectURL(raster.blob);
+      backgroundUrl = transientBackgroundUrl;
     }
   }
 
-  return out.toDataURL("image/jpeg", 0.7);
+  try {
+    if (backgroundUrl) {
+      await drawImageToContext(ctx, backgroundUrl, width, height);
+    } else {
+      drawPaperPattern(ctx, width, height, paperStyle);
+    }
+
+    const canvasData = page.canvasJson?.canvasData || page.canvasJson;
+    if (canvasData) {
+      const staticCanvas = await renderStoredCanvas(page.canvasJson, width, height);
+      if (staticCanvas) {
+        // PNG keeps the ink's transparency so the paper underneath shows through
+        // instead of the JPEG's no-alpha black background masking the page.
+        const inkUrl = staticCanvas.toDataURL({ format: "png" });
+        staticCanvas.dispose();
+        await drawImageToContext(ctx, inkUrl, width, height);
+      }
+    }
+
+    return out.toDataURL("image/jpeg", 0.7);
+  } finally {
+    if (transientBackgroundUrl) URL.revokeObjectURL(transientBackgroundUrl);
+  }
 }

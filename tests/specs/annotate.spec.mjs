@@ -21,6 +21,8 @@ import {
   drawStroke,
   makeEditableCurrentPage,
   makeAllEditable,
+  focusPage,
+  waitForEngine,
   waitForEngines,
 } from "../lib/harness.mjs";
 
@@ -151,7 +153,8 @@ export default async function run({ page, fixtures, check }) {
 
   /* --- all of it survives a reopen --------------------------------------- */
   await openNote(page, noteId);
-  await waitForEngines(page, 3);
+  // Wait for the rebuilt page 0 engine; the window mounts it on demand.
+  await waitForEngine(page, 0);
 
   live = await inspectPage(page, 0);
   census = await objectCensus(page);
@@ -194,6 +197,7 @@ export default async function run({ page, fixtures, check }) {
   // Batch stores a handoff rather than instantiating, so the objects only have
   // to be real after the pages are opened again.
   await openNote(page, noteId);
+  // Mount each page by scrolling so all objects can be counted.
   await waitForEngines(page, 3);
   census = await objectCensus(page);
   console.log(`      after reopen → census ${JSON.stringify(census)}`);

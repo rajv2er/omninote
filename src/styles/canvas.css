@@ -114,6 +114,22 @@
   position: relative;
 }
 
+/*
+ * Static preview shown in place of the canvas for a page outside the live
+ * sliding window. The engine is disposed for those pages, so this element is
+ * what gives the page wrapper its size — it is laid out at the exact box a live
+ * canvas would occupy (set inline by `setStaticPageThumbnail`) and must stay
+ * in normal flow rather than being absolutely positioned.
+ */
+.page-thumbnail {
+  display: block;
+  background: #ffffff;
+  border-radius: 4px;
+  -webkit-user-drag: none;
+  user-select: none;
+  pointer-events: none;
+}
+
 /* Paper Textures */
 .paper-plain {
   background: #ffffff !important;
