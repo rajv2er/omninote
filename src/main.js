@@ -687,6 +687,7 @@ configureViewport({
 async function render() {
   const app = document.querySelector("#app");
   const note = getActiveNote();
+  const previousNoteId = activeId;
 
   if (note) {
     // Lazy hydration: only load this notebook's page payloads when opening it.
@@ -697,7 +698,11 @@ async function render() {
       await hydrateNote(note);
       isLoading = false;
     }
-    setCurrentZoom(1);
+    // Preserve zoom across same-notebook re-renders (e.g. add/delete page,
+    // rename, promote). Only reset to 1 when opening a different notebook.
+    if (note.id !== previousNoteId) {
+      setCurrentZoom(1);
+    }
     app.innerHTML = editorView(note);
     await initEditor(note);
   } else {
