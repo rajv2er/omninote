@@ -83,6 +83,40 @@ export default async function run({ page, fixtures, check }) {
   const victim = await importPdf(page, join(fixtures, "images.pdf"));
   const survivor = await importPdf(page, join(fixtures, "multipage.pdf"));
 
+  /* --- lazy hydration must not erase another unopened notebook ---------- */
+  const survivorPageId = (await noteSummary(page, survivor)).pageIds[0];
+  const survivorCanvasKey = `canvas-${survivorPageId}`;
+  await page.waitForFunction(
+    async (key) => {
+      const req = indexedDB.open("omninote-assets", 1);
+      return new Promise((resolve) => {
+        req.onsuccess = () => {
+          const read = req.result.transaction("assets").objectStore("assets").get(key);
+          read.onsuccess = () => resolve(typeof read.result === "string");
+          read.onerror = () => resolve(false);
+        };
+        req.onerror = () => resolve(false);
+      });
+    },
+    survivorCanvasKey,
+    { timeout: 30000 },
+  );
+  await page.reload();
+  await page.waitForFunction(() => Boolean(window.__omni));
+  await openNote(page, victim);
+  await page.waitForTimeout(600);
+  const survivorStillStored = (await idbKeys(page)).includes(survivorCanvasKey);
+  check(
+    "opening one notebook after reload preserves unopened notebooks' page data",
+    survivorStillStored,
+    `${survivorCanvasKey} ${survivorStillStored ? "present" : "MISSING"}`,
+  );
+  await openNote(page, survivor);
+  check(
+    "unopened notebook's objects survive the lazy-hydration round trip",
+    (await inspectPage(page, 0))?.objects.length > 0,
+  );
+
   // Image blobs are referenced from the recovered objects, so collect them
   // from the live engine rather than trusting the notebook record.
   await openNote(page, victim);

@@ -23,3 +23,30 @@ serde = { version = "1.0", features = ["derive"] }
 log = "0.4"
 tauri = { version = "2.11.3", features = [] }
 tauri-plugin-log = "2"
+
+# Cargo's default dev profile builds with opt-level = 0 and full debug info.
+# For a Tauri webview app the heavy work happens in JS/WebKit, so the Rust
+# shell does not need to be unoptimized. Raising the level and removing full
+# symbols cuts the debug target/ directory dramatically while keeping builds
+# fast enough for interactive development.
+[profile.dev]
+opt-level = 1        # Small, safe optimizations; much less code bloat than 0
+debug = 0            # No embedded debug symbols; stack traces still show frames
+incremental = true     # Keep incremental compilation for fast re-builds
+
+# Release profile targets a small, fast native binary. LTO and a single
+# codegen unit let LLVM remove dead code across crates, and stripping removes
+# symbol tables that do not ship anyway.
+[profile.release]
+opt-level = "z"      # Optimize for binary size; "s" is a good alternative
+lto = true           # Link-time optimization across all crates
+codegen-units = 1    # Maximum cross-crate optimization
+panic = "abort"      # Remove unwinding tables
+strip = true         # Strip all debug symbols from the final binary
+
+# The Tauri CLI also builds the desktop app with a release-ish profile. The
+# default `bundle` profile is Cargo's built-in release profile, but naming it
+# explicitly lets us add Tauri-specific size tuning later without touching
+# release settings.
+[profile.bundling]
+inherits = "release"
