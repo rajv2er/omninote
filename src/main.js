@@ -141,6 +141,11 @@ const STATIC_THUMB_WIDTH = 320;
 let editorInitToken = 0;
 // Sliding-window updates run one at a time; see `scheduleEngineWindow`.
 let engineWindowChain = Promise.resolve();
+// Stored so the scroll observer and outside-click listener can be cleaned up
+// before a new render replaces them. Without this, every render leaks another
+// observer and another document-level click handler.
+let scrollObserver = null;
+let outsideClickHandler = null;
 let currentTool = "select";
 let currentColor = "#176a72";
 let currentWidth = 4;
@@ -607,20 +612,11 @@ async function hydrateNote(note) {
 /**
  * One-shot migration path for legacy notebooks that still store the object
  * graph inline in localStorage. Modern notebooks keep only payload keys, so
- * this is usually a no-op.
+ * this is a no-op. The migration was removed when the storage format changed;
+ * this stub is kept so the startup sequence doesn't need to change.
  */
 async function hydrateNotes() {
-  const jobs = [];
-  for (const note of notes) {
-    for (const page of note.pages || []) {
-      if (page.canvasJson || page.pendingImportData || page.pendingDecomposedData) {
-        // This data belongs in IndexedDB; leave the migration in place without
-        // re-parsing anything. The next save will strip it from localStorage.
-        continue;
-      }
-    }
-  }
-  await Promise.all(jobs);
+  // No-op: modern notebooks store payloads in IndexedDB, not localStorage.
 }
 
 /** True when the notebook's page payloads have already been loaded. */
@@ -710,6 +706,15 @@ async function render() {
     canvasEngines = [];
     pageHistoryCache.clear();
     staticThumbCache.clear();
+    // Clean up editor-scoped listeners before switching to the library view.
+    if (scrollObserver) {
+      scrollObserver.disconnect();
+      scrollObserver = null;
+    }
+    if (outsideClickHandler) {
+      document.removeEventListener("click", outsideClickHandler);
+      outsideClickHandler = null;
+    }
     app.innerHTML = libraryView();
     bindLibraryEvents();
   }
@@ -2319,7 +2324,9 @@ async function initEditor(note) {
   // Set up scroll observer to update active page index
   const scrollContainer = document.querySelector("#canvas-scroll-container");
   if (scrollContainer) {
-    const observer = new IntersectionObserver(
+    // Disconnect the previous render's observer before creating a new one.
+    if (scrollObserver) scrollObserver.disconnect();
+    scrollObserver = new IntersectionObserver(
       (entries) => {
         let maxRatio = 0;
         let mostVisibleIndex = note.currentPageIndex;
@@ -2357,7 +2364,7 @@ async function initEditor(note) {
 
     document
       .querySelectorAll(".page-container")
-      .forEach((el) => observer.observe(el));
+      .forEach((el) => scrollObserver.observe(el));
 
     // Scroll to the active page on load
     const activeWrapper = document.querySelector(
@@ -3041,8 +3048,12 @@ function bindEditorEvents(note) {
     });
   });
 
-  // Close menus on outside click
-  document.addEventListener("click", (e) => {
+  // Close menus on outside click. The handler is stored so it can be removed
+  // before a new render adds another — otherwise every render leaks a duplicate.
+  if (outsideClickHandler) {
+    document.removeEventListener("click", outsideClickHandler);
+  }
+  outsideClickHandler = (e) => {
     if (
       !e.target.closest("#shapes-flyout") &&
       !e.target.closest("#shapes-btn")
@@ -3066,10 +3077,11 @@ function bindEditorEvents(note) {
       const modal = document.querySelector("#page-setup-modal");
       if (modal) modal.style.display = "none";
     }
-  });
+  };
+  document.addEventListener("click", outsideClickHandler);
 
   document.querySelector("#rename-btn")?.addEventListener("click", () => {
-    const newTitle = prompt("Notebook title:", note.title);
+    const newTitle = window.prompt("Notebook title:", note.title);
     if (newTitle && newTitle.trim()) {
       note.title = newTitle.trim();
       saveNotes();
@@ -3335,7 +3347,7 @@ function bindEditorEvents(note) {
   // Keyboard Shortcuts: Cmd+Z, Cmd+Shift+Z, Delete, Cmd+C, Cmd+V
   let clipboard = null;
 
-  window.onkeydown = (e) => {
+  const onKeyDown = (e) => {
     // While the Page Manager is open, swallow everything except Escape (which
     // closes it) so shortcuts can't mutate the hidden editor behind the overlay.
     if (showPageManager) {
@@ -3436,6 +3448,8 @@ function bindEditorEvents(note) {
       zoomFit("page");
     }
   };
+
+  window.addEventListener("keydown", onKeyDown);
 }
 
 /** Fills library card previews from IndexedDB once the grid is in the DOM. */
@@ -3485,7 +3499,7 @@ function bindLibraryEvents() {
 
   // "+ New folder" button — prompts for a name and creates the folder.
   document.querySelector("#new-folder-btn")?.addEventListener("click", () => {
-    const name = (prompt("Folder name:") || "").trim();
+    const name = (window.prompt("Folder name:") || "").trim();
     if (!name) return;
     const folder = { id: crypto.randomUUID(), name, createdAt: Date.now() };
     folders = [...folders, folder];
@@ -3508,7 +3522,7 @@ function bindLibraryEvents() {
       saveFolders();
       saveNotes();
       if (activeFolder === FOLDER_PREFIX + id) activeFolder = "unfiled";
-      console.info(`Removed folder "${folder.name}" (${moved} notes moved to Unfiled)`);
+      console.warn(`Removed folder "${folder.name}" (${moved} notes moved to Unfiled)`);
       render();
     });
   });
