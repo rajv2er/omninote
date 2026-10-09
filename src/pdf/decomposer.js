@@ -920,7 +920,7 @@ export async function decomposePage(page, scale = 1.333333, options = {}) {
       const textLen = item.str.trim().length;
       fontUsage[resolvedFont] = (fontUsage[resolvedFont] || 0) + textLen;
 
-      const [a, b, , d, e, f] = item.transform;
+      const [a, b, , , e, f] = item.transform;
       const fontSize = Math.max(1, Math.hypot(a, b) * scale);
 
       // PDF y grows upward and the viewport flips it, so a rotation that is

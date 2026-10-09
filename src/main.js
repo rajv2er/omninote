@@ -427,11 +427,15 @@ function normalizeNote(n) {
 function loadNotes() {
   try {
     const saved = JSON.parse(localStorage.getItem(STORE_KEY));
+    console.log('[loadNotes] localStorage data:', saved ? 'found' : 'empty');
     if (Array.isArray(saved) && saved.length > 0) {
+      console.log('[loadNotes] Loaded', saved.length, 'notes');
       return saved.map(normalizeNote);
     }
+    console.log('[loadNotes] Using sample note');
     return [normalizeNote(sampleNote)];
-  } catch {
+  } catch (e) {
+    console.error('[loadNotes] Error:', e);
     return [normalizeNote(sampleNote)];
   }
 }
@@ -576,15 +580,19 @@ async function hydrateNote(note) {
   for (const page of note.pages) {
     const canvasKey = canvasKeyForPage(page);
     if (canvasKey && !page.canvasJson) {
+      console.log('[hydrateNote] Loading canvas for page', page.id, 'key:', canvasKey);
       jobs.push(
         getPagePayload(canvasKey)
           .then((json) => {
+            console.log('[hydrateNote] Got canvas for page', page.id, json ? 'ok' : 'empty');
             if (typeof json === "string") {
               page.canvasJson = JSON.parse(json);
               persistedPayloads.set(canvasKey, json);
             }
           })
-          .catch(() => {}),
+          .catch((err) => {
+            console.error('[hydrateNote] Error loading canvas for page', page.id, err);
+          }),
       );
     }
 
@@ -595,20 +603,26 @@ async function hydrateNote(note) {
       !page.pendingImportData &&
       !page.pendingDecomposedData
     ) {
+      console.log('[hydrateNote] Loading pending for page', page.id, 'key:', pendingKey);
       jobs.push(
         getPagePayload(pendingKey)
           .then((json) => {
+            console.log('[hydrateNote] Got pending for page', page.id, json ? 'ok' : 'empty');
             if (typeof json === "string") {
               page.pendingImportData = JSON.parse(json);
               persistedPayloads.set(pendingKey, json);
             }
           })
-          .catch(() => {}),
+          .catch((err) => {
+            console.error('[hydrateNote] Error loading pending for page', page.id, err);
+          }),
       );
     }
   }
 
+  console.log('[hydrateNote] Waiting for', jobs.length, 'jobs');
   await Promise.all(jobs);
+  console.log('[hydrateNote] Done');
 }
 
 /**
@@ -623,13 +637,15 @@ async function hydrateNotes() {
 
 /** True when the notebook's page payloads have already been loaded. */
 function isNoteHydrated(note) {
-  return (note.pages || []).every(
+  const result = (note.pages || []).every(
     (p) =>
       p.canvasJson ||
       p.pendingImportData ||
       p.pendingDecomposedData ||
       !canvasKeyForPage(p),
   );
+  console.log('[isNoteHydrated]', note?.id, '=>', result, 'pages:', note?.pages?.map(p => ({ id: p.id, hasCanvas: !!p.canvasJson, hasPending: !!p.pendingImportData, key: canvasKeyForPage(p) })));
+  return result;
 }
 
 function saveNotes() {
@@ -691,13 +707,16 @@ async function render() {
   const note = getActiveNote();
   const previousNoteId = activeId;
 
+  console.log('[render] activeId:', activeId, 'note:', note?.id, 'isLoading:', isLoading);
   if (note) {
     // Lazy hydration: only load this notebook's page payloads when opening it.
     if (!isNoteHydrated(note)) {
       isLoading = true;
       loadingMessage = "Opening notebook…";
       renderLoading();
+      console.log('[render] Calling hydrateNote for', note.id);
       await hydrateNote(note);
+      console.log('[render] hydrateNote completed for', note.id);
       isLoading = false;
     }
     // Preserve zoom across same-notebook re-renders (e.g. add/delete page,
@@ -708,6 +727,7 @@ async function render() {
     app.innerHTML = editorView(note);
     await initEditor(note);
   } else {
+    console.log('[render] No active note, showing library');
     hideZoomWindow();
     canvasEngines.forEach((engine) => engine?.destroy());
     canvasEngines = [];
@@ -722,10 +742,13 @@ async function render() {
       document.removeEventListener("click", outsideClickHandler);
       outsideClickHandler = null;
     }
+    if (editorKeyHandler) {
+      window.removeEventListener("keydown", editorKeyHandler);
+      editorKeyHandler = null;
+    }
     app.innerHTML = libraryView();
     bindLibraryEvents();
   }
-
 
   renderLoading();
 }
@@ -2149,8 +2172,12 @@ async function makeAllPagesEditable() {
   const note = getActiveNote();
   if (!note) return;
 
-  // Make sure the page on screen is serialized before its record is rewritten.
-  saveActiveCanvasPage();
+  // Flush ALL live engines before the conversion loop so no engine is left
+  // holding stale annotate-mode canvas data that would race with the handoff.
+  for (const engine of canvasEngines) {
+    if (engine) saveEngineToPage(engine);
+  }
+  saveNotes();
 
   const targets = (note.pages || [])
     .map((page, index) => ({ page, index }))
@@ -2168,7 +2195,7 @@ async function makeAllPagesEditable() {
 
     try {
       const { status } = await rebuildPageAsEditable(note, page, {
-        instantiate: index === currentIndex,
+        instantiate: !!canvasEngines[index],
       });
       if (status === "rebuilt") rebuilt++;
       else failed++;
