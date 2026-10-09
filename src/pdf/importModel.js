@@ -15,7 +15,6 @@
 import {
   Circle,
   Ellipse,
-  FabricImage,
   Group,
   IText,
   Line,

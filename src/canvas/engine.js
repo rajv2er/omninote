@@ -15,7 +15,6 @@ import { getAssetUrl } from "../storage/assets.js";
 import { renderPdfPageBlob } from "../pdf/raster.js";
 import {
   IMPORT_OBJECT_PROPS,
-  PLACEHOLDER_IMAGE_SRC,
   compactCanvasJson,
   hydrateCanvasJson,
   legacyCandidatesFromDecomposed,
