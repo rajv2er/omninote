@@ -20,7 +20,9 @@ function openDb() {
   if (dbPromise) return dbPromise;
 
   dbPromise = new Promise((resolve, reject) => {
+    console.log('[openDb] Opening IndexedDB...');
     if (typeof indexedDB === "undefined") {
+      console.error('[openDb] IndexedDB is unavailable');
       reject(new Error("IndexedDB is unavailable in this browser"));
       return;
     }
@@ -28,14 +30,24 @@ function openDb() {
     const request = indexedDB.open(DB_NAME, DB_VERSION);
 
     request.onupgradeneeded = () => {
+      console.log('[openDb] Upgrade needed');
       const db = request.result;
       if (!db.objectStoreNames.contains(STORE)) {
         db.createObjectStore(STORE);
       }
     };
 
-    request.onsuccess = () => resolve(request.result);
-    request.onerror = () => reject(request.error);
+    request.onsuccess = () => {
+      console.log('[openDb] Success');
+      resolve(request.result);
+    };
+    request.onerror = () => {
+      console.error('[openDb] Error:', request.error);
+      reject(request.error);
+    };
+    request.onblocked = () => {
+      console.warn('[openDb] Blocked');
+    };
   });
 
   return dbPromise;
