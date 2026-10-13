@@ -35,6 +35,8 @@ const ALL_SPECS = [
   "picker.spec.mjs",
   "editorSelect.spec.mjs",
   "slidingWindow.spec.mjs",
+  // On-demand diagnosis with a real-world PDF (needs OMNI_DARK_PDF set).
+  "darkThumbs.spec.mjs",
 ];
 
 const filter = process.argv[2];

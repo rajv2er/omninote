@@ -36,6 +36,18 @@ export default [
     rules: { "no-undef": "error" },
   },
   {
+    // Dot-prefixed throwaway probes in scripts/ run in Node but ship
+    // `page.evaluate` callbacks to the browser, so both global sets apply.
+    // (The `scripts/**/*.mjs` pattern above does not match dotfiles.)
+    files: ["scripts/.*.mjs"],
+    languageOptions: {
+      ecmaVersion: "latest",
+      sourceType: "module",
+      globals: { ...globals.node, ...globals.browser },
+    },
+    rules: { "no-undef": "error" },
+  },
+  {
     // Test files run in Node but their `page.evaluate` callbacks are shipped
     // to the browser, so both global sets legitimately apply.
     files: ["tests/**/*.mjs"],

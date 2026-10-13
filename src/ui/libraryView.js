@@ -199,6 +199,10 @@ export function libraryView({
               ${icon("plus", 16)}
               New Note
             </button>
+            <!-- TEMP-DIAG: one-click diagnostics for the white-page investigation. Remove after. -->
+            <button class="new-note-btn" id="diag-btn" title="Download notebook diagnostics JSON">
+              Diag
+            </button>
           </div>
         </header>
 

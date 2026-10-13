@@ -9,6 +9,14 @@
   display: flex;
   flex-direction: column;
   /*
+   * The app sets scrollTop programmatically (focusPage/settle) while engine
+   * mounts resize content inside the wrappers. The browser's scroll anchoring
+   * "corrects" those resizes with its own jumps — observed as an instant
+   * +1056px leap with no JS writer — fighting every programmatic scroll, so
+   * it stays off here.
+   */
+  overflow-anchor: none;
+  /*
    * `safe` keeps a zoomed-in page reachable: plain `center` on an over-wide
    * item pushes half of it past the left edge, and the scroll container cannot
    * scroll to negative offsets — so the left of the page becomes unreachable
@@ -128,6 +136,16 @@
   -webkit-user-drag: none;
   user-select: none;
   pointer-events: none;
+}
+
+/*
+ * Author `display` rules beat the UA `[hidden] { display: none }`, so without
+ * this the preview is laid out even on live pages — a full-page white sheet
+ * stacked under every canvas, with a correct page counter. That was the
+ * "extra white pages" report.
+ */
+.page-thumbnail[hidden] {
+  display: none;
 }
 
 /* Paper Textures */
