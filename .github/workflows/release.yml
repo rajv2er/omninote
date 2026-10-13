@@ -1,0 +1,68 @@
+name: Release
+
+# Builds the signed-less desktop bundles and attaches them to a GitHub Release.
+#
+# Trigger a release by pushing a version tag:
+#   git tag v0.1.0 && git push origin v0.1.0
+#
+# Or run it manually from the Actions tab (Release -> Run workflow) with a tag
+# name, which is useful for a dry run without touching your local repo.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v0.1.0)"
+        required: true
+        default: "v0.1.0"
+
+permissions:
+  contents: write # create releases and upload assets
+
+jobs:
+  release:
+    # Apple Silicon. Add `macos-15-intel` to a matrix to also ship Intel dmg.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      # Stable Rust; the app only uses stable features (rust-version 1.77.2).
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      # Caches ~/.cargo and src-tauri/target between runs.
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - run: npm ci
+
+      # Runs `npm run build` (beforeBuildCommand) then bundles, then uploads
+      # every bundle (.app, .dmg) to the release.
+      - name: Build and release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ github.event.inputs.tag || github.ref_name }}
+          releaseName: "OmniNote v__VERSION__"
+          releaseBody: |
+            See the assets below to download OmniNote for macOS.
+
+            **Install:** open the `.dmg` and drag OmniNote to Applications.
+            Because this build is not notarised with an Apple Developer ID,
+            macOS Gatekeeper will refuse it on first open — right-click the app
+            and choose **Open**, or run
+            `xattr -dr com.apple.quarantine /Applications/OmniNote.app`.
+          releaseDraft: false
+          prerelease: false
