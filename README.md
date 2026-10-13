@@ -1,341 +1,48 @@
 # OmniNote
 
-OmniNote is a local-first desktop application (packaged with **Tauri v2** and Rust) and web notebook app for macOS.
+OmniNote is a local-first notebook app for macOS, available as a native desktop app (Tauri v2) and in the browser.
 
-Its purpose is simple: let someone move exported notebooks from Goodnotes, Notability, and similar apps into a clean canvas where they can keep writing and gradually make imported material editable.
+Import a note PDF, keep its look, and keep writing on top of it. Where possible, imported text, images, and vector content stays editable.
 
-It is **not** a general Canva clone, a document-management suite, or a feature-heavy Goodnotes replacement.
+## Features
 
-## Product promise
+- Notebook library with folders, pin, trash, and restore
+- Multi-page canvas with pen, highlighter, eraser, select, text, and image tools
+- PDF import with editable text / vector recovery and image fallback
+- Undo / redo, page manager, and PDF export
+- Offline local storage (IndexedDB), no account needed
 
-> Import a note PDF, keep its appearance, write on it immediately, and unlock editable imported objects whenever the file contains recoverable data.
+## Quick start
 
-The first release prioritizes a calm, Noteful-like notebook experience. The single meaningful differentiator is migration: Goodnotes/Notability exports should not become permanently dead documents when OmniNote can recover their content.
-
-## Visual direction
-
-The supplied references define the product's visual density and screen structure:
-
-- [Library reference](/Users/rajveer/Desktop/Screenshot%202026-09-07%20at%205.59.29%E2%80%AFAM.png)
-- [Notebook reference](/Users/rajveer/Desktop/Screenshot%202026-09-07%20at%205.59.38%E2%80%AFAM.png)
-
-Use them as inspiration for spacing and information hierarchy. Do not copy Noteful's logo, artwork, icon set, exact UI, source code, private file format, or branding.
-
-### Library
-
-The library has one quiet sidebar and one content area.
-
-```text
-┌───────────────────┬──────────────────────────────────────────────────┐
-│ OmniNote          │ omninote                         Import PDF  New │
-│                   │                                                  │
-│ ▦ Notebooks       │ ▱ Unfiled                                        │
-│ ◌ Unfiled         │                                                  │
-│ ♧ Pinned          │ YOUR NOTES                                       │
-│ ♲ Trash           │ [ notebook thumbnail ] [ notebook thumbnail ]    │
-│                   │                                                  │
-│ FOLDERS           │                                             (+)  │
-│ + New folder      │                                                  │
-└───────────────────┴──────────────────────────────────────────────────┘
-```
-
-Only these destinations exist in the first release:
-
-- Unfiled
-- Pinned
-- Trash
-- Folders
-
-### Notebook
-
-```text
-┌──────────────────────────────────────────────────────────────────────┐
-│ ‹   Notebook title                                      ▦        ••• │
-├───┬──────────────────────────────────────────────────────────────────┤
-│ ✎ │                                                                  │
-│ ▰ │                         page canvas                              │
-│ ◇ │                                                                  │
-│ ⌁ │                                                                  │
-│ T │                                                                  │
-│ ▧ │                                                                  │
-├───┴──────────────────────────────────────────────────────────────────┤
-│ Draw or click anywhere                                    4 px ───  │
-└──────────────────────────────────────────────────────────────────────┘
-```
-
-The UI must remain sparse. The tool rail is the primary way to switch modes; contextual actions appear only after selecting an object.
-
-## Scope & Capabilities
-
-### Included
-
-- **Native Desktop App**: Packaged via **Tauri v2** (`src-tauri/`) with a native macOS window, capabilities, and system menu.
-- **Local Notebook Library**: Create, rename, pin, trash, restore, and folder organization.
-- **Multi-page Canvas**: Dynamic multi-page notebook model with Noteful-style Page Manager (reorder, rotate, cut/copy/paste, tag, extract).
-- **Tools**: Pen (4 styles: ballpoint, fountain, brush, monoline), marker/highlighter, object eraser, selection, text, and image tools.
-- **Color & Stroke Controls**: Custom color swatches, palette popup, color picker, and stroke-width presets.
-- **Input**: Pointer input (mouse, trackpad, stylus where available with pressure support).
-- **Editable PDF Import (Level B)**: Decomposes imported PDFs into editable text, vector stroke groups, and images, with fallback raster support and import diagnostic reports.
-- **Magnified Writing Strip**: Docked Noteful-style zoom window mirroring the live canvas.
-- **Storage & Offline Persistence**: Local persistence using browser storage and IndexedDB with unload transaction safety (`pagehide`/`visibilitychange` flushes). Deep garbage collection on delete.
-- **Undo / Redo**: Canvas history snapshots.
-- **Export to PDF**: High-resolution vector and image export via `pdf-lib`.
-- **Automated Regression Suite**: Playwright Core test suite (`npm test`) and ESLint (`npm run lint`).
-
-### Explicitly out of scope
-
-- Accounts, cloud sync, collaboration, sharing links, and comments.
-- AI chat, summaries, generation, audio recording, handwriting recognition, OCR search, or flashcards.
-- Template marketplace, stock asset library, stickers, elaborate brushes, rulers, tape, laser pointers, and dozens of colour presets.
-- A native Goodnotes/Notability backup importer. Their native formats are proprietary.
-- A promise that every PDF becomes perfectly editable.
-- Copying Noteful or Canva's proprietary implementation or visual identity.
-
-## Development & Execution
-
-### Web Mode (Vite)
+### Web (Vite)
 
 ```bash
 npm install
-npm run dev        # Starts Vite dev server at http://localhost:5173
-npm run build      # Builds web production bundle in dist/
-npm run lint       # Runs ESLint across src, scripts, and tests
-npm test           # Runs Playwright regression tests
+npm run dev      # http://localhost:5173
 ```
 
-### Desktop Mode (Tauri v2)
+### Desktop (Tauri v2)
 
 ```bash
-npm run tauri dev    # Runs the native macOS desktop app with hot-reloading
-npm run tauri build  # Compiles native macOS binary / bundle
+npm run tauri dev    # dev app with hot-reload
+npm run tauri build  # release bundle
 ```
 
-## Technical approach
+## Scripts
 
-### Platform
+```bash
+npm run build    # build web bundle to dist/
+npm run lint     # run ESLint
+npm test         # run tests in tests/run.mjs
+```
 
-Packaged as a native desktop application with Tauri v2 (Rust backend + WebKit/Vite frontend) while maintaining complete zero-install browser compatibility. Pointer Events are used natively for smooth stylus, trackpad, and mouse input.
-
-Use Pointer Events rather than mouse-only events so stylus support is not designed out of the canvas.
-
-### Storage
-
-Do not keep every original imported PDF by default.
-
-| Data | Storage | Reason |
-|---|---|---|
-| Notebook metadata and native object graph | Local persistence | Small and quickly queryable |
-| Images and imported page fallback backgrounds | IndexedDB blobs | Avoids `localStorage` size limits |
-| Render cache | Disposable | Regenerate it; never treat it as user data |
-| Original PDF | Optional only | Retain only if the user wants exact-source fidelity |
-
-If OmniNote cannot reconstruct a source item, it has only two honest options: retain a visual fallback for it, or let the user discard that item. It cannot promise both zero retained visual data and perfect visual fidelity.
-
-### Internal document model
-
-The app should own a native object model, not continually edit PDF bytes.
+## Project structure
 
 ```text
-Notebook
-├── id, title, createdAt, pinned, folderId
-└── pages[]
-    ├── id, width, height, backgroundAssetId?
-    ├── objects[]
-    │   ├── stroke       { points, colour, width, opacity }
-    │   ├── text         { text, x, y, width, font, size, colour }
-    │   ├── image        { assetId, x, y, width, rotation }
-    │   ├── shape        { kind, geometry, style }
-    │   └── vectorGroup  { SVG/PDF paths, transform, style }
-    └── importReport     { source?, extracted, grouped, fallback }
+index.html       App entry
+src/main.js      UI, canvas, storage, PDF import
+src/             Canvas, PDF, storage, UI modules
+src-tauri/       Tauri desktop shell (Rust)
+tests/           Test runner and regression tests
+scripts/         Dev / fixture scripts
 ```
-
-All coordinates belong to the page coordinate system, not screen pixels. Zoom, pan, screen resolution, and device pixel ratio must not change document data.
-
-### Canvas layers
-
-```text
-top      selection controls / active transform box
-         native text, image, shape, vector-group objects
-         native ink strokes
-bottom   optional imported-page fallback image
-```
-
-The fallback layer is locked. It should never accidentally intercept pen input or object selection.
-
-## PDF migration strategy
-
-### The supported input is an export
-
-OmniNote targets PDFs exported from note-taking platforms, especially Goodnotes and Notability. It does not require the native proprietary notebook files.
-
-Goodnotes has an **Editable PDF** option. Its published documentation says this can preserve handwriting, highlighting, text boxes, and images as selectable/movable/resizable PDF objects. A flattened export does not preserve that portability. See [Goodnotes' format documentation](https://support.goodnotes.com/hc/en-us/articles/8537070839183-Differences-between-Editable-and-Flattened-PDF-Formats).
-
-Notability exports PDF, Note, JPEG, PNG, and NTB formats, but its native export formats should be treated as proprietary rather than a stable import contract. See [Notability's sharing documentation](https://support.gingerlabs.com/hc/en-us/articles/205228298-Sharing-Notes).
-
-### Import levels
-
-| Level | Input/result | User experience |
-|---|---|---|
-| A — page background | Any PDF | Page is rendered; write and place native objects over it |
-| B — extracted objects | Digitally authored/exported PDF | Recover text, images, vector paths, highlights; select and transform them |
-| C — reconstruction | Flattened/scanned content | Optional OCR or vision-assisted reconstruction; never claim perfect accuracy |
-
-Level A is implemented as the safety net. Level B is the important differentiator. Level C is later and optional.
-
-### Import pipeline
-
-```text
-PDF file
-  │
-  ├─ inspect page/resources
-  ├─ extract native candidates: text, embedded images, vector paths, annotations
-  ├─ classify: editable / grouped / fallback
-  ├─ render any required fallback region to compressed WebP
-  ├─ write native OmniNote page objects + fallback assets
-  └─ discard original PDF unless “Keep original” was chosen
-```
-
-The importer must provide a concise report, for example:
-
-```text
-Imported 12 pages
-• 38 text boxes editable
-• 146 handwriting/vector groups movable and recolourable
-• 3 visual fallback regions
-• Original PDF not retained
-```
-
-### What “editable” means
-
-For imported Goodnotes/Notability content, editable does **not** always mean restoring the exact original pen gesture, pressure curve, eraser history, or brush preset. A PDF often contains only final geometry.
-
-The practical goal is:
-
-- Move, scale, rotate, recolour, duplicate, delete, and arrange recovered objects.
-- Edit actual text where the font/text data is available.
-- Keep complex handwriting as a sensible `vectorGroup`, rather than turning every tiny path into an unusable individual object.
-- Make all new OmniNote ink fully native and editable at stroke level.
-
-## Interaction rules
-
-### Tools
-
-| Tool | Behaviour |
-|---|---|
-| Pen | Draw a native pressure-aware stroke |
-| Highlighter | Draw a wide translucent native stroke |
-| Eraser | Remove touched native strokes/objects; never damage the locked fallback layer |
-| Select | Tap or drag-select objects, then move/resize/rotate/delete/group |
-| Text | Click anywhere to place a text box |
-| Image | Place a local image as an object |
-
-### Selection
-
-- Click/tap selects the topmost eligible object.
-- Shift-click adds to selection on desktop.
-- Dragging empty space makes a marquee selection.
-- A selected group can be entered to select a child; grouping remains intact.
-- Transform controls appear only while something is selected.
-- Delete affects native objects, not fallback content.
-
-### Input and performance
-
-- Use `PointerEvent.pressure` when present; fall back to a stable width when it is not.
-- Smooth input during drawing, but retain enough raw points to preserve handwriting quality.
-- Use `requestAnimationFrame` for visual updates; save after a short debounce instead of on every pointer move.
-- Render only visible pages once multiple-page notebooks exist.
-
-## Design rules
-
-- Dark shell, white/off-white paper, blue/purple accent only for active actions.
-- Keep library cards small, with the page itself as the thumbnail.
-- Avoid visible panels until the user asks for an action.
-- Tool labels belong in hover tooltips, not permanently in the toolbar.
-- Use clear, familiar symbols, but use original icon assets in a production build.
-- Maintain good contrast and keyboard access; the app is not pen-only.
-
-## Delivery phases
-
-### Phase 0 — current walking skeleton
-
-- Browser shell, library, editor, basic local persistence.
-- Native pen/highlighter/text/image objects.
-- PDF page-background import with source discarded.
-
-### Phase 1 — dependable notebook editing
-
-- Proper multi-page notebook model.
-- Select, move, resize, rotate, delete, copy/paste, group/ungroup.
-- Reliable eraser, undo/redo command history, pin/trash/folders.
-- Page thumbnails and PDF export.
-
-### Phase 2 — editable migration
-
-- Inspect Goodnotes Editable PDF samples.
-- Extract text, images, vector paths, and PDF annotations.
-- Build `vectorGroup` objects and import report.
-- Retain fallback only for unsupported elements.
-
-### Phase 3 — optional recovery enhancements
-
-- Text OCR for flattened PDFs.
-- Vision-assisted segmentation for simple diagrams or graphics.
-- User-controlled “Keep original PDF” option.
-
-Do not begin Phase 3 until Phase 1 is dependable and Phase 2 has been tested against real exports.
-
-## Test corpus
-
-Build and maintain a private test set containing only documents the project has permission to use:
-
-- Goodnotes Editable PDF: handwriting, highlighter, typed text, image, shape, imported slides.
-- Goodnotes Flattened PDF of the same content.
-- Notability PDF exports.
-- A scanned handwritten page.
-- A lecture slide deck annotated with ink.
-- Multiple page sizes and orientations.
-- A large notebook with at least 100 pages.
-
-For every sample, compare:
-
-1. visual appearance after import;
-2. which objects became editable;
-3. page load and drawing latency;
-4. resulting local storage size;
-5. exported-PDF appearance.
-
-## Acceptance criteria
-
-The focused v1 is ready for real use when a person can:
-
-1. Import a typical exported note PDF without losing page appearance.
-2. Open it quickly from the library.
-3. Write smoothly with a mouse, trackpad, or available stylus.
-4. Add and move a text box and image.
-5. Erase their own additions without altering the imported page.
-6. Close and reopen the browser without losing the notebook.
-7. Export or print the annotated result.
-
-The editable-import milestone is ready when a Goodnotes Editable PDF sample produces movable/recolourable vector groups and editable text without visible layout regressions.
-
-## Repository map
-
-```text
-index.html          App entry point
-src/main.js         UI, state, canvas input, local storage, PDF rendering
-src/style.css       Minimal dark library and white-page editor styles
-package.json        Vite commands and dependencies
-```
-
-## Decisions log
-
-| Decision | Reason |
-|---|---|
-| macOS browser first | Fastest way to get a usable app matching the desktop references |
-| Local-first | No account, sync, or backend complexity in v1 |
-| Minimal tool set | The reference UI is intentionally sparse; feature volume is not the goal |
-| Original PDF optional | Avoid duplicate storage; keep only when exact-source fidelity is important |
-| PDF background before object recovery | Every PDF remains usable even when extraction fails |
-| Goodnotes Editable PDF first | It is the clearest public path to portable PDF objects |
-| Independent implementation | Learn from product patterns without copying proprietary code or assets |
-
