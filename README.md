@@ -28,6 +28,39 @@ npm run tauri dev    # dev app with hot-reload
 npm run tauri build  # release bundle
 ```
 
+### Install on macOS
+
+1. Open the `.dmg` from Releases and drag OmniNote to Applications.
+2. Try to open it. If macOS says `"OmniNote" is damaged and can't be opened` or `unverified developer`, run this once in Terminal:
+
+```bash
+xattr -dr com.apple.quarantine /Applications/OmniNote.app
+codesign --force --deep -s - /Applications/OmniNote.app
+```
+
+3. Open OmniNote normally from Finder / Launchpad.
+
+Or in one go (does the same two commands + verify):
+
+```bash
+bash scripts/fix-macos.sh
+```
+
+One-command install of the latest release:
+
+```bash
+REPO=rajv2er/omninote bash scripts/install-mac.sh
+```
+
+Still blocked? System Settings > Privacy & Security > Open Anyway.
+
+Why this step? This is a free ad-hoc signed build (`APPLE_SIGNING_IDENTITY="-"`), not Apple-notarised. Apple only skips Gatekeeper for $99/yr notarised apps.
+
+### No install (web)
+
+Same notebook, no Gatekeeper: `npm run build`, then host `dist/` anywhere
+(GitHub Pages, Netlify, `npm run preview`). No account, data stays in IndexedDB.
+
 ## Scripts
 
 ```bash
