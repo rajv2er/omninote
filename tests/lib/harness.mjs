@@ -14,7 +14,7 @@ import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
-import { chromium } from "playwright-core";
+import { chromium, webkit } from "playwright-core";
 
 const execFileAsync = promisify(execFile);
 
@@ -44,6 +44,13 @@ export function resolveBrowserPath() {
 }
 
 export function launchBrowser() {
+  // OMNI_ENGINE=webkit runs specs under WebKit (the Tauri/WKWebView engine).
+  // Known limitation: Playwright cannot inject real file bytes into WebKit
+  // file inputs, so any spec that imports a file stalls at setInputFiles.
+  // Useful only for boot/render smoke, not for import flows.
+  if (process.env.OMNI_ENGINE === "webkit") {
+    return webkit.launch({ headless: !process.env.OMNI_HEADED });
+  }
   return chromium.launch({
     executablePath: resolveBrowserPath(),
     headless: !process.env.OMNI_HEADED,

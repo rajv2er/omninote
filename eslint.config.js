@@ -11,7 +11,7 @@ export default [
     languageOptions: {
       ecmaVersion: "latest",
       sourceType: "module",
-      globals: { ...globals.browser },
+      globals: { ...globals.browser, __APP_VERSION__: "readonly" },
     },
     rules: {
       "no-undef": "error",
@@ -32,6 +32,18 @@ export default [
       ecmaVersion: "latest",
       sourceType: "module",
       globals: { ...globals.node },
+    },
+    rules: { "no-undef": "error" },
+  },
+  {
+    // Dot-prefixed throwaway probes in scripts/ run in Node but ship
+    // `page.evaluate` callbacks to the browser, so both global sets apply.
+    // (The `scripts/**/*.mjs` pattern above does not match dotfiles.)
+    files: ["scripts/.*.mjs"],
+    languageOptions: {
+      ecmaVersion: "latest",
+      sourceType: "module",
+      globals: { ...globals.node, ...globals.browser },
     },
     rules: { "no-undef": "error" },
   },

@@ -42,6 +42,7 @@ import {
   putAsset,
   putAssetFromDataUrl,
   deleteAssets,
+  getAsset,
   getAssetUrl,
   collectNoteAssetIdsDeep,
   collectPageAssetIdsDeep,
@@ -65,15 +66,13 @@ import {
 } from "./ui/dialogs.js";
 import {
   libraryView as renderLibraryHtml,
-  sidebar as renderSidebarHtml,
-  noteCard as renderNoteCardHtml,
   renderFontOptions as renderFontOptionsHtml,
-  STANDARD_FONTS,
 } from "./ui/libraryView.js";
 import {
   pageManagerTilesHtml as renderPageManagerTilesHtml,
   pageManagerOverlay as renderPageManagerOverlay,
 } from "./ui/pageManagerView.js";
+import { checkForUpdates, autoCheckForUpdates } from "./updater.js";
 
 const STORE_KEY = "omninote-notes-v2";
 const FOLDERS_KEY = "omninote-folders";
@@ -138,6 +137,25 @@ const pageHistoryCache = new Map(); // pageId -> { history, historyIndex }
 // cached per page and only dropped when that page's content changes.
 const staticThumbCache = new Map(); // pageId -> data URL
 const STATIC_THUMB_WIDTH = 320;
+/**
+ * Visibility margin a neighbouring page must clear before it dethrones the
+ * current page. Without it the scroll observer flaps between two pages near
+ * 50/50 visibility, and every flap destroys and remounts live engines.
+ */
+const ACTIVE_PAGE_HYSTERESIS = 0.15;
+// Recent engine-mount failures (page index, message, timestamp), newest last,
+// capped so a pathological page cannot grow memory. Surfaced in the TEMP-DIAG
+// dump because the Tauri WebView has no visible console.
+const mountErrors = [];
+function recordMountError(index, err) {
+  mountErrors.push({
+    pageIndex: index,
+    message: String(err?.message || err),
+    at: Date.now(),
+  });
+  while (mountErrors.length > 20) mountErrors.shift();
+}
+
 // Bumped on every editor render so a superseded render's pending awaits can
 // bail out instead of writing engines into the view that replaced it.
 let editorInitToken = 0;
@@ -148,6 +166,11 @@ let engineWindowChain = Promise.resolve();
 // observer and another document-level click handler.
 let scrollObserver = null;
 let outsideClickHandler = null;
+// Same for the editor keyboard shortcuts: bindEditorEvents runs on every
+// render, so the previous window-level handler must be removed first.
+// (Missing this declaration once crashed every return to the library with
+// `ReferenceError: editorKeyHandler is not defined`.)
+let editorKeyHandler = null;
 let currentTool = "select";
 let currentColor = "#176a72";
 let currentWidth = 4;
@@ -580,49 +603,43 @@ async function hydrateNote(note) {
   for (const page of note.pages) {
     const canvasKey = canvasKeyForPage(page);
     if (canvasKey && !page.canvasJson) {
-      console.log('[hydrateNote] Loading canvas for page', page.id, 'key:', canvasKey);
       jobs.push(
         getPagePayload(canvasKey)
           .then((json) => {
-            console.log('[hydrateNote] Got canvas for page', page.id, json ? 'ok' : 'empty');
             if (typeof json === "string") {
               page.canvasJson = JSON.parse(json);
               persistedPayloads.set(canvasKey, json);
             }
           })
           .catch((err) => {
-            console.error('[hydrateNote] Error loading canvas for page', page.id, err);
+            console.error("[hydrateNote] Error loading canvas for page", page.id, err);
           }),
       );
     }
 
     const pendingKey = pendingKeyForPage(page);
-    if (
-      pendingKey &&
-      !page.canvasJson &&
-      !page.pendingImportData &&
-      !page.pendingDecomposedData
-    ) {
-      console.log('[hydrateNote] Loading pending for page', page.id, 'key:', pendingKey);
+    // Load the handoff whenever it is not already in memory — even when a
+    // canvas graph is present. A teardown save can persist an empty graph for
+    // a page whose handoff was never consumed; skipping the handoff then
+    // strands it in IndexedDB while the page reopens blank forever. loadPage
+    // already layers both sources, so loading both is always safe.
+    if (pendingKey && !page.pendingImportData && !page.pendingDecomposedData) {
       jobs.push(
         getPagePayload(pendingKey)
           .then((json) => {
-            console.log('[hydrateNote] Got pending for page', page.id, json ? 'ok' : 'empty');
             if (typeof json === "string") {
               page.pendingImportData = JSON.parse(json);
               persistedPayloads.set(pendingKey, json);
             }
           })
           .catch((err) => {
-            console.error('[hydrateNote] Error loading pending for page', page.id, err);
+            console.error("[hydrateNote] Error loading pending for page", page.id, err);
           }),
       );
     }
   }
 
-  console.log('[hydrateNote] Waiting for', jobs.length, 'jobs');
   await Promise.all(jobs);
-  console.log('[hydrateNote] Done');
 }
 
 /**
@@ -637,15 +654,13 @@ async function hydrateNotes() {
 
 /** True when the notebook's page payloads have already been loaded. */
 function isNoteHydrated(note) {
-  const result = (note.pages || []).every(
+  return (note.pages || []).every(
     (p) =>
       p.canvasJson ||
       p.pendingImportData ||
       p.pendingDecomposedData ||
       !canvasKeyForPage(p),
   );
-  console.log('[isNoteHydrated]', note?.id, '=>', result, 'pages:', note?.pages?.map(p => ({ id: p.id, hasCanvas: !!p.canvasJson, hasPending: !!p.pendingImportData, key: canvasKeyForPage(p) })));
-  return result;
 }
 
 function saveNotes() {
@@ -707,16 +722,13 @@ async function render() {
   const note = getActiveNote();
   const previousNoteId = activeId;
 
-  console.log('[render] activeId:', activeId, 'note:', note?.id, 'isLoading:', isLoading);
   if (note) {
     // Lazy hydration: only load this notebook's page payloads when opening it.
     if (!isNoteHydrated(note)) {
       isLoading = true;
       loadingMessage = "Opening notebook…";
       renderLoading();
-      console.log('[render] Calling hydrateNote for', note.id);
       await hydrateNote(note);
-      console.log('[render] hydrateNote completed for', note.id);
       isLoading = false;
     }
     // Preserve zoom across same-notebook re-renders (e.g. add/delete page,
@@ -727,7 +739,6 @@ async function render() {
     app.innerHTML = editorView(note);
     await initEditor(note);
   } else {
-    console.log('[render] No active note, showing library');
     hideZoomWindow();
     canvasEngines.forEach((engine) => engine?.destroy());
     canvasEngines = [];
@@ -831,20 +842,6 @@ function libraryView() {
     noteCount,
     folderPrefix: FOLDER_PREFIX,
   });
-}
-
-function sidebar() {
-  return renderSidebarHtml({
-    notes,
-    folders,
-    activeFolder,
-    noteCount,
-    folderPrefix: FOLDER_PREFIX,
-  });
-}
-
-function noteCard(note, view) {
-  return renderNoteCardHtml(note, view, folders);
 }
 
 function renderFontOptions(note) {
@@ -1127,17 +1124,23 @@ function editorView(note) {
           </div>
         </nav>
 
-        <!-- Canvas Viewport -->
+        <!-- Canvas Viewport.
+             Each wrapper reserves its page's exact on-screen box up front so
+             mounting or disposing an engine never moves the pages below it.
+             Without the reserved box, showing/hiding the static preview shifts
+             every following offsetTop, and a programmatic scroll measured
+             before the shift lands on the wrong page. -->
         <section class="canvas-wrap" id="canvas-scroll-container">
           ${note.pages
-            .map(
-              (p, i) => `
-            <div class="page-container" id="page-wrapper-${i}" data-index="${i}">
+            .map((p, i) => {
+              const box = pageDisplaySize(p);
+              return `
+            <div class="page-container" id="page-wrapper-${i}" data-index="${i}" style="width:${box.width}px;height:${box.height}px">
               <canvas id="omni-canvas-${i}"></canvas>
               <img id="omni-thumb-${i}" class="page-thumbnail" alt="Page ${i + 1}" hidden />
             </div>
-          `,
-            )
+          `;
+            })
             .join("")}
         </section>
 
@@ -1808,8 +1811,12 @@ async function pmMakeEditable() {
       const { status } = await rebuildPageAsEditable(note, page, {
         instantiate: index === currentIndex,
       });
-      if (status === "rebuilt") rebuilt++;
-      else failed++;
+      if (status === "rebuilt") {
+        rebuilt++;
+      } else {
+        page.conversionState = "failed";
+        failed++;
+      }
     } catch (err) {
       page.conversionState = "failed";
       failed++;
@@ -2185,7 +2192,6 @@ async function makeAllPagesEditable() {
 
   if (targets.length === 0) return;
 
-  const currentIndex = note.currentPageIndex || 0;
   let rebuilt = 0;
   let failed = 0;
 
@@ -2197,8 +2203,14 @@ async function makeAllPagesEditable() {
       const { status } = await rebuildPageAsEditable(note, page, {
         instantiate: !!canvasEngines[index],
       });
-      if (status === "rebuilt") rebuilt++;
-      else failed++;
+      if (status === "rebuilt") {
+        rebuilt++;
+      } else {
+        // Nothing recoverable (a scan, a flattened export): leave the raster
+        // in place and say so, instead of leaving the page marked converting.
+        page.conversionState = "failed";
+        failed++;
+      }
     } catch (err) {
       page.conversionState = "failed";
       failed++;
@@ -2314,7 +2326,19 @@ async function initEditor(note) {
     thumbEl.hidden = true;
     thumbEl.removeAttribute("src");
 
-    const mounted = await createPageEngine(canvasEl, page, note, i);
+    let mounted = null;
+    try {
+      mounted = await createPageEngine(canvasEl, page, note, i);
+    } catch (err) {
+      // Same poison-page rule as the window update: fall back to the static
+      // preview for this page instead of aborting the whole editor setup.
+      console.error(`Could not mount page ${i}:`, err);
+      recordMountError(i, err);
+      canvasEl.hidden = true;
+      thumbEl.hidden = false;
+      setStaticPageThumbnail(thumbEl, page, note);
+      continue;
+    }
     if (token !== editorInitToken) {
       mounted.engine.destroy();
       return;
@@ -2362,18 +2386,50 @@ async function initEditor(note) {
   if (scrollContainer) {
     // Disconnect the previous render's observer before creating a new one.
     if (scrollObserver) scrollObserver.disconnect();
+    // Latest visibility per page across observer callbacks. A callback only
+    // delivers pages whose ratio *changed*, so crowning the max of a single
+    // batch flaps between neighbours sitting near 50/50 — and every flip
+    // destroys and remounts live engines. The table makes the decision global;
+    // the hysteresis margin below makes it sticky.
+    const pageVisibility = new Map();
+    // Synchronous ground truth for the incumbent page. The table can hold a
+    // stale zero for the current page while a neighbour's threshold-crossing
+    // arrives first; judging the switch on that stale value dethrones a page
+    // that is actually fully visible. Measuring the incumbent live on every
+    // decision closes the hole (one rect read per callback batch).
+    const measureRatio = (index) => {
+      const el = document.querySelector(`#page-wrapper-${index}`);
+      if (!el) return 0;
+      const c = scrollContainer.getBoundingClientRect();
+      const r = el.getBoundingClientRect();
+      const visible = Math.max(
+        0,
+        Math.min(r.bottom, c.bottom) - Math.max(r.top, c.top),
+      );
+      return visible / Math.max(1, r.height);
+    };
     scrollObserver = new IntersectionObserver(
       (entries) => {
-        let maxRatio = 0;
-        let mostVisibleIndex = note.currentPageIndex;
-        entries.forEach((entry) => {
-          if (entry.isIntersecting && entry.intersectionRatio > maxRatio) {
-            maxRatio = entry.intersectionRatio;
-            mostVisibleIndex = Number(entry.target.dataset.index);
+        for (const entry of entries) {
+          pageVisibility.set(
+            Number(entry.target.dataset.index),
+            entry.isIntersecting ? entry.intersectionRatio : 0,
+          );
+        }
+        const currentRatio = measureRatio(note.currentPageIndex);
+        let bestIndex = note.currentPageIndex;
+        let bestRatio = currentRatio;
+        for (const [index, ratio] of pageVisibility) {
+          if (
+            index !== note.currentPageIndex &&
+            ratio > bestRatio + ACTIVE_PAGE_HYSTERESIS
+          ) {
+            bestRatio = ratio;
+            bestIndex = index;
           }
-        });
-        if (mostVisibleIndex !== note.currentPageIndex) {
-          note.currentPageIndex = mostVisibleIndex;
+        }
+        if (bestIndex !== note.currentPageIndex) {
+          note.currentPageIndex = bestIndex;
           document.querySelector(".page-counter-text").textContent =
             `Page ${note.currentPageIndex + 1} of ${note.pages.length}`;
           // Update nav buttons disabled state
@@ -2402,12 +2458,19 @@ async function initEditor(note) {
       .querySelectorAll(".page-container")
       .forEach((el) => scrollObserver.observe(el));
 
-    // Scroll to the active page on load
+    // Scroll to the active page on load. This must land instantly: the
+    // workspace scrolls smoothly (see `.canvas-wrap`), and a fresh render
+    // starts at the top, so a smooth scroll here would animate all the way
+    // from page 1 to the active page (e.g. 1→6 when adding a page after 5).
+    // Same pattern as `restoreZoomAnchor` in viewport.js.
     const activeWrapper = document.querySelector(
       `#page-wrapper-${note.currentPageIndex}`,
     );
     if (activeWrapper) {
-      activeWrapper.scrollIntoView();
+      const prevBehavior = scrollContainer.style.scrollBehavior;
+      scrollContainer.style.scrollBehavior = "auto";
+      activeWrapper.scrollIntoView({ block: "start" });
+      scrollContainer.style.scrollBehavior = prevBehavior;
     }
   }
   syncToolbarForActivePage();
@@ -2521,10 +2584,9 @@ function pageDisplaySize(page) {
  * sliding window. This keeps long notebooks memory-flat: only the current page
  * and its neighbours get a full OmniCanvas engine.
  *
- * The preview doubles as the page's layout box — the engine has been disposed,
- * so nothing else gives the wrapper its size. It is therefore laid out at the
- * exact size a live canvas would have, and cached per page so scrolling does
- * not re-rasterize every off-window page on every window change.
+ * The wrapper already reserves the page's box (see editorView), so the
+ * preview only fills it. Previews are cached per page so scrolling does not
+ * re-rasterize every off-window page on every window change.
  */
 async function setStaticPageThumbnail(imgEl, page, note) {
   const { width, height } = pageDisplaySize(page);
@@ -2552,14 +2614,24 @@ async function setStaticPageThumbnail(imgEl, page, note) {
   }
 }
 
-/** Re-sizes every visible static preview after the zoom changes. */
+/**
+ * Re-lays out every page box after the zoom changes. Wrappers always carry
+ * their page's exact on-screen size so mounting or disposing an engine never
+ * shifts the pages below it (which used to send programmatic scrolls to the
+ * wrong page and flip the active page spuriously).
+ */
 function layoutStaticThumbnails() {
   const note = getActiveNote();
   if (!note) return;
   for (let i = 0; i < note.pages.length; i++) {
+    const { width, height } = pageDisplaySize(note.pages[i]);
+    const wrapEl = document.querySelector(`#page-wrapper-${i}`);
+    if (wrapEl) {
+      wrapEl.style.width = `${width}px`;
+      wrapEl.style.height = `${height}px`;
+    }
     const imgEl = document.querySelector(`#omni-thumb-${i}`);
     if (!imgEl || imgEl.hidden) continue;
-    const { width, height } = pageDisplaySize(note.pages[i]);
     imgEl.style.width = `${width}px`;
     imgEl.style.height = `${height}px`;
   }
@@ -2625,7 +2697,17 @@ async function updateEngineWindow(note) {
     }
 
     if (!canvasEngines[i]) {
-      const mounted = await createPageEngine(canvasEl, page, note, i);
+      let mounted = null;
+      try {
+        mounted = await createPageEngine(canvasEl, page, note, i);
+      } catch (err) {
+        // One poison page must never abort the whole window update and leave
+        // every page after it without an engine. The thumbnail stays visible
+        // for this page; the next window update retries the mount.
+        console.error(`Could not mount page ${i}:`, err);
+        recordMountError(i, err);
+      }
+      if (!mounted) continue;
       if (token !== editorInitToken) {
         mounted.engine.destroy();
         return;
@@ -3485,6 +3567,13 @@ function bindEditorEvents(note) {
     }
   };
 
+  // The previous render's handler must go before this one is added: without
+  // this, every render stacks another window-level listener and one Cmd+Z
+  // fires undo N times.
+  if (editorKeyHandler) {
+    window.removeEventListener("keydown", editorKeyHandler);
+  }
+  editorKeyHandler = onKeyDown;
   window.addEventListener("keydown", onKeyDown);
 }
 
@@ -3505,6 +3594,80 @@ async function hydrateThumbnails() {
 
 function bindLibraryEvents() {
   hydrateThumbnails();
+
+  // Manual update check (sidebar footer). Silent no-op outside the Mac app.
+  document
+    .querySelector("#check-updates-btn")
+    ?.addEventListener("click", () => checkForUpdates());
+
+  // TEMP-DIAG: one-click diagnostics for the white-page investigation.
+  // Downloads per-page record flags + asset byte sizes (no pixels).
+  // Remove together with the #diag-btn in libraryView.js.
+  document.querySelector("#diag-btn")?.addEventListener("click", async () => {
+    const diag = { exportedAt: Date.now(), activeId, mountErrors, notes: [] };
+    for (const n of notes) {
+      const entry = {
+        id: n.id,
+        title: n.title,
+        pages: n.pages.length,
+        currentPageIndex: n.currentPageIndex,
+        pdfAssetBytes: await getAsset(n.pdfAssetId)
+          .then((b) => (b ? b.size : null))
+          .catch(() => null),
+        pagesDetail: [],
+      };
+      for (const p of n.pages || []) {
+        const graph = p.canvasJson?.canvasData || p.canvasJson;
+        const handoff = p.pendingImportData || p.pendingDecomposedData;
+        let canvasPayloadBytes = null;
+        try {
+          const raw = await getPagePayload(canvasKeyForPage(p));
+          canvasPayloadBytes = typeof raw === "string" ? raw.length : raw ? -1 : null;
+        } catch {
+          canvasPayloadBytes = null;
+        }
+        let pendingPayloadBytes = null;
+        try {
+          const raw = await getPagePayload(pendingKeyForPage(p));
+          pendingPayloadBytes = typeof raw === "string" ? raw.length : raw ? -1 : null;
+        } catch {
+          pendingPayloadBytes = null;
+        }
+        entry.pagesDetail.push({
+          pageId: p.id,
+          pageNumber: p.pageNumber,
+          pdfPageIndex: p.pdfPageIndex,
+          editMode: p.editMode,
+          conversionState: p.conversionState,
+          fallbackVisible: p.fallbackVisible,
+          bgBytes: await getAsset(p.backgroundAssetId)
+            .then((b) => (b ? b.size : null))
+            .catch(() => null),
+          thumbBytes: await getAsset(p.thumbnailAssetId)
+            .then((b) => (b ? b.size : null))
+            .catch(() => null),
+          graphObjects: Array.isArray(graph?.objects) ? graph.objects.length : null,
+          graphLocked: Array.isArray(graph?.objects)
+            ? graph.objects.filter((o) => o.omniLocked).length
+            : null,
+          canvasPayloadBytes,
+          handoffObjects: Array.isArray(handoff?.objects) ? handoff.objects.length : null,
+          pendingPayloadBytes,
+          reportStatus: p.importReport?.status ?? null,
+        });
+      }
+      diag.notes.push(entry);
+    }
+    const blob = new Blob([JSON.stringify(diag, null, 1)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `omninote-diag-${Date.now()}.json`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 4000);
+  });
 
   document.querySelectorAll("[data-open]").forEach((card) => {
     card.addEventListener("click", () => {
@@ -3958,6 +4121,8 @@ if (import.meta.env.DEV) {
     getNotes: () => notes,
     getActiveId: () => activeId,
     getEngines: () => canvasEngines,
+    /** IndexedDB payload writes still in flight; tests drain these before a reload. */
+    pendingWrites: () => inFlightPayloads.size,
     /** Snapshot of every object on a page, for assertions. */
     inspectPage: (index) => {
       const engine = canvasEngines[index];
@@ -4001,4 +4166,8 @@ document.addEventListener("visibilitychange", () => {
 // wait for it — rendering early would show blank imported pages.
 hydrateNotes()
   .catch((err) => console.warn("Could not restore page data:", err))
-  .finally(() => render());
+  .finally(() => {
+    render();
+    // Silent daily update check (Mac app only; no-op in a browser).
+    autoCheckForUpdates();
+  });

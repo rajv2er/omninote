@@ -1,5 +1,6 @@
 import { icon } from "./icons.js";
 import { escapeHtml } from "./escapeHtml.js";
+import { appVersion } from "../updater.js";
 
 export const STANDARD_FONTS = [
   "DM Sans",
@@ -154,6 +155,14 @@ export function sidebar({ notes, folders, activeFolder, noteCount, folderPrefix 
         <span>New folder</span>
       </button>
     </nav>
+
+    <div class="side-footer">
+      <span class="side-version" title="Installed version">v${escapeHtml(appVersion())}</span>
+      <button class="side-update" id="check-updates-btn" title="Check for updates">
+        ${icon("download", 14)}
+        <span>Check for Updates</span>
+      </button>
+    </div>
   `;
 }
 
@@ -198,6 +207,10 @@ export function libraryView({
             <button class="new-note-btn" id="new-note-btn">
               ${icon("plus", 16)}
               New Note
+            </button>
+            <!-- TEMP-DIAG: one-click diagnostics for the white-page investigation. Remove after. -->
+            <button class="new-note-btn" id="diag-btn" title="Download notebook diagnostics JSON">
+              Diag
             </button>
           </div>
         </header>

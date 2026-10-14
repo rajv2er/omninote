@@ -11,8 +11,14 @@ import { renderPdfPageBlob } from "./raster.js";
  * A page is only allowed to drop its fallback when import proved the whole
  * page was recovered; anything partial keeps the raster so unsupported content
  * does not silently vanish from the export.
+ *
+ * A page waiting on its import handoff has no materialised objects yet — the
+ * raster is still the only thing carrying its appearance, even when the
+ * finished state will hide it. Without this, batch-promoted pages preview as
+ * blank white sheets until they are first opened.
  */
 function pageShowsFallback(page) {
+  if (page?.pendingImportData || page?.pendingDecomposedData) return true;
   return page?.fallbackVisible !== false;
 }
 
@@ -231,11 +237,14 @@ export async function renderPageThumbnail(page, targetWidth = 320, options = {})
   // states. Once a fully recovered page has serialized canvas JSON, that JSON
   // remains authoritative and is rendered over ordinary paper below.
   const hasCanvasJson = Boolean(page.canvasJson?.canvasData || page.canvasJson);
+  const hasPendingHandoff = Boolean(
+    page.pendingImportData || page.pendingDecomposedData,
+  );
   const canUseSourcePdf =
     !backgroundUrl &&
     options.pdfAssetId &&
     Number.isInteger(page.pdfPageIndex) &&
-    (page.fallbackVisible !== false || !hasCanvasJson);
+    (page.fallbackVisible !== false || !hasCanvasJson || hasPendingHandoff);
   if (canUseSourcePdf) {
     const raster = await renderPdfPageBlob(
       options.pdfAssetId,
