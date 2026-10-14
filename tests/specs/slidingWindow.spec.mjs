@@ -76,9 +76,14 @@ const thumbnailState = (page, index) =>
     const canvas = document.querySelector(`#omni-canvas-${i}`);
     const thumb = document.querySelector(`#omni-thumb-${i}`);
     if (!canvas || !thumb) return null;
+    // NOTE: assert computed display, not the `hidden` property. A CSS
+    // `display` rule beats the UA `[hidden]{display:none}`, so the property
+    // can claim hidden while the element still lays out (that was the
+    // phantom-white-pages bug).
+    const shown = (el) => getComputedStyle(el).display !== "none";
     return {
-      canvasHidden: canvas.hidden,
-      thumbHidden: thumb.hidden,
+      canvasHidden: !shown(canvas),
+      thumbHidden: !shown(thumb),
       thumbWidth: thumb.naturalWidth,
       thumbHeight: thumb.naturalHeight,
     };
@@ -158,7 +163,7 @@ export default async function run({ page, fixtures, check }) {
       .waitForFunction(
         () => {
           const t = document.querySelector("#omni-thumb-0");
-          return Boolean(t) && !t.hidden && t.naturalWidth > 0;
+          return Boolean(t) && getComputedStyle(t).display !== "none" && t.naturalWidth > 0;
         },
         undefined,
         { timeout: 8000 },
@@ -175,6 +180,33 @@ export default async function run({ page, fixtures, check }) {
       "the off-window thumbnail actually rendered pixels",
       Boolean(thumb) && thumb.thumbWidth > 0 && thumb.thumbHeight > 0,
       `natural ${thumb?.thumbWidth}×${thumb?.thumbHeight}`,
+    );
+
+    // Every slot shows exactly one visual: canvas xor thumbnail by *computed*
+    // display. A CSS display rule once defeated the hidden attribute, stacking
+    // a full-page white sheet under every live canvas ("extra white pages"
+    // with a correct counter).
+    const slots = await page.evaluate(() => {
+      const out = [];
+      document.querySelectorAll(".page-container").forEach((wrap, i) => {
+        const canvas = wrap.querySelector("canvas");
+        const thumb = wrap.querySelector("img");
+        const shown = (el) => el && getComputedStyle(el).display !== "none";
+        out.push({ i, canvas: shown(canvas), thumb: shown(thumb) });
+      });
+      return out;
+    });
+    const doubled = slots.filter((s) => s.canvas && s.thumb).map((s) => s.i);
+    const blank = slots.filter((s) => !s.canvas && !s.thumb).map((s) => s.i);
+    check(
+      "no page shows canvas and thumbnail at once",
+      doubled.length === 0,
+      doubled.length ? `doubled: ${doubled.join(",")}` : "all single",
+    );
+    check(
+      "no page shows neither canvas nor thumbnail",
+      blank.length === 0,
+      blank.length ? `blank: ${blank.join(",")}` : "all covered",
     );
   });
 

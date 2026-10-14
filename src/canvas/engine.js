@@ -444,6 +444,7 @@ export class OmniCanvas {
     this.historyIndex--;
     const state = JSON.parse(this.history[this.historyIndex]);
     await this.canvas.loadFromJSON(state);
+    this.reapplyFurnitureLocks();
     this.applyBackground();
     this.canvas.requestRenderAll();
     this.isHistoryProcessing = false;
@@ -457,6 +458,7 @@ export class OmniCanvas {
     this.historyIndex++;
     const state = JSON.parse(this.history[this.historyIndex]);
     await this.canvas.loadFromJSON(state);
+    this.reapplyFurnitureLocks();
     this.applyBackground();
     this.canvas.requestRenderAll();
     this.isHistoryProcessing = false;
@@ -670,6 +672,25 @@ export class OmniCanvas {
     this.canvas.requestRenderAll();
   }
 
+  /**
+   * Re-locks imported page furniture after any `loadFromJSON()`.
+   *
+   * Fabric does not serialise `selectable`/`evented`, so a revived object
+   * defaults to selectable even though its `omniLocked` marker survived.
+   * Without this pass, every reload, undo, redo — and every sliding-window
+   * remount — silently unlocks the page background, making it clickable and
+   * deletable.
+   */
+  reapplyFurnitureLocks() {
+    this.canvas.forEachObject((obj) => {
+      if (obj.omniLocked) {
+        obj.selectable = false;
+        obj.evented = false;
+        obj.hoverCursor = "default";
+      }
+    });
+  }
+
   addTextAt(text, x, y) {
     const itext = new IText(text, {
       left: x,
@@ -839,6 +860,10 @@ export class OmniCanvas {
         page.canvasJson.canvasData || page.canvasJson,
       );
       await this.canvas.loadFromJSON(canvasData);
+      // Revived furniture defaults to selectable; lock it before anything can
+      // click it. setTool() ran on an empty canvas earlier, so this pass is
+      // the only thing standing between the background and the selection tool.
+      this.reapplyFurnitureLocks();
       this.canvas.requestRenderAll();
     }
 
@@ -924,6 +949,8 @@ export class OmniCanvas {
       added++;
     }
 
+    // Enlivened objects revive `omniLocked` but default to selectable.
+    this.reapplyFurnitureLocks();
     this.canvas.requestRenderAll();
     return added;
   }

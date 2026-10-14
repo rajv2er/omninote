@@ -111,6 +111,29 @@
   border-left: 3px solid #ef4444;
 }
 
+/* Determinate download bar for the in-app updater. Shares the toast shell
+   but manages its own lifetime (no auto-dismiss mid-download). */
+.update-progress {
+  border-left: 3px solid var(--accent-primary, #6366f1);
+  min-width: 280px;
+}
+
+.update-progress-track {
+  height: 6px;
+  border-radius: 3px;
+  background: rgba(148, 163, 184, 0.2);
+  overflow: hidden;
+  margin-top: 6px;
+}
+
+.update-progress-fill {
+  height: 100%;
+  width: 0%;
+  border-radius: 3px;
+  background: var(--accent-primary, #6366f1);
+  transition: width 0.15s ease;
+}
+
 .import-report-close {
   position: absolute;
   top: 8px;
