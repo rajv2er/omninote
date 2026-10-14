@@ -1,5 +1,6 @@
 import { icon } from "./icons.js";
 import { escapeHtml } from "./escapeHtml.js";
+import { appVersion } from "../updater.js";
 
 export const STANDARD_FONTS = [
   "DM Sans",
@@ -154,6 +155,14 @@ export function sidebar({ notes, folders, activeFolder, noteCount, folderPrefix 
         <span>New folder</span>
       </button>
     </nav>
+
+    <div class="side-footer">
+      <span class="side-version" title="Installed version">v${escapeHtml(appVersion())}</span>
+      <button class="side-update" id="check-updates-btn" title="Check for updates">
+        ${icon("download", 14)}
+        <span>Check for Updates</span>
+      </button>
+    </div>
   `;
 }
 

@@ -47,22 +47,43 @@ jobs:
 
       - run: npm ci
 
+      # The updater compares the release against the version baked into the
+      # bundle, so the tag is the single source of truth: v0.2.0 must ship a
+      # bundle that reports 0.2.0, or clients will never see the update.
+      - name: Sync version from tag
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          VERSION="${TAG#v}"
+          echo "Release version: $VERSION"
+          npm version "$VERSION" --no-git-tag-version --allow-same-version
+          VERSION="$VERSION" node -e 'const fs=require("fs");const f="src-tauri/tauri.conf.json";const c=JSON.parse(fs.readFileSync(f,"utf8"));c.version=process.env.VERSION;fs.writeFileSync(f,JSON.stringify(c,null,2)+"\n");'
+
       # Runs `npm run build` (beforeBuildCommand) then bundles, then uploads
       # every bundle (.app, .dmg) to the release.
       # APPLE_SIGNING_IDENTITY="-" = free ad-hoc sign (no $99 Developer ID).
       # This is what stops Apple Silicon Macs reporting the app as "damaged".
       # It does NOT remove Gatekeeper entirely — users still need one
       # `xattr` command on first install (see releaseBody below).
+      #
+      # TAURI_SIGNING_PRIVATE_KEY = contents of the updater private key
+      # (repo Settings -> Secrets -> Actions). With it set, tauri-action also
+      # signs the updater bundle (.app.tar.gz) and uploads `latest.json`,
+      # which is what the in-app "Check for Updates" polls.
       - name: Build and release
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           APPLE_SIGNING_IDENTITY: "-"
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
         with:
           tagName: ${{ github.event.inputs.tag || github.ref_name }}
           releaseName: "OmniNote v__VERSION__"
           releaseBody: |
             See the assets below to download OmniNote for macOS.
+
+            **Already have OmniNote installed?** You don't need this download —
+            open the app and use *Check for Updates* (bottom of the library
+            sidebar). It updates itself and restarts.
 
             **Install (free build, no Apple Developer ID):**
             1. Open the `.dmg` and drag OmniNote to Applications.

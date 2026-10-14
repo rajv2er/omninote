@@ -72,6 +72,7 @@ import {
   pageManagerTilesHtml as renderPageManagerTilesHtml,
   pageManagerOverlay as renderPageManagerOverlay,
 } from "./ui/pageManagerView.js";
+import { checkForUpdates, autoCheckForUpdates } from "./updater.js";
 
 const STORE_KEY = "omninote-notes-v2";
 const FOLDERS_KEY = "omninote-folders";
@@ -2457,12 +2458,19 @@ async function initEditor(note) {
       .querySelectorAll(".page-container")
       .forEach((el) => scrollObserver.observe(el));
 
-    // Scroll to the active page on load
+    // Scroll to the active page on load. This must land instantly: the
+    // workspace scrolls smoothly (see `.canvas-wrap`), and a fresh render
+    // starts at the top, so a smooth scroll here would animate all the way
+    // from page 1 to the active page (e.g. 1→6 when adding a page after 5).
+    // Same pattern as `restoreZoomAnchor` in viewport.js.
     const activeWrapper = document.querySelector(
       `#page-wrapper-${note.currentPageIndex}`,
     );
     if (activeWrapper) {
-      activeWrapper.scrollIntoView();
+      const prevBehavior = scrollContainer.style.scrollBehavior;
+      scrollContainer.style.scrollBehavior = "auto";
+      activeWrapper.scrollIntoView({ block: "start" });
+      scrollContainer.style.scrollBehavior = prevBehavior;
     }
   }
   syncToolbarForActivePage();
@@ -3587,6 +3595,11 @@ async function hydrateThumbnails() {
 function bindLibraryEvents() {
   hydrateThumbnails();
 
+  // Manual update check (sidebar footer). Silent no-op outside the Mac app.
+  document
+    .querySelector("#check-updates-btn")
+    ?.addEventListener("click", () => checkForUpdates());
+
   // TEMP-DIAG: one-click diagnostics for the white-page investigation.
   // Downloads per-page record flags + asset byte sizes (no pixels).
   // Remove together with the #diag-btn in libraryView.js.
@@ -4153,4 +4166,8 @@ document.addEventListener("visibilitychange", () => {
 // wait for it — rendering early would show blank imported pages.
 hydrateNotes()
   .catch((err) => console.warn("Could not restore page data:", err))
-  .finally(() => render());
+  .finally(() => {
+    render();
+    // Silent daily update check (Mac app only; no-op in a browser).
+    autoCheckForUpdates();
+  });
