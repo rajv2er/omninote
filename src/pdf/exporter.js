@@ -1,6 +1,7 @@
-import { PDFDocument } from "pdf-lib";
+import { PDFDocument, StandardFonts, rgb } from "pdf-lib";
 import { StaticCanvas } from "fabric";
 import { getAssetUrl } from "../storage/assets.js";
+import { getPdfDoc } from "./raster.js";
 import { hydrateCanvasJson } from "./importModel.js";
 import { renderPdfPageBlob } from "./raster.js";
 
@@ -78,6 +79,28 @@ function drawPaperPattern(ctx, width, height, style) {
         ctx.fill();
       }
     }
+  } else if (style === "cornell") {
+    ctx.strokeStyle = "#e2e8f0";
+    ctx.lineWidth = 1;
+    for (let y = 28; y < height; y += 28) {
+      ctx.beginPath();
+      ctx.moveTo(0, y);
+      ctx.lineTo(width, y);
+      ctx.stroke();
+    }
+    ctx.beginPath();
+    ctx.moveTo(width * 0.3, 0);
+    ctx.lineTo(width * 0.3, height);
+    ctx.stroke();
+  } else if (style === "music") {
+    ctx.strokeStyle = "#cbd5e1";
+    ctx.lineWidth = 1;
+    for (let y = 20; y < height; y += 12) {
+      ctx.beginPath();
+      ctx.moveTo(0, y);
+      ctx.lineTo(width, y);
+      ctx.stroke();
+    }
   }
 }
 
@@ -99,6 +122,7 @@ function dataUrlToBytes(dataUrl) {
  */
 export async function exportNotebookToPdf(note, activeCanvasEngine, onProgress = () => {}, pagesToExport = null) {
   const pdfDoc = await PDFDocument.create();
+  const textFont = await pdfDoc.embedFont(StandardFonts.Helvetica).catch(() => null);
   const allPages = note.pages && note.pages.length > 0 ? note.pages : [{
     width: 800,
     height: 1130,
@@ -162,6 +186,104 @@ export async function exportNotebookToPdf(note, activeCanvasEngine, onProgress =
       }
     }
 
+    // Invisible text layer: makes the exported PDF searchable even though the
+    // visible page is rasterised. Only text objects that are already in the
+    // page's object graph are used; annotate-only pages keep their raster.
+    if (textFont) {
+      const textObjects = [];
+      if (idx === note.currentPageIndex && activeCanvasEngine) {
+        for (const obj of activeCanvasEngine.canvas.getObjects()) {
+          if (
+            (obj.type === "i-text" ||
+              obj.type === "text" ||
+              obj.type === "textbox") &&
+            typeof obj.text === "string"
+          ) {
+            textObjects.push({
+              text: obj.text,
+              left: obj.left || 0,
+              top: obj.top || 0,
+              fontSize: obj.fontSize || 16,
+            });
+          }
+        }
+      } else {
+        const canvasData = page.canvasJson?.canvasData || page.canvasJson;
+        const walk = (node) => {
+          if (!node || typeof node !== "object") return;
+          if (Array.isArray(node.objects)) node.objects.forEach(walk);
+          if (
+            (node.type === "i-text" ||
+              node.type === "text" ||
+              node.type === "textbox") &&
+            typeof node.text === "string"
+          ) {
+            textObjects.push({
+              text: node.text,
+              left: node.left || 0,
+              top: node.top || 0,
+              fontSize: node.fontSize || 16,
+            });
+          }
+        };
+        walk(canvasData);
+      }
+
+      for (const t of textObjects) {
+        try {
+          const size = Math.max(4, (t.fontSize || 16) * 0.75);
+          pdfPage.drawText(String(t.text), {
+            x: (t.left || 0) * 0.75,
+            y: (height - (t.top || 0) - (t.fontSize || 16) * 0.8) * 0.75,
+            size,
+            font: textFont,
+            color: rgb(0, 0, 0),
+            opacity: 0,
+          });
+        } catch {
+          // A single bad text object must not fail the whole export.
+        }
+      }
+    }
+
+    // Searchable text layer from the source PDF. This makes annotate-only pages
+    // searchable too, using the original (not substituted) text positions.
+    if (textFont && note?.pdfAssetId && Number.isInteger(page.pdfPageIndex)) {
+      try {
+        const doc = await getPdfDoc(note.pdfAssetId);
+        const sourcePage = await doc.getPage(page.pdfPageIndex + 1);
+        const content = await sourcePage.getTextContent();
+        for (const item of content.items || []) {
+          if (!item || typeof item.str !== "string" || !item.str.trim()) continue;
+          const transform = Array.isArray(item.transform) ? item.transform : [];
+          const x = Number(transform[4]) || 0;
+          const y = Number(transform[5]) || 0;
+          const fontSize = Math.max(
+            4,
+            Math.hypot(
+              Number(transform[2]) || 0,
+              Number(transform[3]) || 0,
+            ) || Number(item.height) || 12,
+          );
+          try {
+            pdfPage.drawText(String(item.str), {
+              x,
+              y,
+              size: fontSize,
+              font: textFont,
+              color: rgb(0, 0, 0),
+              opacity: 0,
+            });
+          } catch {
+            // A single bad text item must not fail the whole export.
+          }
+        }
+        sourcePage.cleanup();
+      } catch {
+        // Text extraction is a best-effort enhancement.
+      }
+    }
+
     // Photographic page backgrounds compress far better as JPEG; pure line art
     // stays lossless as PNG.
     let embeddedImage;
@@ -182,18 +304,7 @@ export async function exportNotebookToPdf(note, activeCanvasEngine, onProgress =
   }
 
   const pdfBytes = await pdfDoc.save();
-  const blob = new Blob([pdfBytes], { type: "application/pdf" });
-  const downloadUrl = URL.createObjectURL(blob);
-
-  const downloadLink = document.createElement("a");
-  const cleanTitle = (note.title || "OmniNote_Document").replace(/[/\\?%*:|"<>]/g, "-");
-  downloadLink.href = downloadUrl;
-  downloadLink.download = `${cleanTitle}.pdf`;
-  document.body.appendChild(downloadLink);
-  downloadLink.click();
-  document.body.removeChild(downloadLink);
-
-  setTimeout(() => URL.revokeObjectURL(downloadUrl), 4000);
+  return pdfBytes;
 }
 
 function drawImageToContext(ctx, dataUrl, width, height) {

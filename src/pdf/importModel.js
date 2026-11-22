@@ -24,7 +24,7 @@ import {
   Triangle,
 } from "fabric";
 import { getAssetUrl } from "../storage/assets.js";
-import { canvasToBlob } from "./canvasBlob.js";
+import { canvasToBlob } from "../canvas/canvasBlob.js";
 
 /**
  * The one scale at which PDF pages become notebook pages.

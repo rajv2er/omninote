@@ -211,6 +211,7 @@ export function groupPageCandidates(page) {
       width: run.width,
       height: run.height,
       sourceFontName: run.sourceFontName || null,
+      seq: run.seq || (Number.MAX_SAFE_INTEGER - 1),
     });
   }
 
@@ -246,6 +247,7 @@ export function groupPageCandidates(page) {
       width: img.width,
       height: img.height,
       angle: img.angle || 0,
+      seq: img.seq,
     });
   }
 
@@ -264,6 +266,7 @@ export function groupPageCandidates(page) {
     if (obj.importConfidence >= MIN_CONFIDENCE) {
       // Page furniture stays visible but must not be draggable.
       obj.locked = coversPage(obj.bbox, page.width, page.height);
+      obj.seq = group.length ? group[0].seq : 0;
       objects.push(obj);
     } else if (obj.bbox) {
       fallbackRegions.push(obj.bbox);
@@ -389,10 +392,16 @@ export function groupPageCandidates(page) {
   // Fabric paints objects in insertion order. Full-page PDF fills are normal
   // vector objects, so leaving them after images hides those images under an
   // opaque paper rectangle. Preserve the relative order within each group, but
-  // always paint locked page furniture first.
+  // always paint locked page furniture first. Within the unlocked objects,
+  // interleave images and vectors by their original paint order (seq) so a
+  // vector that was painted before an image in the PDF stays behind it.
+  const unlocked = objects
+    .filter((object) => !object.locked)
+    .slice()
+    .sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0));
   const paintOrderedObjects = [
     ...objects.filter((object) => object.locked),
-    ...objects.filter((object) => !object.locked),
+    ...unlocked,
   ];
 
   return {

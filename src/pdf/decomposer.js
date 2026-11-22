@@ -1,7 +1,7 @@
 import * as pdfjs from "pdfjs-dist";
 import pdfWorker from "pdfjs-dist/build/pdf.worker.mjs?url";
 import { groupPageCandidates } from "./grouping.js";
-import { canvasToBlob } from "./canvasBlob.js";
+import { canvasToBlob } from "../canvas/canvasBlob.js";
 import { PDF_IMPORT_SCALE } from "./importModel.js";
 // One pdf.js document per notebook, owned by the raster module. Promotion must
 // reuse it rather than opening the file a second time.
@@ -947,6 +947,7 @@ export async function decomposePage(page, scale = 1.333333, options = {}) {
         sourceFontName: rawFontName || null,
         width: Math.round(itemWidth),
         height: Math.round(fontSize * 1.25),
+        seq: Number.MAX_SAFE_INTEGER - 1,
       };
 
       const sameLine =
@@ -1253,82 +1254,90 @@ export async function decomposePdf(arrayBuffer, scale = PDF_IMPORT_SCALE, onPage
   const pages = [];
   const globalFontUsage = {};
 
-  for (let num = 1; num <= pdf.numPages; num++) {
-    const page = await pdf.getPage(num);
-    const decomposed = await decomposePage(page, scale, {
-      extract,
-      includeBackground: !lazyBackgrounds || num === 1,
-    });
+  try {
+    for (let num = 1; num <= pdf.numPages; num++) {
+      const page = await pdf.getPage(num);
+      const decomposed = await decomposePage(page, scale, {
+        extract,
+        includeBackground: !lazyBackgrounds || num === 1,
+      });
 
-    // Turn the raw operator-level candidates into the objects the editor will
-    // actually receive: grouped where the evidence is strong, dropped into the
-    // fallback where it is not.
-    const grouped = extract
-      ? groupPageCandidates(decomposed)
-      : {
-          objects: [],
-          fallbackRegions: [],
-          fallbackImage: null,
-          // Nothing was recovered, so the page is a locked raster. Reported as
-          // `fallback` rather than `partial` because that is what it is — the
-          // user asked for an annotated PDF, not a recovered one.
-          report: {
-            status: "fallback",
-            fallbackFromImage: false,
-            mode: "annotations",
-            textObjects: 0,
-            vectorGroups: 0,
-            imageObjects: 0,
-            fallbackRegions: 0,
-            backdropImages: 0,
-            unsupportedOperators: 0,
-            unsupportedAnnotations: [],
-            nonVisualAnnotations: [],
-            warnings: [],
-            errors: [],
-          },
-          fallbackVisible: true,
-        };
+      // Turn the raw operator-level candidates into the objects the editor will
+      // actually receive: grouped where the evidence is strong, dropped into the
+      // fallback where it is not.
+      const grouped = extract
+        ? groupPageCandidates(decomposed)
+        : {
+            objects: [],
+            fallbackRegions: [],
+            fallbackImage: null,
+            // Nothing was recovered, so the page is a locked raster. Reported as
+            // `fallback` rather than `partial` because that is what it is — the
+            // user asked for an annotated PDF, not a recovered one.
+            report: {
+              status: "fallback",
+              fallbackFromImage: false,
+              mode: "annotations",
+              textObjects: 0,
+              vectorGroups: 0,
+              imageObjects: 0,
+              fallbackRegions: 0,
+              backdropImages: 0,
+              unsupportedOperators: 0,
+              unsupportedAnnotations: [],
+              nonVisualAnnotations: [],
+              warnings: [],
+              errors: [],
+            },
+            fallbackVisible: true,
+          };
 
-    let record = {
-      pageNumber: num,
-      width: decomposed.width,
-      height: decomposed.height,
-      importSchemaVersion: IMPORT_SCHEMA_VERSION,
-      importedObjectVersion: IMPORTED_OBJECT_VERSION,
-      ...grouped,
-      backgroundBlob: decomposed.backgroundBlob,
-      thumbnailBlob: decomposed.thumbnailBlob,
-      detectedFonts: decomposed.detectedFonts,
-      mostUsedFont: decomposed.mostUsedFont,
-      fontUsage: decomposed.fontUsage,
-    };
+      let record = {
+        pageNumber: num,
+        width: decomposed.width,
+        height: decomposed.height,
+        importSchemaVersion: IMPORT_SCHEMA_VERSION,
+        importedObjectVersion: IMPORTED_OBJECT_VERSION,
+        ...grouped,
+        backgroundBlob: decomposed.backgroundBlob,
+        thumbnailBlob: decomposed.thumbnailBlob,
+        detectedFonts: decomposed.detectedFonts,
+        mostUsedFont: decomposed.mostUsedFont,
+        fontUsage: decomposed.fontUsage,
+      };
 
-    if (typeof onPage === "function") {
-      record = (await onPage(record, num - 1)) || record;
-    }
-    pages.push(record);
+      if (typeof onPage === "function") {
+        record = (await onPage(record, num - 1)) || record;
+      }
+      pages.push(record);
 
-    if (decomposed.fontUsage) {
-      for (const [font, count] of Object.entries(decomposed.fontUsage)) {
-        globalFontUsage[font] = (globalFontUsage[font] || 0) + count;
+      if (decomposed.fontUsage) {
+        for (const [font, count] of Object.entries(decomposed.fontUsage)) {
+          globalFontUsage[font] = (globalFontUsage[font] || 0) + count;
+        }
       }
     }
-  }
 
-  let primaryFont = "sans-serif";
-  let maxChars = 0;
-  for (const [font, count] of Object.entries(globalFontUsage)) {
-    if (count > maxChars) {
-      maxChars = count;
-      primaryFont = font;
+    let primaryFont = "sans-serif";
+    let maxChars = 0;
+    for (const [font, count] of Object.entries(globalFontUsage)) {
+      if (count > maxChars) {
+        maxChars = count;
+        primaryFont = font;
+      }
+    }
+
+    pages.mostUsedFont = primaryFont;
+    pages.detectedFonts = Object.keys(globalFontUsage);
+
+    return pages;
+  } finally {
+    try {
+      await pdf.destroy();
+    } catch {
+      // Already torn down; nothing to release.
     }
   }
-
-  pages.mostUsedFont = primaryFont;
-  pages.detectedFonts = Object.keys(globalFontUsage);
-
-  return pages;
 }
 
 /**

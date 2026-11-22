@@ -1,6 +1,11 @@
 import { defineConfig } from "vite";
 
 export default defineConfig({
+  server: {
+    host: "127.0.0.1",
+    port: 5173,
+    strictPort: true,
+  },
   define: {
     // Baked-in app version for the library footer / update checks. The web
     // build has no Tauri runtime, so the version cannot be read live there.

@@ -15,6 +15,7 @@ let dbPromise = null;
 
 /** Object URLs are cached so re-rendering the library does not reload blobs. */
 const urlCache = new Map();
+const MAX_URL_CACHE = 64;
 
 function openDb() {
   if (dbPromise) return dbPromise;
@@ -121,6 +122,13 @@ export async function getAssetUrl(id) {
   if (!blob) return null;
 
   const url = URL.createObjectURL(blob);
+  if (urlCache.size >= MAX_URL_CACHE) {
+    const oldest = urlCache.keys().next().value;
+    if (oldest) {
+      URL.revokeObjectURL(urlCache.get(oldest));
+      urlCache.delete(oldest);
+    }
+  }
   urlCache.set(id, url);
   return url;
 }

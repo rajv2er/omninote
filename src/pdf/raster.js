@@ -15,7 +15,7 @@
 import * as pdfjs from "pdfjs-dist";
 import pdfWorker from "pdfjs-dist/build/pdf.worker.mjs?url";
 import { getAsset } from "../storage/assets.js";
-import { canvasToBlob } from "./canvasBlob.js";
+import { canvasToBlob } from "../canvas/canvasBlob.js";
 
 pdfjs.GlobalWorkerOptions.workerSrc = pdfWorker;
 

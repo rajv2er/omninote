@@ -27,7 +27,7 @@ export default [
     },
   },
   {
-    files: ["scripts/**/*.mjs", "vite.config.js", "eslint.config.js"],
+    files: ["scripts/**/*.mjs", "vite.config.js", "vitest.config.js", "eslint.config.js"],
     languageOptions: {
       ecmaVersion: "latest",
       sourceType: "module",
@@ -40,6 +40,17 @@ export default [
     // `page.evaluate` callbacks to the browser, so both global sets apply.
     // (The `scripts/**/*.mjs` pattern above does not match dotfiles.)
     files: ["scripts/.*.mjs"],
+    languageOptions: {
+      ecmaVersion: "latest",
+      sourceType: "module",
+      globals: { ...globals.node, ...globals.browser },
+    },
+    rules: { "no-undef": "error" },
+  },
+  {
+    // Dev probes (scripts/dev/) ship `page.evaluate` callbacks to the browser,
+    // so both global sets legitimately apply.
+    files: ["scripts/dev/**/*.mjs"],
     languageOptions: {
       ecmaVersion: "latest",
       sourceType: "module",
