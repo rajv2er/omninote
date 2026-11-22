@@ -63,7 +63,7 @@ TOTAL                                 4.3G          1.6G          1.3G          
 
 ### Bottleneck 2: Eager IndexedDB Hydration on Launch (`hydrateNotes`)
 - **Current Behavior**:
-  In `src/main.js:511`, `hydrateNotes()` runs before the first render:
+  In `src/app/persistence.js`, `hydrateNotes()` runs before the first render:
   ```javascript
   for (const note of notes) {
     for (const page of note.pages || []) {
@@ -115,7 +115,7 @@ Notebook [Page 1 ... Page 50]
 ### Phase 1: Immediate Quick Wins
 
 #### 1. Lazy Payload Hydration
-- **Change**: In `src/main.js`, update `hydrateNotes()` to do **nothing on startup**.
+- **Change**: In `src/app/persistence.js`, update `hydrateNotes()` to do **nothing on startup**.
 - **Execution**: Only load notebook metadata (id, title, page count, thumbnail).
 - **On Note Open**: Only fetch payloads from IndexedDB for the pages of the opened note.
 - **Impact**: App startup time drops to < 50 ms; Library view uses under **50 MB** of RAM.
@@ -186,8 +186,8 @@ npm run tauri build
 
 ## 4. Summary Checklist for Future Implementation
 
-- [ ] **Task 1**: Update `hydrateNotes()` in `src/main.js` to lazy-load page JSON on-demand.
-- [ ] **Task 2**: Add `[profile.release]` and `[profile.dev]` flags to `src-tauri/Cargo.toml`.
-- [ ] **Task 3**: Refactor `initEditor()` to mount a 3-page sliding window using `IntersectionObserver`.
+- [x] **Task 1**: Update `hydrateNotes()` in `src/app/persistence.js` to lazy-load page JSON on-demand.
+- [x] **Task 2**: Add `[profile.release]` and `[profile.dev]` flags to `src-tauri/Cargo.toml`.
+- [x] **Task 3**: Refactor `initEditor()` to mount a 3-page sliding window using `IntersectionObserver`.
 - [ ] **Task 4**: Unmount `upperCanvasEl` for off-screen pages to release Metal GPU buffers.
-- [ ] **Task 5**: Build and test with `npm run tauri build` to measure production memory consumption.
+- [x] **Task 5**: Build and test with `npm run tauri build` to measure production memory consumption.

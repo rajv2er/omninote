@@ -64,18 +64,24 @@ Same notebook, no Gatekeeper: `npm run build`, then host `dist/` anywhere
 ## Scripts
 
 ```bash
-npm run build    # build web bundle to dist/
-npm run lint     # run ESLint
-npm test         # run tests in tests/run.mjs
+npm run build      # build web bundle to dist/
+npm run lint       # run ESLint
+npm run test:unit  # run Vitest unit tests
+npm test           # run the browser regression suite
 ```
 
 ## Project structure
 
 ```text
 index.html       App entry
-src/main.js      UI, canvas, storage, PDF import
-src/             Canvas, PDF, storage, UI modules
+src/main.js      App shell: state, rendering, event binding
+src/app/         Persistence, PDF import/promotion, keyboard shortcuts, backup, page manager, library events
+src/canvas/      Fabric canvas engine, viewport, zoom window, canvas blob helpers
+src/pdf/         PDF decomposition, grouping, export, rasterization
+src/storage/     IndexedDB asset store
+src/ui/          HTML templates, dialogs, icons
+src/styles/      Component stylesheets
 src-tauri/       Tauri desktop shell (Rust)
-tests/           Test runner and regression tests
+tests/           Unit tests and browser regression specs
 scripts/         Dev / fixture scripts
 ```

@@ -31,7 +31,7 @@ explicitly out of scope per the README.
 |---|---|---|
 | Build | Vite (`npm run dev` / `build` / `preview`) | `vite.config.js` splits `fabric`, `pdfjs`, `pdflib` into separate vendor chunks |
 | Desktop App | Tauri v2 (`src-tauri/`) | Rust-based desktop shell for macOS / cross-platform |
-| Language | Vanilla ES modules, modular UI & CSS | ~8k LOC JS, ~1.8k LOC CSS across component sheets |
+| Language | Vanilla ES modules, modular UI & CSS | ~11.9k LOC JS, ~2.3k LOC CSS across component sheets |
 | Canvas | `fabric` v7 | Owns the object graph, hit-testing, free-drawing brush, text editing |
 | PDF decode | `pdfjs-dist` v6 | Operator-list parsing (Level B) and page rasterization |
 | PDF write | `pdf-lib` | Export: each page is rasterized and embedded as one image |
@@ -43,45 +43,63 @@ explicitly out of scope per the README.
 ## 3. Repository map
 
 ```text
-index.html                  15    single <main id="app"> + module script
-vite.config.js              22    manual vendor chunks for fabric, pdfjs, pdflib
-eslint.config.js            50    ESLint flat config for src, scripts, and tests
+index.html                  16    single <main id="app"> + module script
+vite.config.js              32    manual vendor chunks for fabric, pdfjs, pdflib
+eslint.config.js            61    ESLint flat config for src, scripts, and tests
 jsconfig.json               10    module resolution & editor IntelliSense config
-src/main.js               3335    app shell, state, view orchestration, event binding
+src/main.js               2373    app shell, state, view orchestration, event binding
+src/updater.js             212    Tauri update checks and install flow
+src/app/
+  persistence.js           440    localStorage record, IndexedDB payload cache, hydration
+  importFlow.js            641    PDF import, page promotion, blob persistence
+  editorShortcuts.js       173    global keyboard shortcuts and typing-target guard
+  backup.js                245    whole-library backup and restore (assets inlined)
+  pageManager.js           880    Page Manager: reorder, rotate, extract, tag, copy/cut/paste
+  libraryEvents.js         460    library screen events: cards, folders, search, bulk actions
 src/ui/
-  icons.js                  51    SVG icon lookup table (~30 crisp vector icons)
-  libraryView.js           215    library grid, sidebar, note card, font options
-  pageManagerView.js        67    page manager modal overlay & tile generator
-  dialogs.js               225    import completion toast, generic toast, storage warnings
+  icons.js                  52    SVG icon lookup table (~30 crisp vector icons)
+  libraryView.js           261    library grid, sidebar, note card, font options
+  pageManagerView.js        76    page manager modal overlay & tile generator
+  dialogs.js               601    import report, toasts, confirms, storage warnings
   escapeHtml.js             16    HTML sanitization utility
+  toolbar.js               105    font toolbar state sync and option rendering
 src/styles/
-  base.css                  50    variables (:root), reset, body, input styling
-  library.css              471    shell grid, sidebar, cards, card hover actions
-  editor.css               821    topbar, tool rail, presets, swatches, status pill
-  canvas.css               140    viewport container, zoom window, paper textures
-  dialogs.css              144    loading overlay, spinner, toasts, alerts
+  base.css                  55    variables (:root), reset, body, input styling
+  library.css              534    shell grid, sidebar, cards, card hover actions
+  editor.css               828    topbar, tool rail, presets, swatches, status pill
+  canvas.css               193    viewport container, zoom window, paper textures
+  dialogs.css              437    loading overlay, spinner, toasts, alerts
   pageManager.css          235    page manager modal overlay & grid layout
-src/style.css                7    root stylesheet aggregator importing src/styles/
-src/canvas/engine.js      1394    OmniCanvas: tools, undo/redo, zoom/pan, background
-src/canvas/viewport.js     394    viewport controller: zoom math, anchors, gestures, window
-src/canvas/zoomWindow.js   351    magnified writing strip (mirrors live canvas)
-src/pdf/decomposer.js     1343    Level-B: PDF operator stream -> editable objects
-src/pdf/exporter.js        243    PDF export + page thumbnails
-src/pdf/grouping.js        410    spatial clustering of strokes into coherent ink groups
-src/pdf/importModel.js     361    decomposed object normalization & fallback layer
-src/pdf/canvasBlob.js       52    canvas to WebP/PNG blob conversion utilities
-src/pdf/raster.js          107    on-demand re-raster of the source PDF at zoom
-src/storage/assets.js      272    IndexedDB blob store with deep graph traversal
+src/style.css                6    root stylesheet aggregator importing src/styles/
+src/canvas/
+  engine.js               1827    OmniCanvas: tools, undo/redo, zoom/pan, background
+  viewport.js              417    viewport controller: zoom math, anchors, gestures, window
+  zoomWindow.js            351    magnified writing strip (mirrors live canvas)
+  canvasBlob.js             52    canvas to WebP/PNG blob conversion utilities
+src/pdf/
+  decomposer.js           1444    Level-B: PDF operator stream -> editable objects
+  exporter.js              394    PDF export + page thumbnails
+  grouping.js              410    spatial clustering of strokes into coherent ink groups
+  importModel.js           360    decomposed object normalization & fallback layer
+  raster.js                107    on-demand re-raster of the source PDF at zoom
+src/storage/assets.js      287    IndexedDB blob store with deep graph traversal
 tests/
-  run.mjs                  117    regression test runner (boots Vite & browser)
-  lib/harness.mjs          324    Playwright test driver and evaluation helpers
-  specs/import.spec.mjs           Level-B extraction and reload survival assertions
-  specs/persistence.spec.mjs      Ink persistence, thumbnail refresh, asset cleanup
-  specs/annotate.spec.mjs         Annotate-first import and per-page promotion
-scripts/make-fixtures.mjs  420    byte-deterministic PDF fixture generator
+  run.mjs                  122    regression test runner (boots Vite & browser)
+  lib/harness.mjs          420    Playwright test driver and evaluation helpers
+  specs/                         7 browser regression specs: import, persistence,
+                                 annotate, picker, editorSelect, slidingWindow,
+                                 darkThumbs
+  unit/                          4 Vitest suites: viewport, grouping, importModel,
+                                 eraser
+scripts/
+  make-fixtures.mjs        561    byte-deterministic PDF fixture generator
+  install-mac.sh            42    macOS install helper
+  fix-macos.sh              32    macOS launch/quarantine helper
+  dev/                            manual PDF probes (not part of the test suite)
 src-tauri/                        Tauri 2 desktop wrapper configuration & Rust source
-archive/                          Non-app deliverables (synopsis docs, AI memory)
-README.md                  352    product spec (authoritative for scope)
+.github/workflows/                CI (lint, unit, build) and release pipeline
+README.md                   87    product spec (authoritative for scope)
+MEMORY_OPTIMIZATION.md     193    sliding-window memory notes
 ```
 
 ---
@@ -90,23 +108,89 @@ README.md                  352    product spec (authoritative for scope)
 
 ### `src/main.js` — the application shell
 
-One module holds application state and orchestrates views, persistence, and event listeners:
+Holds the live application state and orchestrates views and event listeners.
+The format and import pipelines live in `src/app/` and receive that state
+through injected getters, so `main.js` stays the composition root:
 
 * **State**: module-level variables — `notes`, `activeId`, `canvasEngines`,
   `currentTool/Color/Width/PenStyle`, `currentZoom`, `showPageManager`,
-  `pageManagerSelection`, `pageClipboard`, `zoomLocked`, `inFlightPayloads`, …
+  `pageManagerSelection`, `pageClipboard`, `zoomLocked`, `normalizedNotes`,
+  `hydratedPages`, …
 * **Views**: delegates HTML template generation to `src/ui/libraryView.js` and
   `src/ui/pageManagerView.js`. `render()` updates `#app.innerHTML` and wires
   event handlers.
 * **Orchestration**: `initEditor(note)` creates one `OmniCanvas` per page,
   loads each page, wires callbacks, sets up the IntersectionObserver and the
   zoom window.
-* **Payload Safety**: tracks in-flight IndexedDB writes via `inFlightPayloads` and
-  flushes on `pagehide` and `visibilitychange` to prevent lost page data.
-* **PDF page promotion** (§10): `promotePageToEditable()` and
-  `makeAllPagesEditable()` rebuild an annotate-mode page as native objects.
-  `persistPageAssets()` is shared with the importer, so a promoted page is
-  exactly the shape an import produces.
+* **Composition**: constructs the persistence, import-flow, shortcut,
+  backup, page-manager and library-event controllers once, passing live
+  getters and the callbacks they may call back into (`saveNotes`, `render`,
+  `setLoading`, …).
+
+### `src/app/persistence.js` — notebook record & payload cache
+
+Owns the storage format, not the data. `createPersistence()` closes over the
+caller's notebook array and the two WeakSets:
+
+* **Record**: `normalizeNote()` backfills legacy fields; `projectNotesForStorage()`
+  strips the object graph and import handoff before the localStorage write.
+* **Payloads**: `persistPayload()` de-duplicates IndexedDB writes by key, while
+  `inFlightPayloads` tracks unsettled writes so `flushPayloads()` can drain them
+  on `pagehide`/`visibilitychange`.
+* **Hydration**: `hydratePage()` lazily loads a page's `canvasJson` and pending
+  import handoff; `hydrateNote()` loads the pages around the current one.
+* **Quota fallback**: `saveNotes()` retries with thumbnails stripped and raises
+  the storage warning if that still fails.
+
+### `src/app/importFlow.js` — PDF in, editable pages out
+
+`createImportFlow()` owns the pipeline from `File` to notebook, and from an
+annotate-mode raster to native objects:
+
+* **Import**: `handlePdfImport()` reads the mode once, then routes to
+  `importPdfFile()` or the choose-pages picker. `importPdfFile()` decomposes
+  page-by-page, persists blobs as each page arrives, and commits the notebook
+  only after every page succeeds.
+* **Promotion** (§10): `rebuildPageAsEditable()` captures the user's ink, swaps
+  the raster for recovered objects, and re-applies the ink.
+  `promotePageToEditable()` does one page; `makeAllPagesEditable()` batches the
+  rest as lazy handoffs.
+* **Shared asset path**: `persistPageAssets()` is used by both import and
+  promotion, so a promoted page has exactly the shape an import produces.
+
+### `src/app/editorShortcuts.js` — global keyboard handler
+
+`createEditorShortcuts()` returns the single window-level `keydown` handler:
+tool keys (V/P/H/E/T), undo/redo, copy/paste, delete, zoom, `?` for help, and
+Escape while the Page Manager is open. It bails out via `isTypingTarget()` so
+form fields keep their keys — notably macOS's `Backspace`-labelled Delete key.
+
+### `src/app/backup.js` — whole-library backup and restore
+
+`createBackup()` exports `backupAllNotes`, `restoreFromBackup` and `saveBytes`.
+A backup is self-contained: every notebook, folder, colour and IndexedDB blob
+is inlined into one JSON file. Restore replaces the library atomically and
+only then deletes the assets the old library owned.
+
+### `src/app/pageManager.js` — the Page Manager
+
+`createPageManager()` owns the Noteful-style selection grid and its transient
+state (open/closed, selection, drag, clipboard, thumbnails, zoom to restore).
+It reorders, rotates, extracts, tags, copies, cuts, pastes, deletes, exports
+and promotes pages, mounting temporary engines for pages outside the sliding
+window.
+
+### `src/app/libraryEvents.js` — library screen events
+
+`createLibraryEvents()` wires cards, sidebar folders, pin/restore/trash
+actions, search, bulk selection, backup/restore and PDF import. Library view
+state stays in the shell; this module mutates it through injected
+getters/setters.
+
+### `src/ui/toolbar.js` — editor font toolbar
+
+`createToolbar()` exposes `renderFontOptions`, `updateFontToolbarState` and
+`syncToolbarForActivePage`, keeping font-control DOM sync out of the shell.
 
 ### `src/ui/` — modular UI templates & components
 
@@ -151,6 +235,12 @@ One instance per page. Wraps a Fabric `Canvas` and owns:
 * **`loadPage(page)`**: the fork between first import
   (`pendingDecomposedData` → build objects) and reopening (`canvasJson` → `loadFromJSON`).
 
+### `src/canvas/canvasBlob.js` — canvas blob conversions
+
+Helper routines converting off-screen canvases into WebP or PNG blobs for
+storage and thumbnail rendering. Shared by the PDF rasterizer, the decomposer
+and the importer.
+
 ### `src/pdf/decomposer.js` — Level B extraction
 
 `decomposePdf(buffer, scale, onPage, { mode })` walks every page. `mode` is
@@ -184,9 +274,6 @@ Spatial clustering algorithms that analyze extracted vector paths and cluster th
 
 ### `src/pdf/importModel.js` — import normalization
 Normalizes extracted objects, validates schema versions, and composes page-sized fallback image layers when full object extraction is partial or lossy.
-
-### `src/pdf/canvasBlob.js` — canvas blob conversions
-Helper routines converting off-screen canvases into WebP or PNG blobs for storage and thumbnail rendering.
 
 ### `src/pdf/raster.js` — crisp zoom for imported pages
 
@@ -257,9 +344,10 @@ the UI can explain rather than silently retry.
 Page sizes: a4 800×1130, letter 800×1035, slide 1200×675, square 800×800.
 Imported pages keep the PDF's own dimensions at 96 DPI (`scale = 1.3333`).
 
-`normalizeNote()` runs on every read and backfills missing fields, drops legacy
-inline dataURLs, and derives `detectedFonts` — it is the de-facto migration
-layer, invoked from `loadNotes()` and from `getActiveNote()` on all ~21 call sites.
+`normalizeNote()` (in `src/app/persistence.js`) runs on every read and backfills
+missing fields, drops legacy inline dataURLs, and derives `detectedFonts` — it is
+the de-facto migration layer, invoked from `loadNotes()` and from
+`getActiveNote()` on all ~21 call sites.
 
 ---
 
@@ -393,12 +481,14 @@ CSS-only scale (`preview`), and re-render at full resolution on release.
 
 ## 9. Known defects / debt
 
-1. **One live Fabric engine per page.** `initEditor` instantiates an
-   `OmniCanvas` for every page in the notebook, so memory is O(pages).
-   `isActivePage` limits render *quality*, not engine count.
-2. [RESOLVED] **Unload write safety & in-flight tracking.** `inFlightPayloads` tracks
-   every asynchronous IndexedDB write, drained on `pagehide` and `visibilitychange`
-   (`flushPayloads()`). Deep asset collection ensures no orphaned blobs on delete.
+1. [RESOLVED] **One live Fabric engine per page.** `initEditor` now mounts only
+   the current page plus one neighbour on each side (see `windowIndexes`); pages
+   outside the window render as a static thumbnail. `isActivePage` is retained
+   for render-scale bookkeeping only.
+2. [RESOLVED] **Unload write safety & in-flight tracking.** `inFlightPayloads`
+   (in `src/app/persistence.js`) tracks every asynchronous IndexedDB write,
+   drained on `pagehide` and `visibilitychange` (`flushPayloads()`). Deep asset
+   collection ensures no orphaned blobs on delete.
 3. **Undo is full-canvas snapshots** (35 deep, per engine) rather than commands.
 4. **Eraser uses a bounding-box hit test** (`performErase`) — no partial erase.
 5. [RESOLVED] **Page Manager icons.** Glyphs for `copy`, `cut`, `paste`, and `tag`
@@ -449,13 +539,13 @@ The mode is chosen in the library (`#import-mode`) and read once, before any
 
 | Concern | Location |
 |---|---|
-| Mode read + notebook construction | `main.js` import handler |
+| Mode read + notebook construction | `app/importFlow.js` `handlePdfImport()`, `importPdfFile()` |
 | Raster-only page record | `decomposer.js` `decomposePdf({ mode: "annotations" })` |
 | Single-page extraction | `decomposer.js` `decomposeStoredPdfPage()` |
-| Blob persistence (shared with import) | `main.js` `persistPageAssets()` |
-| Promotion and batch | `main.js` `promotePageToEditable()`, `makeAllPagesEditable()` |
+| Blob persistence (shared with import) | `app/importFlow.js` `persistPageAssets()` |
+| Promotion and batch | `app/importFlow.js` `promotePageToEditable()`, `makeAllPagesEditable()` |
 | Page layering | `engine.js` `loadPage()`, `addObjectsFromJson()` |
-| Controls | `main.js` `promoteControlsHtml()`, in the floating status pill |
+| Controls | `app/importFlow.js` `promoteControlsHtml()`, in the floating status pill |
 
 ### Decisions, and how they landed
 
@@ -504,8 +594,18 @@ quality* for distant pages, not the number of live Fabric engines.
 
 ---
 
-## 11. Git history
+## 11. Verification
 
-Eleven commits, latest `91d450d "refactor: modularize styles, extract UI views &
-viewport controller, update docs"`. `README.md` and `npm run build` verify clean,
-as do `npm run lint` (0 errors) and `npm test` (52 checks across three specs).
+Release gates:
+
+```bash
+npm run lint        # ESLint over src, scripts, tests and configs
+npm run test:unit   # Vitest: 56 checks across four unit suites
+npm test            # Playwright: seven browser regression specs
+npm run build       # Vite production bundle
+```
+
+CI (`.github/workflows/ci.yml`) runs lint, unit tests and the production build.
+The browser suite is run locally (it needs a Chrome-family binary); see
+`tests/run.mjs` for the `OMNI_BROWSER` / `OMNI_HEADED` switches. For the
+authoritative commit history, use `git log`.

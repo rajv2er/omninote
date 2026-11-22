@@ -25,6 +25,8 @@ tauri = { version = "2.11.3", features = [] }
 tauri-plugin-log = "2"
 tauri-plugin-process = "2"
 tauri-plugin-updater = "2"
+tauri-plugin-dialog = "2"
+tauri-plugin-fs = "2"
 
 # Cargo's default dev profile builds with opt-level = 0 and full debug info.
 # For a Tauri webview app the heavy work happens in JS/WebKit, so the Rust
