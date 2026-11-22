@@ -2,6 +2,28 @@
  * Toast notifications, warnings, and import summary dialogs.
  */
 
+
+function trapFocus(overlay) {
+  const handler = (e) => {
+    if (e.key !== "Tab") return;
+    const focusable = [...overlay.querySelectorAll(
+      'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])',
+    )].filter((el) => !el.disabled && el.offsetParent !== null);
+    if (!focusable.length) return;
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    if (e.shiftKey && document.activeElement === first) {
+      e.preventDefault();
+      last.focus();
+    } else if (!e.shiftKey && document.activeElement === last) {
+      e.preventDefault();
+      first.focus();
+    }
+  };
+  overlay.addEventListener("keydown", handler);
+  return () => overlay.removeEventListener("keydown", handler);
+}
+
 export const IMPORT_WARNING_TEXT = {
   "unsupported-graphics-operators": "Some graphics could not be converted.",
   "unsupported-annotations": "Some annotations stayed in the page image.",
@@ -185,6 +207,82 @@ export function clearStorageWarning() {
 }
 
 /**
+ * Non-blocking overlay listing the app's keyboard shortcuts.
+ */
+export function showShortcutsHelp() {
+  document.querySelector(".omni-shortcuts-overlay")?.remove();
+
+  const overlay = document.createElement("div");
+  overlay.className = "omni-shortcuts-overlay omni-confirm-overlay";
+  overlay.setAttribute("role", "dialog");
+  overlay.setAttribute("aria-label", "Keyboard shortcuts");
+
+  const box = document.createElement("div");
+  box.className = "omni-confirm omni-shortcuts";
+
+  const title = document.createElement("h3");
+  title.textContent = "Keyboard shortcuts";
+  box.appendChild(title);
+
+  const list = document.createElement("ul");
+  const shortcuts = [
+    ["Cmd/Ctrl + Z", "Undo"],
+    ["Cmd/Ctrl + Shift + Z", "Redo"],
+    ["Cmd/Ctrl + C / V", "Copy / Paste"],
+    ["Delete / Backspace", "Delete selection"],
+    ["V", "Select tool"],
+    ["P", "Pen"],
+    ["H", "Highlighter"],
+    ["E", "Eraser"],
+    ["T", "Text"],
+    ["Space + drag", "Pan"],
+    ["Cmd/Ctrl + + / -", "Zoom in / out"],
+    ["Cmd/Ctrl + 0", "Reset zoom"],
+    ["Cmd/Ctrl + 8", "Fit page"],
+    ["Cmd/Ctrl + 9", "Fit width"],
+    ["?", "Show this help"],
+  ];
+  for (const [key, action] of shortcuts) {
+    const item = document.createElement("li");
+    const kbd = document.createElement("kbd");
+    kbd.textContent = key;
+    const span = document.createElement("span");
+    span.textContent = action;
+    item.appendChild(kbd);
+    item.appendChild(span);
+    list.appendChild(item);
+  }
+  box.appendChild(list);
+
+  const close = document.createElement("button");
+  close.type = "button";
+  close.className = "ip-btn ip-btn-primary";
+  close.textContent = "Close";
+  const releaseTrap = trapFocus(overlay);
+  close.addEventListener("click", () => {
+    releaseTrap();
+    overlay.remove();
+  });
+  box.appendChild(close);
+
+  overlay.addEventListener("click", (e) => {
+    if (e.target === overlay) overlay.remove();
+  });
+  const onKey = (e) => {
+    if (e.key === "Escape") {
+      document.removeEventListener("keydown", onKey);
+      releaseTrap();
+      overlay.remove();
+    }
+  };
+  document.addEventListener("keydown", onKey);
+
+  overlay.appendChild(box);
+  document.body.appendChild(overlay);
+  close.focus();
+}
+
+/**
  * Import-time page picker: a modal grid of page thumbnails the user checks to
  * choose which pages are decomposed into editable objects on import.
  *
@@ -211,7 +309,7 @@ export function showImportPagePicker({ fileName, thumbnails, onDone }) {
   const tiles = thumbnails
     .map((url, i) => {
       const img = url
-        ? `<img class="ip-thumb" src="${url}" alt="Page ${i + 1}" draggable="false" />`
+        ? `<img class="ip-thumb" src="${escapeHtmlText(url)}" alt="Page ${i + 1}" draggable="false" />`
         : `<div class="ip-thumb ip-thumb-empty"></div>`;
       return `
         <button type="button" class="ip-tile" data-index="${i}" title="Page ${i + 1} — click to toggle">
@@ -256,9 +354,16 @@ export function showImportPagePicker({ fileName, thumbnails, onDone }) {
   };
 
   const finish = (indices) => {
+    document.removeEventListener("keydown", onKey);
+    releaseTrap();
     overlay.remove();
     onDone(indices);
   };
+  const releaseTrap = trapFocus(overlay);
+  const onKey = (e) => {
+    if (e.key === "Escape") finish(null);
+  };
+  document.addEventListener("keydown", onKey);
 
   grid.addEventListener("click", (e) => {
     const tile = e.target.closest(".ip-tile");
@@ -397,16 +502,24 @@ export function showConfirm(message, confirmLabel = "Delete", cancelLabel = "Can
   overlay.appendChild(box);
 
   return new Promise((resolve) => {
+    const releaseTrap = trapFocus(overlay);
     const done = (val) => {
+      document.removeEventListener("keydown", onKey);
+      releaseTrap();
       overlay.remove();
       resolve(val);
     };
+    const onKey = (e) => {
+      if (e.key === "Escape") done(false);
+    };
+    document.addEventListener("keydown", onKey);
     cancelBtn.addEventListener("click", () => done(false));
     confirmBtn.addEventListener("click", () => done(true));
     overlay.addEventListener("click", (e) => {
       if (e.target === overlay) done(false);
     });
     document.body.appendChild(overlay);
+    confirmBtn.focus();
   });
 }
 
@@ -461,10 +574,17 @@ export function showPrompt(message, defaultValue = "") {
   overlay.appendChild(box);
 
   return new Promise((resolve) => {
+    const releaseTrap = trapFocus(overlay);
     const done = (val) => {
+      document.removeEventListener("keydown", onKey);
+      releaseTrap();
       overlay.remove();
       resolve(val);
     };
+    const onKey = (e) => {
+      if (e.key === "Escape") done(null);
+    };
+    document.addEventListener("keydown", onKey);
     cancelBtn.addEventListener("click", () => done(null));
     confirmBtn.addEventListener("click", () => done(input.value.trim()));
     input.addEventListener("keydown", (e) => {

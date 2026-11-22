@@ -172,3 +172,22 @@
   background-size: 24px 24px !important;
 }
 
+.paper-cornell {
+  background-color: #ffffff !important;
+  background-image: linear-gradient(#e2e8f0 1px, transparent 1px),
+    linear-gradient(to right, #e2e8f0 1px, transparent 1px) !important;
+  background-size: 100% 28px, 30% 100% !important;
+  background-position: 0 0, 30% 0 !important;
+}
+
+.paper-music {
+  background-color: #ffffff !important;
+  background-image: repeating-linear-gradient(
+    transparent,
+    transparent 11px,
+    #cbd5e1 11px,
+    #cbd5e1 12px
+  ) !important;
+  background-size: 100% 60px !important;
+}
+

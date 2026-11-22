@@ -319,7 +319,13 @@ export function initZoomWindow() {
   const stripEl = document.querySelector("#zw-canvas");
   const boxEl = document.querySelector("#zw-box");
   if (!stripEl || !boxEl) return;
-  if (!zoomWindow) zoomWindow = new ZoomWindow({ stripEl, boxEl });
+  // The editor DOM is rebuilt on every render, so a cached ZoomWindow would
+  // keep writing to detached canvas/box nodes. Rebind to the fresh ones.
+  if (zoomWindow) {
+    zoomWindow.destroy();
+    zoomWindow = null;
+  }
+  zoomWindow = new ZoomWindow({ stripEl, boxEl });
   attachZoomWindow();
 }
 

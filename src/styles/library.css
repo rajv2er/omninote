@@ -81,6 +81,7 @@ nav {
 
 .side {
   width: 100%;
+  cursor: pointer;
   display: flex;
   gap: 11px;
   align-items: center;
@@ -312,6 +313,27 @@ nav {
   position: relative;
   display: flex;
   flex-direction: column;
+  content-visibility: auto;
+  contain-intrinsic-size: 260px 320px;
+}
+
+.selection-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 12px;
+  margin-bottom: 12px;
+  background: var(--bg-surface);
+  border-radius: 8px;
+}
+
+.note-select-checkbox {
+  position: absolute;
+  top: 8px;
+  left: 8px;
+  z-index: 2;
+  width: 18px;
+  height: 18px;
 }
 
 .note-card {

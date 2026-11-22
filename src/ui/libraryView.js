@@ -50,8 +50,10 @@ export function renderFontOptions(note, currentSelectedFont) {
   return html;
 }
 
-export function noteCard(note, view, folders = []) {
+export function noteCard(note, view, folders = [], selectionMode = false, selectedIds = new Set()) {
+  const SAFE_PAPER_STYLES = new Set(["plain", "lined", "grid", "dotted", "cornell", "music"]);
   const firstPage = note.pages?.[0];
+  const paperStyle = SAFE_PAPER_STYLES.has(firstPage?.paperStyle) ? firstPage.paperStyle : "plain";
   const pageCount = note.pages?.length || 1;
   const thumbAssetId = firstPage?.thumbnailAssetId || note.thumbnailAssetId;
   const legacyThumb =
@@ -61,7 +63,7 @@ export function noteCard(note, view, folders = []) {
   if (thumbAssetId) {
     thumbMarkup = `<img data-thumb="${escapeHtml(thumbAssetId)}" alt="" />`;
   } else if (legacyThumb) {
-    thumbMarkup = `<img src="${legacyThumb}" alt="" />`;
+    thumbMarkup = `<img src="${escapeHtml(legacyThumb)}" alt="" />`;
   }
 
   const inTrash = view === "trashed";
@@ -80,16 +82,19 @@ export function noteCard(note, view, folders = []) {
     : `<select class="card-folder-select" data-folder-select="${escapeHtml(note.id)}" title="Move to folder" aria-label="Move to folder">${folderOptions}</select>`;
 
   return `
-    <div class="note-card-wrapper">
+    <div class="note-card-wrapper" data-note-id="${escapeHtml(note.id)}">
+      ${selectionMode
+        ? `<input type="checkbox" class="note-select-checkbox" data-select-note="${escapeHtml(note.id)}" ${selectedIds.has(note.id) ? "checked" : ""} aria-label="Select ${escapeHtml(note.title)}" />`
+        : ""}
       <button class="note-card" data-open="${escapeHtml(note.id)}">
-        <div class="preview ${firstPage?.paperStyle ? `paper-${firstPage.paperStyle}` : ""}">
+        <div class="preview paper-${paperStyle}">
           ${note.isPdf ? `<span class="preview-badge">${pageCount} ${pageCount === 1 ? "Page" : "Pages"}</span>` : ""}
           ${thumbMarkup}
         </div>
         <strong>${escapeHtml(note.title)}</strong>
         <small>${pageCount} ${pageCount === 1 ? "page" : "pages"} · ${note.isPdf ? "PDF Document" : "Notebook"}</small>
-        ${folderSelect}
       </button>
+      ${folderSelect ? `<div class="card-folder-wrap">${folderSelect}</div>` : ""}
       <div class="card-actions">
         ${inTrash
           ? `<button class="card-restore-btn" data-restore="${escapeHtml(note.id)}" title="Restore">${icon("restore", 14)}</button>`
@@ -104,12 +109,12 @@ export function sidebar({ notes, folders, activeFolder, noteCount, folderPrefix 
   const folderList = folders
     .map(
       (f) => `
-      <button class="side ${activeFolder === folderPrefix + f.id ? "active" : ""}" data-folder="${folderPrefix}${escapeHtml(f.id)}">
+      <div class="side ${activeFolder === folderPrefix + f.id ? "active" : ""}" data-folder="${folderPrefix}${escapeHtml(f.id)}" role="button" tabindex="0">
         ${icon("folder", 16)}
         <span>${escapeHtml(f.name)}</span>
         <span class="side-badge">${notes.filter((n) => !n.trashed && n.folderId === f.id).length}</span>
         <button class="side-remove" data-remove-folder="${escapeHtml(f.id)}" title="Delete folder">${icon("close", 12)}</button>
-      </button>`,
+      </div>`,
     )
     .join("");
 
@@ -162,6 +167,10 @@ export function sidebar({ notes, folders, activeFolder, noteCount, folderPrefix 
         ${icon("download", 14)}
         <span>Check for Updates</span>
       </button>
+      <button class="side-update" id="shortcuts-btn" title="Keyboard shortcuts">
+        ${icon("text", 14)}
+        <span>Shortcuts</span>
+      </button>
     </div>
   `;
 }
@@ -175,6 +184,8 @@ export function libraryView({
   emptyMsg,
   noteCount,
   folderPrefix,
+  selectionMode = false,
+  selectedIds = new Set(),
 }) {
   return `
     <div class="shell">
@@ -190,10 +201,19 @@ export function libraryView({
               ${icon("search", 15)}
               <input type="text" placeholder="Search notes..." id="search-input" />
             </div>
-            <label class="import-pdf-btn">
+            <label class="import-pdf-btn" id="import-pdf-btn">
               ${icon("upload", 15)}
               Import PDF
               <input type="file" accept="application/pdf,.pdf" id="pdf-input" />
+            </label>
+            <button class="new-note-btn" id="backup-btn" title="Download a backup of all notebooks">
+              ${icon("download", 15)}
+              Back up
+            </button>
+            <label class="import-pdf-btn" id="restore-btn" title="Restore notebooks from a backup file">
+              ${icon("restore", 15)}
+              Restore
+              <input type="file" accept="application/json,.omninote" id="restore-input" />
             </label>
             <select
               id="import-mode"
@@ -204,20 +224,32 @@ export function libraryView({
               <option value="choose">Choose pages…</option>
               <option value="editable">Make editable</option>
             </select>
+            <button class="new-note-btn" id="selection-mode-btn" title="Select multiple notebooks">
+              ${icon("select", 16)}
+              ${selectionMode ? "Done" : "Select"}
+            </button>
             <button class="new-note-btn" id="new-note-btn">
               ${icon("plus", 16)}
               New Note
             </button>
-            <!-- TEMP-DIAG: one-click diagnostics for the white-page investigation. Remove after. -->
-            <button class="new-note-btn" id="diag-btn" title="Download notebook diagnostics JSON">
-              Diag
-            </button>
           </div>
         </header>
 
+        ${selectionMode
+          ? `<div class="selection-toolbar">
+              <span>${selectedIds.size} selected</span>
+              <select id="bulk-folder-select" class="card-folder-select" aria-label="Move selected to folder">
+                <option value="__none__">No folder</option>
+                ${folders.map((f) => `<option value="${escapeHtml(f.id)}">${escapeHtml(f.name)}</option>`).join("")}
+              </select>
+              <button class="ip-btn ip-btn-quiet" id="bulk-move-btn" ${selectedIds.size ? "" : "disabled"}>Move</button>
+              <button class="ip-btn ip-btn-quiet" id="bulk-trash-btn" ${selectedIds.size ? "" : "disabled"}>Trash</button>
+              <button class="ip-btn ip-btn-quiet" id="bulk-cancel-btn">Cancel</button>
+            </div>`
+          : ""}
         <p class="library-section-label">${escapeHtml(heading)} (${visibleNotes.length})</p>
         <div class="note-grid">
-          ${visibleNotes.length ? visibleNotes.map((n) => noteCard(n, activeFolder, folders)).join("") : `<div class="library-empty">${emptyMsg}</div>`}
+          ${visibleNotes.length ? visibleNotes.map((n) => noteCard(n, activeFolder, folders, selectionMode, selectedIds)).join("") : `<div class="library-empty">${emptyMsg}</div>`}
         </div>
 
         <button class="fab" id="fab-new-note" title="Create New Note">

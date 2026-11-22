@@ -1,6 +1,5 @@
 import "./style.css";
 import { OmniCanvas } from "./canvas/engine.js";
-import { Point } from "fabric";
 import {
   configureViewport,
   ZOOM_MIN,
@@ -28,51 +27,31 @@ import {
   zoomWindowMoveTo,
 } from "./canvas/viewport.js";
 
-import {
-  decomposePdf,
-  decomposeStoredPdfPage,
-  renderPdfPageThumbnails,
-  IMPORT_SCHEMA_VERSION,
-  IMPORTED_OBJECT_VERSION,
-} from "./pdf/decomposer.js";
-import { invalidatePdfDoc, renderPdfPageBlob } from "./pdf/raster.js";
-import { canvasToBlob } from "./pdf/canvasBlob.js";
 import { exportNotebookToPdf, renderPageThumbnail } from "./pdf/exporter.js";
 import {
   putAsset,
   putAssetFromDataUrl,
   deleteAssets,
-  getAsset,
-  getAssetUrl,
-  collectNoteAssetIdsDeep,
   collectPageAssetIdsDeep,
-  canvasKeyForPage,
-  pendingKeyForPage,
-  putPagePayload,
-  getPagePayload,
 } from "./storage/assets.js";
-import { composePageSizedFallback, PDF_IMPORT_SCALE } from "./pdf/importModel.js";
+import { createPersistence } from "./app/persistence.js";
+import { createImportFlow } from "./app/importFlow.js";
+import { createEditorShortcuts } from "./app/editorShortcuts.js";
+import { createBackup } from "./app/backup.js";
+import { createPageManager } from "./app/pageManager.js";
+import { createLibraryEvents } from "./app/libraryEvents.js";
 import { icon } from "./ui/icons.js";
 import { escapeHtml } from "./ui/escapeHtml.js";
 import {
-  showImportReport,
-  showImportPagePicker,
-  summarizeImport,
   showStorageWarning,
   clearStorageWarning,
   showToast,
   showConfirm,
   showPrompt,
 } from "./ui/dialogs.js";
-import {
-  libraryView as renderLibraryHtml,
-  renderFontOptions as renderFontOptionsHtml,
-} from "./ui/libraryView.js";
-import {
-  pageManagerTilesHtml as renderPageManagerTilesHtml,
-  pageManagerOverlay as renderPageManagerOverlay,
-} from "./ui/pageManagerView.js";
-import { checkForUpdates, autoCheckForUpdates } from "./updater.js";
+import { libraryView as renderLibraryHtml } from "./ui/libraryView.js";
+import { createToolbar } from "./ui/toolbar.js";
+import { autoCheckForUpdates } from "./updater.js";
 
 const STORE_KEY = "omninote-notes-v2";
 const FOLDERS_KEY = "omninote-folders";
@@ -85,6 +64,7 @@ const PAGE_SIZES = {
 };
 
 const FOLDER_PREFIX = "folder:";
+const SAFE_PAPER_STYLES = new Set(["plain", "lined", "grid", "dotted", "cornell", "music"]);
 
 function loadFolders() {
   try {
@@ -127,16 +107,80 @@ const sampleNote = {
   ],
 };
 
-let notes = loadNotes();
-let activeId = notes[0]?.id || null;
+const normalizedNotes = new WeakSet();
+let notes = [];
+let activeId = null;
+let lastRenderedNoteId = null;
 let canvasEngines = [];
+// Pages whose IndexedDB payloads have been loaded (or confirmed absent).
+// A WeakSet keeps this out of the persisted notebook record.
+const hydratedPages = new WeakSet();
+
+let scheduleSnapshotRef = () => {};
+const persistence = createPersistence({
+  storeKey: STORE_KEY,
+  getNotes: () => notes,
+  getFolders: () => folders,
+  getCustomColors: () => customColors,
+  normalizedNotes,
+  hydratedPages,
+  showStorageWarning,
+  clearStorageWarning,
+  onSaved: () => scheduleSnapshotRef(),
+});
+const {
+  normalizeNote,
+  loadNotes,
+  saveNotes,
+  hydratePage,
+  hydrateNote,
+  hydrateNotes,
+  isNoteHydrated,
+  flushPayloads,
+  pendingWrites,
+  snapshotNotes,
+  restoreFromSnapshot,
+  scheduleSnapshot,
+} = persistence;
+scheduleSnapshotRef = scheduleSnapshot;
 const pageHistoryCache = new Map(); // pageId -> { history, historyIndex }
+// Keep undo history for only the most recently evicted pages; otherwise
+// scrolling a long notebook pins a full snapshot stack for every page.
+const PAGE_HISTORY_CACHE_LIMIT = 8;
 // Off-window pages render as a static preview. Re-rasterizing one on every
 // window change would make scrolling through a long notebook far more
 // expensive than the engines the window exists to avoid, so the preview is
 // cached per page and only dropped when that page's content changes.
 const staticThumbCache = new Map(); // pageId -> data URL
 const STATIC_THUMB_WIDTH = 320;
+// Rendering every off-window preview at once (common on first open of a long
+// notebook) used to spawn dozens of concurrent PDF renders. Serialize them
+// behind a small concurrency limit instead.
+const THUMB_RENDER_CONCURRENCY = 3;
+let thumbRenderActive = 0;
+const thumbRenderQueue = [];
+function pumpThumbRenderQueue() {
+  while (thumbRenderActive < THUMB_RENDER_CONCURRENCY && thumbRenderQueue.length) {
+    const task = thumbRenderQueue.shift();
+    thumbRenderActive++;
+    task()
+      .catch(() => {})
+      .finally(() => {
+        thumbRenderActive--;
+        pumpThumbRenderQueue();
+      });
+  }
+}
+function queueThumbRender(task) {
+  return new Promise((resolve, reject) => {
+    thumbRenderQueue.push(() =>
+      Promise.resolve()
+        .then(task)
+        .then(resolve, reject),
+    );
+    pumpThumbRenderQueue();
+  });
+}
 /**
  * Visibility margin a neighbouring page must clear before it dethrones the
  * current page. Without it the scroll observer flaps between two pages near
@@ -144,8 +188,7 @@ const STATIC_THUMB_WIDTH = 320;
  */
 const ACTIVE_PAGE_HYSTERESIS = 0.15;
 // Recent engine-mount failures (page index, message, timestamp), newest last,
-// capped so a pathological page cannot grow memory. Surfaced in the TEMP-DIAG
-// dump because the Tauri WebView has no visible console.
+// capped so a pathological page cannot grow memory.
 const mountErrors = [];
 function recordMountError(index, err) {
   mountErrors.push({
@@ -172,7 +215,7 @@ let outsideClickHandler = null;
 // `ReferenceError: editorKeyHandler is not defined`.)
 let editorKeyHandler = null;
 let currentTool = "select";
-let currentColor = "#176a72";
+let currentColor = sanitizeColor("#176a72");
 let currentWidth = 4;
 let currentPenStyle = "ballpoint";
 /** Every palette starts from this, so there is always at least one colour. */
@@ -180,10 +223,21 @@ const DEFAULT_COLOR = "#176a72";
 /** Two-column rail: eleven swatches plus the add button. */
 const MAX_SWATCHES = 11;
 
+/** Accepts only safe hex colors to prevent CSS/attribute injection. */
+function isSafeColor(value) {
+  return typeof value === "string" && /^#[0-9a-fA-F]{3,8}$/.test(value.trim());
+}
+function sanitizeColor(value) {
+  const trimmed = typeof value === "string" ? value.trim() : "";
+  return isSafeColor(trimmed) ? trimmed : DEFAULT_COLOR;
+}
+
 let customColors = [];
 try {
-  customColors =
-    JSON.parse(localStorage.getItem("omninote-custom-colors")) || [];
+  const parsed = JSON.parse(localStorage.getItem("omninote-custom-colors"));
+  if (Array.isArray(parsed)) {
+    customColors = parsed.map(sanitizeColor).filter(isSafeColor);
+  }
 } catch {}
 if (!Array.isArray(customColors) || customColors.length === 0) {
   customColors = [DEFAULT_COLOR];
@@ -285,410 +339,10 @@ let loadingMessage = "";
 let showShapesFlyout = false;
 let showPageSetup = false;
 let activeFolder = "unfiled";
+let librarySelectionMode = false;
+const selectedNoteIds = new Set();
 
 
-// Page Manager (Noteful-style "Select" grid) state
-let showPageManager = false;
-let pageManagerSelection = new Set();
-let pageManagerAnchor = null;
-let pageManagerThumbs = [];
-let pageManagerPriorZoom = 1;
-let zoomRestoreTarget = null;
-// Live drag-to-reorder gesture in the Page Manager grid. Null when idle.
-let pageManagerDrag = null;
-// A completed drag also emits a click; that click must not toggle selection.
-// Cleared on the next pointerdown so it can never stay latched.
-let pageManagerSuppressClick = false;
-// Pointer travel before a press counts as a drag rather than a click.
-const PM_DRAG_THRESHOLD = 6;
-// Page-level clipboard for the Page Manager Copy / Cut / Paste ops. Each entry
-// is a fully cloned page object (new id, cloned canvasJson, shared asset ids).
-let pageClipboard = [];
-
-function normalizeNote(n) {
-  if (!n) return n;
-  // Legacy cleanup. Before the asset store, imported pages kept full-size
-  // dataURLs inline, which blows the localStorage quota. Drop them on load.
-  for (const p of n.pages || []) {
-    if (p.pendingDecomposedData?.backgroundDataUrl) {
-      delete p.pendingDecomposedData.backgroundDataUrl;
-    }
-    if (typeof p.thumbnail === "string" && p.thumbnail.length > 20000) {
-      p.thumbnail = null;
-    }
-    if (p.backgroundAssetId === undefined) p.backgroundAssetId = null;
-    if (p.thumbnailAssetId === undefined) p.thumbnailAssetId = null;
-
-    // Import schema v2 backfills. Every field is optional and additive: a
-    // record written by any earlier version must still open, and a malformed
-    // report must never block it.
-    if (!Array.isArray(p.tags)) p.tags = [];
-    if (p.importSchemaVersion === undefined) p.importSchemaVersion = 1;
-
-    // `pendingDecomposedData` is the pre-v2 name for the same one-shot
-    // handoff. Alias it forward rather than rewriting the record, so the
-    // original asset ids are never discarded.
-    if (!p.pendingImportData && p.pendingDecomposedData) {
-      p.pendingImportData = p.pendingDecomposedData;
-    }
-    if (p.fallbackVisible === undefined) {
-      // Records written before the flag existed predate the completeness
-      // decision; keeping the fallback is the appearance-preserving default.
-      p.fallbackVisible = true;
-    }
-    // Older records always used a whole-page render as their fallback, so
-    // defaulting to false keeps their re-rasterization behaviour unchanged.
-    if (p.fallbackFromImage === undefined) p.fallbackFromImage = false;
-
-    // Which document owns this page. An imported page starts as a locked raster
-    // the user writes on top of ("annotate") and can be promoted in place to
-    // native objects ("notes"). A page that never came from a PDF is always
-    // native, so it never offers promotion.
-    if (p.pdfPageIndex == null) {
-      p.editMode = "notes";
-      p.decomposedObjects = true;
-    } else if (p.editMode !== "annotate" && p.editMode !== "notes") {
-      // Records written before the flag existed: anything already holding
-      // decomposed objects, or an unconsumed import handoff, was an editable
-      // import. Everything else was a raster-only import.
-      p.decomposedObjects =
-        p.decomposedObjects === true ||
-        Boolean(p.pendingImportData || p.pendingDecomposedData);
-      p.editMode = p.decomposedObjects ? "notes" : "annotate";
-    }
-    // A conversion in flight cannot survive a reload, so only a recorded
-    // failure is restored; any other value means the page is idle.
-    if (p.conversionState !== "failed") p.conversionState = "idle";
-
-    const report = p.importReport;
-    p.importReport =
-      report && typeof report === "object" && typeof report.status === "string"
-        ? {
-            status: report.status,
-            textObjects: Number(report.textObjects) || 0,
-            vectorGroups: Number(report.vectorGroups) || 0,
-            imageObjects: Number(report.imageObjects) || 0,
-            fallbackRegions: Number(report.fallbackRegions) || 0,
-            backdropImages: Number(report.backdropImages) || 0,
-            fallbackFromImage: report.fallbackFromImage === true,
-            unsupportedOperators: Number(report.unsupportedOperators) || 0,
-            unsupportedAnnotations: Array.isArray(report.unsupportedAnnotations)
-              ? report.unsupportedAnnotations
-              : [],
-            nonVisualAnnotations: Array.isArray(report.nonVisualAnnotations)
-              ? report.nonVisualAnnotations
-              : [],
-            warnings: Array.isArray(report.warnings) ? report.warnings : [],
-            errors: Array.isArray(report.errors) ? report.errors : [],
-          }
-        : null;
-  }
-
-  if (n.pinned === undefined) n.pinned = false;
-  if (n.trashed === undefined) n.trashed = false;
-  if (n.folderId === undefined) n.folderId = null;
-
-  if (!Array.isArray(n.pages) || n.pages.length === 0) {
-    n.pages = [
-      {
-        id: crypto.randomUUID(),
-        pageNumber: 1,
-        width: n.width || 800,
-        height: n.height || 1130,
-        paperStyle: n.paperStyle || "plain",
-        pageSize: n.pageSize || "custom",
-        thumbnail: n.thumbnail || null,
-        canvasJson: n.canvasJson || null,
-        pendingDecomposedData: n.pendingDecomposedData || null,
-        pendingImportData: n.pendingImportData || null,
-        importSchemaVersion: 1,
-        fallbackVisible: true,
-        importReport: null,
-        // A page invented for a notebook that has none is native, never an
-        // imported raster, so it is never a promotion candidate.
-        editMode: "notes",
-        conversionState: "idle",
-        decomposedObjects: true,
-        tags: [],
-      },
-    ];
-  }
-  if (
-    n.currentPageIndex === undefined ||
-    n.currentPageIndex >= n.pages.length
-  ) {
-    n.currentPageIndex = 0;
-  }
-  if (!n.defaultFont) {
-    n.defaultFont = "DM Sans";
-  }
-  if (!Array.isArray(n.detectedFonts)) {
-    n.detectedFonts = [];
-  }
-  if (n.detectedFonts.length === 0 && n.pages) {
-    const detected = new Set();
-    let mostUsed = null;
-    for (const p of n.pages) {
-      const pending = p.pendingImportData || p.pendingDecomposedData;
-      if (pending?.detectedFonts) {
-        pending.detectedFonts.forEach((f) => detected.add(f));
-      }
-      if (!mostUsed && pending?.mostUsedFont) {
-        mostUsed = pending.mostUsedFont;
-      }
-    }
-    if (detected.size > 0) {
-      n.detectedFonts = Array.from(detected);
-      if (n.defaultFont === "DM Sans" && mostUsed) {
-        n.defaultFont = mostUsed;
-      }
-    }
-  }
-  return n;
-}
-
-function loadNotes() {
-  try {
-    const saved = JSON.parse(localStorage.getItem(STORE_KEY));
-    console.log('[loadNotes] localStorage data:', saved ? 'found' : 'empty');
-    if (Array.isArray(saved) && saved.length > 0) {
-      console.log('[loadNotes] Loaded', saved.length, 'notes');
-      return saved.map(normalizeNote);
-    }
-    console.log('[loadNotes] Using sample note');
-    return [normalizeNote(sampleNote)];
-  } catch (e) {
-    console.error('[loadNotes] Error:', e);
-    return [normalizeNote(sampleNote)];
-  }
-}
-
-/**
- * The last JSON written to IndexedDB for each page payload, keyed by storage
- * key. Editing one page must not rewrite the other thirteen.
- * @type {Map<string, string>}
- */
-const persistedPayloads = new Map();
-
-/**
- * Payload writes that have not settled yet.
- *
- * The notebook record in localStorage is written synchronously, but the object
- * graph it refers to lands in IndexedDB asynchronously. A quit during that gap
- * leaves a page whose graph never arrived — it comes back blank, with no error.
- * These are tracked so the app can drain them before it goes away.
- * @type {Set<Promise<void>>}
- */
-const inFlightPayloads = new Set();
-
-/** Registers a payload write so it can be drained on unload. */
-function trackPayload(promise) {
-  const tracked = promise
-    .catch(() => {})
-    .finally(() => inFlightPayloads.delete(tracked));
-  inFlightPayloads.add(tracked);
-  return tracked;
-}
-
-/**
- * Settles every payload write still in flight.
- *
- * Best-effort by nature: unload handlers get no time to await. It is still worth
- * doing, because backgrounding the app (visibilitychange) leaves the process
- * alive, and an already-open IndexedDB transaction usually completes.
- */
-function flushPayloads() {
-  return Promise.all([...inFlightPayloads]);
-}
-
-/**
- * Writes a page payload, skipping the write when it has not changed.
- *
- * `null` means the payload was cleared, which deletes the stored copy. That
- * matters for the import handoff: leaving it behind would let a later load
- * rebuild the page from its original import data and silently discard every
- * edit the user has since made.
- */
-function persistPayload(key, value) {
-  if (!key) return Promise.resolve();
-
-  if (value == null) {
-    if (persistedPayloads.get(key) === null) return Promise.resolve();
-    persistedPayloads.set(key, null);
-    return trackPayload(deleteAssets([key]).catch(() => {}));
-  }
-
-  let json;
-  try {
-    json = typeof value === "string" ? value : JSON.stringify(value);
-  } catch {
-    return Promise.resolve();
-  }
-  if (persistedPayloads.get(key) === json) return Promise.resolve();
-
-  persistedPayloads.set(key, json);
-  return trackPayload(
-    putPagePayload(key, json).catch((err) => {
-      // Drop the cached value so the next save retries rather than believing
-      // this payload is already stored.
-      persistedPayloads.delete(key);
-      console.warn("Could not store page data:", err);
-    }),
-  );
-}
-
-/**
- * Makes sure every page payload that is currently in memory has been written.
- *
- * `saveNotes` strips these payloads from the localStorage record, so anything
- * not yet in IndexedDB would be dropped on the floor — this is the safety net
- * for payloads that arrived some other way (a legacy record, or a page whose
- * graph was assigned directly).
- */
-function ensurePayloadsPersisted() {
-  for (const note of notes) {
-    for (const page of note.pages || []) {
-      // Missing means "not loaded yet" for notebooks outside the active one;
-      // null means "explicitly cleared" (e.g. an import handoff consumed on
-      // first open). Never turn an unloaded payload into a delete request:
-      // saving notebook A must not erase notebook B's IndexedDB data.
-      if (page.canvasJson !== undefined) {
-        persistPayload(canvasKeyForPage(page), page.canvasJson);
-      }
-      if (
-        page.pendingImportData !== undefined ||
-        page.pendingDecomposedData !== undefined
-      ) {
-        persistPayload(
-          pendingKeyForPage(page),
-          page.pendingImportData ?? page.pendingDecomposedData ?? null,
-        );
-      }
-    }
-  }
-}
-
-/**
- * The localStorage shape of the notebooks: everything except the object graph
- * and the import handoff, which are far too large to live here.
- */
-function projectNotesForStorage() {
-  return notes.map((note) => ({
-    ...note,
-    pages: (note.pages || []).map((page) => {
-      const {
-        canvasJson: _canvasJson,
-        pendingImportData: _pendingImportData,
-        pendingDecomposedData: _pendingDecomposedData,
-        ...rest
-      } = page;
-      return rest;
-    }),
-  }));
-}
-
-/**
- * Loads every page's object graph back out of IndexedDB.
- *
- * Modern notebooks keep only the payload keys in localStorage, so the graph
- * must be loaded before a notebook can render. To keep the library fast, this
- * is now done lazily per-notebook instead of eagerly parsing every page in the
- * library at startup. Legacy notebooks that still have an inline canvasJson or
- * pendingImportData are migrated on first load.
- */
-async function hydrateNote(note) {
-  if (!note || !Array.isArray(note.pages)) return;
-
-  const jobs = [];
-  for (const page of note.pages) {
-    const canvasKey = canvasKeyForPage(page);
-    if (canvasKey && !page.canvasJson) {
-      jobs.push(
-        getPagePayload(canvasKey)
-          .then((json) => {
-            if (typeof json === "string") {
-              page.canvasJson = JSON.parse(json);
-              persistedPayloads.set(canvasKey, json);
-            }
-          })
-          .catch((err) => {
-            console.error("[hydrateNote] Error loading canvas for page", page.id, err);
-          }),
-      );
-    }
-
-    const pendingKey = pendingKeyForPage(page);
-    // Load the handoff whenever it is not already in memory — even when a
-    // canvas graph is present. A teardown save can persist an empty graph for
-    // a page whose handoff was never consumed; skipping the handoff then
-    // strands it in IndexedDB while the page reopens blank forever. loadPage
-    // already layers both sources, so loading both is always safe.
-    if (pendingKey && !page.pendingImportData && !page.pendingDecomposedData) {
-      jobs.push(
-        getPagePayload(pendingKey)
-          .then((json) => {
-            if (typeof json === "string") {
-              page.pendingImportData = JSON.parse(json);
-              persistedPayloads.set(pendingKey, json);
-            }
-          })
-          .catch((err) => {
-            console.error("[hydrateNote] Error loading pending for page", page.id, err);
-          }),
-      );
-    }
-  }
-
-  await Promise.all(jobs);
-}
-
-/**
- * One-shot migration path for legacy notebooks that still store the object
- * graph inline in localStorage. Modern notebooks keep only payload keys, so
- * this is a no-op. The migration was removed when the storage format changed;
- * this stub is kept so the startup sequence doesn't need to change.
- */
-async function hydrateNotes() {
-  // No-op: modern notebooks store payloads in IndexedDB, not localStorage.
-}
-
-/** True when the notebook's page payloads have already been loaded. */
-function isNoteHydrated(note) {
-  return (note.pages || []).every(
-    (p) =>
-      p.canvasJson ||
-      p.pendingImportData ||
-      p.pendingDecomposedData ||
-      !canvasKeyForPage(p),
-  );
-}
-
-function saveNotes() {
-  // Nothing may be stripped from the record until it is safely stored.
-  ensurePayloadsPersisted();
-
-  try {
-    localStorage.setItem(STORE_KEY, JSON.stringify(projectNotesForStorage()));
-    clearStorageWarning();
-    return true;
-  } catch (e) {
-    console.warn("Storage quota exceeded, stripping thumbnails:", e);
-    // If local storage is full, strip heavy thumbnails to allow note save
-    try {
-      const stripped = projectNotesForStorage().map((n) => ({
-        ...n,
-        pages: n.pages.map((p) => ({ ...p, thumbnail: null })),
-      }));
-      localStorage.setItem(STORE_KEY, JSON.stringify(stripped));
-      return true;
-    } catch (err2) {
-      console.error("Critical storage failure:", err2);
-      // Losing the notebook silently is the worst possible outcome, so say so.
-      showStorageWarning(err2);
-      return false;
-    }
-  }
-}
 
 
 function getActiveNote() {
@@ -708,6 +362,184 @@ function getActiveCanvasEngine() {
   return canvasEngines[note.currentPageIndex] || null;
 }
 
+/**
+ * Switch every canvas engine to `tool` and keep the toolbar's selected state
+ * in sync. Used by both the toolbar buttons and the single-key shortcuts
+ * (V/P/H/E/T) advertised in the shortcuts dialog.
+ */
+function setActiveTool(tool) {
+  currentTool = tool;
+  canvasEngines.forEach((e) => e?.setTool(currentTool));
+
+  document
+    .querySelectorAll("[data-tool]")
+    .forEach((b) => b.classList.remove("selected"));
+  document
+    .querySelector(`[data-tool="${tool}"]`)
+    ?.classList.add("selected");
+
+  const engine = getActiveCanvasEngine();
+  if (engine) {
+    updateFontToolbarState(engine.canvas.getActiveObjects());
+  }
+}
+
+function beginLoading(message) {
+  isLoading = true;
+  loadingMessage = message;
+  renderLoading();
+}
+
+function endLoading() {
+  isLoading = false;
+}
+
+const {
+  releaseReplacedBackground,
+  isPromotablePage,
+  promoteControlsHtml,
+  refreshPromoteControls,
+  rebuildPageAsEditable,
+  promotePageToEditable,
+  makeAllPagesEditable,
+  handlePdfImport,
+  pickPdfFileNative,
+} = createImportFlow({
+  getNotes: () => notes,
+  setActiveId: (id) => {
+    activeId = id;
+  },
+  registerNote: (note) => normalizedNotes.add(note),
+  getActiveNote,
+  getCanvasEngines: () => canvasEngines,
+  saveNotes,
+  saveEngineToPage,
+  render,
+  setLoading: beginLoading,
+  clearLoading: endLoading,
+});
+
+const { backupAllNotes, restoreFromBackup, saveBytes } = createBackup({
+  getNotes: () => notes,
+  setNotes: (next) => {
+    notes = next;
+  },
+  getFolders: () => folders,
+  setFolders: (next) => {
+    folders = next;
+  },
+  getCustomColors: () => customColors,
+  setCustomColors: (next) => {
+    customColors = next;
+  },
+  setActiveId: (id) => {
+    activeId = id;
+  },
+  markPageHydrated: (page) => hydratedPages.add(page),
+  saveFolders,
+  saveCustomColors,
+  normalizeNote,
+  hydrateNote,
+  saveNotes,
+  render,
+  setLoading: beginLoading,
+  clearLoading: endLoading,
+  refreshLoading: renderLoading,
+  sanitizeColor,
+  defaultColor: DEFAULT_COLOR,
+  safePaperStyles: SAFE_PAPER_STYLES,
+});
+
+const {
+  pageManagerOverlay,
+  openPageManager,
+  closePageManager,
+  isPageManagerOpen,
+  bindPageManagerGrid,
+  bindPageManagerControls,
+  consumeZoomRestoreTarget,
+} = createPageManager({
+  getNotes: () => notes,
+  getActiveNote,
+  getCanvasEngines: () => canvasEngines,
+  getActiveCanvasEngine,
+  setActiveId: (id) => {
+    activeId = id;
+  },
+  saveNotes,
+  render,
+  saveActiveCanvasPage,
+  saveEngineToPage,
+  forgetPageCaches,
+  createPageEngine,
+  setStaticPageThumbnail,
+  hydrateNote,
+  setLoading: beginLoading,
+  clearLoading: endLoading,
+  refreshLoading: renderLoading,
+  saveBytes,
+  isPromotablePage,
+  rebuildPageAsEditable,
+  refreshPromoteControls,
+  releaseReplacedBackground,
+  forgetNoteNormalization: (note) => normalizedNotes.delete(note),
+  markPageHydrated: (page) => hydratedPages.add(page),
+});
+
+const { bindLibraryEvents } = createLibraryEvents({
+  getNotes: () => notes,
+  setNotes: (next) => {
+    notes = next;
+  },
+  getActiveId: () => activeId,
+  setActiveId: (id) => {
+    activeId = id;
+  },
+  getFolders: () => folders,
+  setFolders: (next) => {
+    folders = next;
+  },
+  getActiveFolder: () => activeFolder,
+  setActiveFolder: (next) => {
+    activeFolder = next;
+  },
+  isSelectionMode: () => librarySelectionMode,
+  setSelectionMode: (on) => {
+    librarySelectionMode = on;
+  },
+  getSelectedNoteIds: () => selectedNoteIds,
+  saveNotes,
+  saveFolders,
+  render,
+  folderById,
+  notesInCurrentView,
+  hydrateNote,
+  backupAllNotes,
+  restoreFromBackup,
+  handlePdfImport,
+  pickPdfFileNative,
+  markPageHydrated: (page) => hydratedPages.add(page),
+  markNoteNormalized: (note) => normalizedNotes.add(note),
+  folderPrefix: FOLDER_PREFIX,
+});
+
+const { renderFontOptions, updateFontToolbarState, syncToolbarForActivePage } = createToolbar({
+  getActiveCanvasEngine,
+  getCurrentTool: () => currentTool,
+});
+
+
+const editorShortcuts = createEditorShortcuts({
+  getActiveCanvasEngine,
+  setActiveTool,
+  isPageManagerOpen,
+  closePageManager,
+  zoomIn,
+  zoomOut,
+  zoomReset,
+  zoomFit,
+});
+
 configureViewport({
   getCanvasEngines: () => canvasEngines,
   getActiveNote,
@@ -718,9 +550,10 @@ configureViewport({
 });
 
 async function render() {
+  // Never switch views with an unwritten save in flight.
+  flushSaveNotes();
   const app = document.querySelector("#app");
   const note = getActiveNote();
-  const previousNoteId = activeId;
 
   if (note) {
     // Lazy hydration: only load this notebook's page payloads when opening it.
@@ -733,8 +566,9 @@ async function render() {
     }
     // Preserve zoom across same-notebook re-renders (e.g. add/delete page,
     // rename, promote). Only reset to 1 when opening a different notebook.
-    if (note.id !== previousNoteId) {
+    if (note.id !== lastRenderedNoteId) {
       setCurrentZoom(1);
+      lastRenderedNoteId = note.id;
     }
     app.innerHTML = editorView(note);
     await initEditor(note);
@@ -757,6 +591,7 @@ async function render() {
       window.removeEventListener("keydown", editorKeyHandler);
       editorKeyHandler = null;
     }
+    lastRenderedNoteId = null;
     app.innerHTML = libraryView();
     bindLibraryEvents();
   }
@@ -771,10 +606,18 @@ function renderLoading() {
   if (isLoading) {
     const overlay = document.createElement("div");
     overlay.className = "loading-overlay";
-    overlay.innerHTML = `
-      <div class="spinner"></div>
-      <div>${loadingMessage || "Processing..."}</div>
-    `;
+    overlay.setAttribute("role", "status");
+    overlay.setAttribute("aria-live", "polite");
+
+    const spinner = document.createElement("div");
+    spinner.className = "spinner";
+    spinner.setAttribute("aria-hidden", "true");
+    overlay.appendChild(spinner);
+
+    const message = document.createElement("div");
+    message.textContent = loadingMessage || "Processing...";
+    overlay.appendChild(message);
+
     document.body.appendChild(overlay);
   }
 }
@@ -841,98 +684,9 @@ function libraryView() {
     emptyMsg: emptyMessage(),
     noteCount,
     folderPrefix: FOLDER_PREFIX,
+    selectionMode: librarySelectionMode,
+    selectedIds: selectedNoteIds,
   });
-}
-
-function renderFontOptions(note) {
-  const engine = getActiveCanvasEngine();
-  const selectedFont = engine?.currentFont || note?.defaultFont || "DM Sans";
-  return renderFontOptionsHtml(note, selectedFont);
-}
-
-function updateFontToolbarState(selected) {
-  const textObj = selected?.find(
-    (o) => o.type === "i-text" || o.text !== undefined,
-  );
-
-  const engine = getActiveCanvasEngine();
-  const fontControlsBar = document.querySelector("#font-controls-bar");
-  const fontSelect = document.querySelector("#font-family-select");
-  const sizeLabel = document.querySelector("#font-size-label");
-  const boldBtn = document.querySelector("#font-bold-btn");
-  const italicBtn = document.querySelector("#font-italic-btn");
-  const underlineBtn = document.querySelector("#font-underline-btn");
-  const strikethroughBtn = document.querySelector("#font-strikethrough-btn");
-
-  const hasTextSelection = !!textObj;
-  const isTextTool = currentTool === "text";
-
-  if (fontControlsBar) {
-    const shouldShow = hasTextSelection || isTextTool;
-    fontControlsBar.classList.toggle("visible", shouldShow);
-  }
-
-  if (!hasTextSelection && !isTextTool) {
-    return;
-  }
-
-  if (textObj) {
-    const font = textObj.fontFamily || engine?.currentFont || "DM Sans";
-    if (fontSelect) {
-      const exists = Array.from(fontSelect.options).some(
-        (o) => o.value === font,
-      );
-      if (!exists) {
-        fontSelect.add(new Option(font, font, true, true));
-      }
-      fontSelect.value = font;
-    }
-    if (sizeLabel) {
-      sizeLabel.textContent = Math.round(textObj.fontSize || 22);
-    }
-    const isBold = textObj.fontWeight === "bold" || textObj.fontWeight === 700;
-    boldBtn?.classList.toggle("active", isBold);
-
-    const isItalic = textObj.fontStyle === "italic";
-    italicBtn?.classList.toggle("active", isItalic);
-
-    const isUnderline = textObj.underline === true;
-    underlineBtn?.classList.toggle("active", isUnderline);
-
-    const isStrikethrough = textObj.linethrough === true;
-    strikethroughBtn?.classList.toggle("active", isStrikethrough);
-  } else if (engine) {
-    if (fontSelect) {
-      fontSelect.value = engine.currentFont;
-    }
-    if (sizeLabel) {
-      sizeLabel.textContent = Math.round(engine.currentFontSize || 22);
-    }
-    boldBtn?.classList.toggle("active", !!engine.isBold);
-    italicBtn?.classList.toggle("active", !!engine.isItalic);
-    underlineBtn?.classList.toggle("active", !!engine.isUnderline);
-    strikethroughBtn?.classList.toggle("active", !!engine.isStrikethrough);
-  }
-}
-
-/**
- * Re-points the per-page toolbar at whichever page is now active.
- *
- * Undo/redo and the font controls describe the page being edited. Changing
- * pages does not fire a history or selection event on the page you arrive at,
- * so without this the buttons keep showing the state of the page you left —
- * undo stays greyed out on a page that has plenty to undo, and vice versa.
- */
-function syncToolbarForActivePage() {
-  const engine = getActiveCanvasEngine();
-
-  const undoBtn = document.querySelector("#undo-btn");
-  const redoBtn = document.querySelector("#redo-btn");
-  if (undoBtn) undoBtn.disabled = !engine?.canUndo?.();
-  if (redoBtn) redoBtn.disabled = !engine?.canRedo?.();
-
-  const selected = engine?.canvas?.getActiveObjects?.() || [];
-  updateFontToolbarState(selected);
 }
 
 function editorView(note) {
@@ -1006,6 +760,7 @@ function editorView(note) {
         </div>
 
         <div class="top-actions-right">
+          <span class="save-status" id="save-status" aria-live="polite">Saved</span>
           <button class="icon-btn" id="export-pdf-btn" title="Export as PDF / Print">${icon("download", 16)}</button>
           <button class="icon-btn delete-notebook-btn" id="delete-notebook-btn" title="Delete Entire Notebook">${icon("trash", 16)}</button>
         </div>
@@ -1029,16 +784,22 @@ function editorView(note) {
               <button class="paper-btn ${page.paperStyle === "dotted" ? "active" : ""}" data-paper="dotted" title="Dotted">
                 <div class="paper-preview p-dotted"></div>
               </button>
+              <button class="paper-btn ${page.paperStyle === "cornell" ? "active" : ""}" data-paper="cornell" title="Cornell Notes">
+                <div class="paper-preview p-cornell"></div>
+              </button>
+              <button class="paper-btn ${page.paperStyle === "music" ? "active" : ""}" data-paper="music" title="Music Staff">
+                <div class="paper-preview p-music"></div>
+              </button>
             </div>
           </div>
           <div class="page-setup-row">
             <label>Page Size</label>
             <select id="page-size-select">
-              <option value="custom" selected>Current (${page.width} × ${page.height} px)</option>
-              <option value="a4">A4 (800 × 1130)</option>
-              <option value="letter">US Letter (800 × 1035)</option>
-              <option value="slide">16:9 Slide (1200 × 675)</option>
-              <option value="square">Square (800 × 800)</option>
+              <option value="custom" ${page.pageSize === "custom" || !page.pageSize ? "selected" : ""}>Current (${page.width} × ${page.height} px)</option>
+              <option value="a4" ${page.pageSize === "a4" ? "selected" : ""}>A4 (800 × 1130)</option>
+              <option value="letter" ${page.pageSize === "letter" ? "selected" : ""}>US Letter (800 × 1035)</option>
+              <option value="slide" ${page.pageSize === "slide" ? "selected" : ""}>16:9 Slide (1200 × 675)</option>
+              <option value="square" ${page.pageSize === "square" ? "selected" : ""}>Square (800 × 800)</option>
             </select>
           </div>
         </div>
@@ -1174,1061 +935,9 @@ function editorView(note) {
           ${promoteControlsHtml(note, page)}
         </div>
       </div>
-      ${showPageManager ? pageManagerOverlay(note) : ""}
+      ${pageManagerOverlay(note)}
     </div>
   `;
-}
-
-/* ==========================================================================
-   PAGE MANAGER (Noteful-style "Select" page grid)
-   ========================================================================== */
-
-function pageManagerTilesHtml(note) {
-  return renderPageManagerTilesHtml(note, pageManagerSelection, pageManagerThumbs);
-}
-
-function pageManagerOverlay(note) {
-  // How many pages could still be rebuilt as editable objects. The op only
-  // appears for a PDF notebook that has annotate-mode pages left.
-  const promotableCount = (note?.pages || []).filter((p) =>
-    isPromotablePage(p, note),
-  ).length;
-  return renderPageManagerOverlay(
-    note,
-    pageManagerSelection,
-    pageManagerThumbs,
-    pageClipboard.length,
-    promotableCount,
-  );
-}
-
-function updatePageManagerSelectionUI() {
-  document.querySelectorAll("#page-manager-grid .pm-tile").forEach((t) => {
-    const i = Number(t.dataset.index);
-    t.classList.toggle("selected", pageManagerSelection.has(i));
-  });
-  const note = getActiveNote();
-  const sub = document.querySelector(".pm-sub");
-  if (sub) {
-    sub.textContent = `${note.pages.length} page${note.pages.length !== 1 ? "s" : ""}${
-      pageManagerSelection.size
-        ? ` · ${pageManagerSelection.size} selected`
-        : ""
-    }`;
-  }
-  const hasSel = pageManagerSelection.size > 0;
-  [
-    "pm-rotate",
-    "pm-delete",
-    "pm-extract",
-    "pm-share",
-    "pm-copy",
-    "pm-cut",
-    "pm-tag",
-    "pm-make-editable",
-  ].forEach((id) => {
-    const b = document.querySelector("#" + id);
-    if (b) b.disabled = !hasSel;
-  });
-  const pasteBtn = document.querySelector("#pm-paste");
-  if (pasteBtn) pasteBtn.disabled = pageClipboard.length === 0;
-}
-
-function clearPageManagerDropMarkers() {
-  document
-    .querySelectorAll("#page-manager-grid .pm-tile.pm-drop-target")
-    .forEach((t) => t.classList.remove("pm-drop-target"));
-}
-
-/**
- * Where an index lands after `from` is spliced out and re-inserted at `to`.
- * Reordering shifts everything between the two, so the selection, the shift
- * anchor, the thumbnails and the active page all have to be remapped or they
- * end up pointing at the wrong pages.
- */
-function remapIndexForMove(index, from, to) {
-  if (index === from) return to;
-  if (from < to && index > from && index <= to) return index - 1;
-  if (to < from && index >= to && index < from) return index + 1;
-  return index;
-}
-
-function reorderPages(from, to) {
-  const note = getActiveNote();
-  if (!note || !Array.isArray(note.pages)) return;
-  if (from === to) return;
-  if (from < 0 || to < 0 || from >= note.pages.length || to >= note.pages.length) {
-    return;
-  }
-
-  const [moved] = note.pages.splice(from, 1);
-  note.pages.splice(to, 0, moved);
-
-  // Thumbnails are index-aligned with pages. Moving them together means the
-  // grid can be repainted from the existing images instead of re-rendering
-  // every page after a drop.
-  pageManagerThumbs.splice(to, 0, pageManagerThumbs.splice(from, 1)[0]);
-
-  note.pages.forEach((p, i) => {
-    p.pageNumber = i + 1;
-  });
-
-  pageManagerSelection = new Set(
-    Array.from(pageManagerSelection, (i) => remapIndexForMove(i, from, to)),
-  );
-  if (pageManagerAnchor !== null) {
-    pageManagerAnchor = remapIndexForMove(pageManagerAnchor, from, to);
-  }
-  note.currentPageIndex = remapIndexForMove(note.currentPageIndex, from, to);
-
-  saveNotes();
-  // The editor's page stack is rendered from `note.pages`, so it has to be
-  // rebuilt for the new order to take effect. Hold the zoom across it.
-  zoomRestoreTarget = getCurrentZoom();
-  render();
-}
-
-function bindPageManagerGrid() {
-  document.querySelectorAll("#page-manager-grid .pm-tile").forEach((tile) => {
-    const i = Number(tile.dataset.index);
-
-    tile.addEventListener("click", (e) => {
-      if (pageManagerSuppressClick) {
-        pageManagerSuppressClick = false;
-        return;
-      }
-      if (e.shiftKey && pageManagerAnchor !== null) {
-        const a = Math.min(pageManagerAnchor, i);
-        const b = Math.max(pageManagerAnchor, i);
-        for (let k = a; k <= b; k++) pageManagerSelection.add(k);
-      } else {
-        if (pageManagerSelection.has(i)) pageManagerSelection.delete(i);
-        else pageManagerSelection.add(i);
-        pageManagerAnchor = i;
-      }
-      updatePageManagerSelectionUI();
-    });
-
-    // Drag-to-reorder.
-    //
-    // Pointer events rather than HTML5 drag-and-drop: the same gesture then
-    // works with a mouse, trackpad and stylus, and click-to-select keeps
-    // working because a press only becomes a drag past a small threshold.
-    tile.addEventListener("pointerdown", (e) => {
-      pageManagerSuppressClick = false;
-      // A touch drag should scroll the grid, not start a reorder.
-      if (e.button !== 0 || e.pointerType === "touch") return;
-      pageManagerDrag = {
-        index: i,
-        startX: e.clientX,
-        startY: e.clientY,
-        active: false,
-        over: null,
-      };
-      tile.setPointerCapture?.(e.pointerId);
-    });
-
-    tile.addEventListener("pointermove", (e) => {
-      const drag = pageManagerDrag;
-      if (!drag || drag.index !== i) return;
-
-      if (!drag.active) {
-        const travelled = Math.hypot(
-          e.clientX - drag.startX,
-          e.clientY - drag.startY,
-        );
-        if (travelled < PM_DRAG_THRESHOLD) return;
-        drag.active = true;
-        tile.classList.add("pm-dragging");
-      }
-
-      // Pointer capture routes events to this tile, so hit-test explicitly to
-      // find which tile is actually under the cursor.
-      const under = document.elementFromPoint(e.clientX, e.clientY);
-      const target = under && under.closest ? under.closest(".pm-tile") : null;
-      const over = target && target !== tile ? Number(target.dataset.index) : null;
-
-      if (over !== drag.over) {
-        clearPageManagerDropMarkers();
-        drag.over = over;
-        if (over !== null) target.classList.add("pm-drop-target");
-      }
-    });
-
-    const finishDrag = (e) => {
-      const drag = pageManagerDrag;
-      if (!drag || drag.index !== i) return;
-      pageManagerDrag = null;
-      tile.releasePointerCapture?.(e.pointerId);
-      tile.classList.remove("pm-dragging");
-      clearPageManagerDropMarkers();
-
-      // An ordinary click falls through to the click handler above.
-      if (!drag.active) return;
-      pageManagerSuppressClick = true;
-      if (drag.over !== null && drag.over !== i) reorderPages(i, drag.over);
-    };
-
-    tile.addEventListener("pointerup", finishDrag);
-    tile.addEventListener("pointercancel", finishDrag);
-  });
-}
-
-function bindPageManagerControls() {
-  document
-    .querySelector("#pm-close")
-    ?.addEventListener("click", closePageManager);
-  document.querySelector("#pm-select-all")?.addEventListener("click", () => {
-    const note = getActiveNote();
-    pageManagerSelection = new Set(note.pages.map((_, i) => i));
-    updatePageManagerSelectionUI();
-  });
-  document.querySelector("#pm-clear")?.addEventListener("click", () => {
-    pageManagerSelection = new Set();
-    updatePageManagerSelectionUI();
-  });
-  document.querySelector("#pm-insert")?.addEventListener("click", pmInsert);
-  document.querySelector("#pm-rotate")?.addEventListener("click", pmRotate);
-  document.querySelector("#pm-delete")?.addEventListener("click", pmDelete);
-  document.querySelector("#pm-extract")?.addEventListener("click", pmExtract);
-  document.querySelector("#pm-share")?.addEventListener("click", pmShare);
-  document.querySelector("#pm-copy")?.addEventListener("click", pmCopy);
-  document.querySelector("#pm-cut")?.addEventListener("click", pmCut);
-  document.querySelector("#pm-paste")?.addEventListener("click", pmPaste);
-  document.querySelector("#pm-tag")?.addEventListener("click", pmTag);
-  document
-    .querySelector("#pm-make-editable")
-    ?.addEventListener("click", pmMakeEditable);
-}
-
-async function regeneratePageManagerThumbs() {
-  const note = getActiveNote();
-  pageManagerThumbs = [];
-  for (let i = 0; i < note.pages.length; i++) {
-    try {
-      pageManagerThumbs[i] = await renderPageThumbnail(note.pages[i], 260, {
-        pdfAssetId: note.pdfAssetId,
-      });
-    } catch {
-      pageManagerThumbs[i] = null;
-    }
-  }
-}
-
-async function openPageManager() {
-  if (showPageManager) return;
-  const note = getActiveNote();
-  if (!note) return;
-  saveActiveCanvasPage();
-  pageManagerPriorZoom = getCurrentZoom();
-  await regeneratePageManagerThumbs();
-  pageManagerSelection = new Set();
-  pageManagerAnchor = null;
-  showPageManager = true;
-  zoomRestoreTarget = pageManagerPriorZoom;
-  render();
-}
-
-function closePageManager() {
-  showPageManager = false;
-  pageManagerSelection = new Set();
-  pageManagerAnchor = null;
-  zoomRestoreTarget = pageManagerPriorZoom;
-  render();
-}
-
-function clonePageForExtract(page) {
-  return {
-    id: crypto.randomUUID(),
-    pageNumber: 1,
-    width: page.width,
-    height: page.height,
-    paperStyle: page.paperStyle || "plain",
-    pageSize: page.pageSize || "custom",
-    thumbnail: null,
-    backgroundAssetId: page.backgroundAssetId || null,
-    thumbnailAssetId: null,
-    tags: Array.isArray(page.tags) ? page.tags.slice() : [],
-    canvasJson: page.canvasJson
-      ? JSON.parse(JSON.stringify(page.canvasJson))
-      : null,
-    pendingDecomposedData: null,
-    pdfPageIndex:
-      typeof page.pdfPageIndex === "number" ? page.pdfPageIndex : null,
-  };
-}
-
-function rotateObjectAbout(obj, oldW, oldH, newW, newH) {
-  const c = obj.getCenterPoint();
-  const dx = c.x - oldW / 2;
-  const dy = c.y - oldH / 2;
-  // Clockwise 90° about the page centre, then map into the swapped page.
-  const nx = newW / 2 + -dy;
-  const ny = newH / 2 + dx;
-  obj.set({ angle: (obj.angle || 0) + 90 });
-  if (typeof obj.setPositionByOrigin === "function") {
-    obj.setPositionByOrigin(new Point(nx, ny), "center", "center");
-  } else {
-    obj.set({ left: nx, top: ny });
-  }
-  obj.setCoords();
-}
-
-async function rotateBackground90(page, note, oldW) {
-  if (page.fallbackVisible === false) return null;
-
-  // A PDF page imported as annotations may have no saved raster yet. Rasterize
-  // it on demand before rotating; otherwise the dimensions change but the
-  // unrotated source gets stretched over the new page on the next mount.
-  let url = page.backgroundAssetId
-    ? await getAssetUrl(page.backgroundAssetId)
-    : null;
-  let transient = false;
-  if (!url && note?.pdfAssetId && Number.isInteger(page.pdfPageIndex)) {
-    const source = await renderPdfPageBlob(
-      note.pdfAssetId,
-      page.pdfPageIndex,
-      Math.min(1600, Math.round(oldW)),
-    );
-    if (!source?.blob) throw new Error("Could not render PDF page before rotation");
-    url = URL.createObjectURL(source.blob);
-    transient = true;
-  }
-  if (!url) return null;
-
-  try {
-    const img = new Image();
-    img.src = url;
-    await img.decode();
-    const rotated = document.createElement("canvas");
-    rotated.width = img.naturalHeight;
-    rotated.height = img.naturalWidth;
-    const ctx = rotated.getContext("2d");
-    ctx.translate(rotated.width, 0);
-    ctx.rotate(Math.PI / 2);
-    ctx.drawImage(img, 0, 0);
-    const blob = await canvasToBlob(rotated);
-    if (!blob) throw new Error("Could not encode rotated PDF page");
-    const assetId = `bg-${crypto.randomUUID()}`;
-    await putAsset(assetId, blob);
-    return assetId;
-  } finally {
-    if (transient) URL.revokeObjectURL(url);
-  }
-}
-
-async function rotateEnginePage90(engine, page, note) {
-  const canvas = engine.canvas;
-  const oldW = engine.width;
-  const oldH = engine.height;
-  const newW = oldH;
-  const newH = oldW;
-  // Prepare and store the rotated raster *before* changing page geometry, so
-  // an encode/store failure leaves the original page untouched.
-  const previousBackgroundId = page.backgroundAssetId;
-  const rotatedBackgroundId = await rotateBackground90(page, note, oldW);
-  canvas.discardActiveObject();
-  canvas
-    .getObjects()
-    .slice()
-    .forEach((o) => rotateObjectAbout(o, oldW, oldH, newW, newH));
-  if (canvas.backgroundImage)
-    rotateObjectAbout(canvas.backgroundImage, oldW, oldH, newW, newH);
-  engine.width = newW;
-  engine.height = newH;
-  page.width = newW;
-  page.height = newH;
-  canvas.setDimensions({ width: newW, height: newH });
-  // Rotated pages need a durable raster, not just a transformed in-memory
-  // Fabric image. The PDF source still has its original orientation and must
-  // never replace this raster when the engine is mounted again.
-  if (rotatedBackgroundId) {
-    page.backgroundAssetId = rotatedBackgroundId;
-    page.pdfBackgroundRotated = true;
-    page.pdfRotation = ((page.pdfRotation || 0) + 90) % 360;
-    engine.setPdfBackgroundSource(null);
-    engine._bgRasterToken++;
-    await engine.loadBackgroundAsset(rotatedBackgroundId);
-    releaseReplacedBackground(previousBackgroundId, page);
-  }
-  engine.setZoom(engine.currentZoom, { force: true, resetPan: true });
-  canvas.requestRenderAll();
-}
-
-async function pmInsert() {
-  const note = getActiveNote();
-  if (!note.pages.length) return;
-  const idx = pageManagerSelection.size
-    ? Math.max(...pageManagerSelection)
-    : note.currentPageIndex;
-  const ref = note.pages[Math.min(idx, note.pages.length - 1)] || note.pages[0];
-  note.pages.splice(idx + 1, 0, {
-    id: crypto.randomUUID(),
-    pageNumber: idx + 2,
-    width: ref.width || 800,
-    height: ref.height || 1130,
-    paperStyle: ref.paperStyle || "lined",
-    pageSize: "custom",
-    thumbnail: null,
-    canvasJson: null,
-    pendingDecomposedData: null,
-  });
-  pageManagerSelection = new Set();
-  saveNotes();
-  await regeneratePageManagerThumbs();
-  zoomRestoreTarget = pageManagerPriorZoom;
-  render();
-}
-
-async function pmDelete() {
-  const note = getActiveNote();
-  if (note.pages.length <= 1) return;
-  if (
-    !(await showConfirm(
-      `Delete ${pageManagerSelection.size} selected page(s)? This cannot be undone.`,
-      "Delete",
-      "Cancel",
-    ))
-  )
-    return;
-  const indices = Array.from(pageManagerSelection).sort((a, b) => b - a);
-  for (const i of indices) {
-    if (note.pages.length <= 1) break;
-    const [removed] = note.pages.splice(i, 1);
-    forgetPageCaches(removed);
-    // Don't delete assets still referenced by other (e.g. copied) pages.
-    // The deep form matters here: a copy shares the source's embedded images
-    // through its object graph, not through the notebook record.
-    const remainingIds = new Set();
-    for (const p of note.pages) {
-      for (const id of await collectPageAssetIdsDeep(p)) remainingIds.add(id);
-    }
-    const ids = (await collectPageAssetIdsDeep(removed)).filter(
-      (id) => id && !remainingIds.has(id),
-    );
-    if (ids.length) await deleteAssets(ids);
-  }
-  if (note.currentPageIndex >= note.pages.length)
-    note.currentPageIndex = note.pages.length - 1;
-  pageManagerSelection = new Set();
-  saveNotes();
-  await regeneratePageManagerThumbs();
-  zoomRestoreTarget = pageManagerPriorZoom;
-  render();
-}
-
-/**
- * Runs `fn(engine)` against a page that currently has no live engine.
- *
- * The Page Manager acts on pages the user is not looking at, so the sliding
- * window holds no engine for most of them. Rather than duplicating every
- * object-graph transform in JSON space, the page is briefly mounted on its own
- * (hidden) canvas, transformed, written back and torn down again — which keeps
- * the transform on exactly the same code path as the on-screen case.
- */
-async function withTemporaryEngine(page, index, fn) {
-  const note = getActiveNote();
-  if (!note || !page) return;
-
-  const existing = canvasEngines[index];
-  if (existing) {
-    await fn(existing);
-    saveEngineToPage(existing);
-    return;
-  }
-
-  const canvasEl = document.querySelector(`#omni-canvas-${index}`);
-  const thumbEl = document.querySelector(`#omni-thumb-${index}`);
-  if (!canvasEl) return;
-
-  const hadJson = Boolean(page.canvasJson);
-  const canvasWasHidden = canvasEl.hidden;
-  canvasEl.hidden = false;
-  if (thumbEl) thumbEl.hidden = true;
-
-  const { engine } = await createPageEngine(canvasEl, page, note, index);
-  try {
-    await fn(engine);
-  } finally {
-    // Only write back when there is something to write. An annotate-only page
-    // has no object graph, and inventing an empty one would make the Page
-    // Manager prefer it over the source-PDF preview.
-    if (hadJson || engine.canvas.getObjects().length > 0) {
-      saveEngineToPage(engine);
-    }
-    engine.destroy();
-    canvasEl.hidden = canvasWasHidden;
-    if (thumbEl && !canvasWasHidden) {
-      thumbEl.hidden = false;
-      setStaticPageThumbnail(thumbEl, page, note);
-    }
-  }
-}
-
-async function pmRotate() {
-  const note = getActiveNote();
-  const indices = Array.from(pageManagerSelection).sort((a, b) => a - b);
-  if (!indices.length) return;
-  for (const i of indices) {
-    const page = note.pages[i];
-    if (!page) continue;
-    // Pages outside the sliding window have no engine; mount one for the
-    // rotation so selecting any page in the grid actually rotates it.
-    await withTemporaryEngine(page, i, (engine) =>
-      rotateEnginePage90(engine, page, note),
-    );
-  }
-  saveActiveCanvasPage();
-  pageManagerSelection = new Set();
-  saveNotes();
-  await regeneratePageManagerThumbs();
-  zoomRestoreTarget = pageManagerPriorZoom;
-  render();
-}
-
-async function pmExtract() {
-  const note = getActiveNote();
-  const indices = Array.from(pageManagerSelection).sort((a, b) => a - b);
-  if (!indices.length) return;
-  saveActiveCanvasPage();
-  const pages = indices.map((i) => clonePageForExtract(note.pages[i]));
-  pages.forEach((p, idx) => {
-    p.pageNumber = idx + 1;
-  });
-  const newNote = {
-    id: crypto.randomUUID(),
-    title: `${note.title} (extracted)`,
-    createdAt: Date.now(),
-    isPdf: note.isPdf || false,
-    pdfAssetId: note.pdfAssetId || null,
-    defaultFont: note.defaultFont || "DM Sans",
-    detectedFonts: note.detectedFonts || [],
-    currentPageIndex: 0,
-    pages,
-  };
-  notes.unshift(newNote);
-  saveNotes();
-  showPageManager = false;
-  activeId = null;
-  render();
-}
-
-async function pmShare() {
-  const note = getActiveNote();
-  const indices = Array.from(pageManagerSelection).sort((a, b) => a - b);
-  if (!indices.length) return;
-  isLoading = true;
-  loadingMessage = "Exporting selected pages...";
-  renderLoading();
-  try {
-    await exportNotebookToPdf(
-      note,
-      getActiveCanvasEngine(),
-      (curr, total) => {
-        loadingMessage = `Exporting page ${curr} of ${total}...`;
-        renderLoading();
-      },
-      indices,
-    );
-  } catch (err) {
-    showToast("Export failed", String(err?.message || err), "error");
-    console.error(err);
-  } finally {
-    isLoading = false;
-    renderLoading();
-  }
-}
-
-// Deep-clone a page for the clipboard / paste / extract flows. A fresh id is
-// assigned; asset ids are intentionally shared (read-only) so copying a page
-// that uses an imported background does not duplicate the blob.
-function clonePageData(page) {
-  return {
-    id: crypto.randomUUID(),
-    pageNumber: 1,
-    width: page.width,
-    height: page.height,
-    paperStyle: page.paperStyle || "plain",
-    pageSize: page.pageSize || "custom",
-    thumbnail: page.thumbnail || null,
-    backgroundAssetId: page.backgroundAssetId || null,
-    thumbnailAssetId: page.thumbnailAssetId || null,
-    pdfAssetId: page.pdfAssetId || null,
-    pdfPageIndex:
-      typeof page.pdfPageIndex === "number" ? page.pdfPageIndex : null,
-    canvasJson: page.canvasJson
-      ? JSON.parse(JSON.stringify(page.canvasJson))
-      : null,
-    pendingDecomposedData: null,
-    tags: Array.isArray(page.tags) ? page.tags.slice() : [],
-  };
-}
-
-// Re-render just the thumbnail grid (used after Tag so we don't rebuild engines).
-function refreshPageManagerGrid() {
-  const note = getActiveNote();
-  const grid = document.querySelector("#page-manager-grid");
-  if (grid) {
-    grid.innerHTML = pageManagerTilesHtml(note);
-    bindPageManagerGrid();
-  }
-  updatePageManagerSelectionUI();
-}
-
-/**
- * Rebuilds the selected annotate-mode pages as editable objects, in place.
- *
- * The Page Manager stays open and the user keeps annotating; the current page
- * is instantiated so the result is visible immediately, the rest are stored as
- * handoffs that materialise when each page is opened. This is the in-editor
- * counterpart to the import-time "Choose pages…" picker.
- */
-async function pmMakeEditable() {
-  const note = getActiveNote();
-  if (!note || !pageManagerSelection.size) return;
-
-  // Persist any in-flight edits before records are rewritten.
-  saveActiveCanvasPage();
-
-  const indices = Array.from(pageManagerSelection).sort((a, b) => a - b);
-  const currentIndex = note.currentPageIndex || 0;
-
-  const btn = document.querySelector("#pm-make-editable");
-  if (btn) {
-    btn.disabled = true;
-    btn.querySelector("span").textContent = "Rebuilding…";
-  }
-
-  let rebuilt = 0;
-  let failed = 0;
-
-  for (const index of indices) {
-    const page = note.pages[index];
-    if (!isPromotablePage(page, note)) continue;
-
-    page.conversionState = "converting";
-    try {
-      const { status } = await rebuildPageAsEditable(note, page, {
-        instantiate: index === currentIndex,
-      });
-      if (status === "rebuilt") {
-        rebuilt++;
-      } else {
-        page.conversionState = "failed";
-        failed++;
-      }
-    } catch (err) {
-      page.conversionState = "failed";
-      failed++;
-      console.error("Could not make a page editable:", err);
-    }
-  }
-
-  saveNotes();
-  await regeneratePageManagerThumbs();
-  // Full render so the toolbar's promotable count and button state update; the
-  // overlay stays open because `showPageManager` is module-level state.
-  zoomRestoreTarget = pageManagerPriorZoom;
-  render();
-  refreshPromoteControls(note);
-
-  showToast(
-    failed === 0
-      ? `${rebuilt} page${rebuilt === 1 ? "" : "s"} rebuilt`
-      : "Some pages could not be rebuilt",
-    failed === 0
-      ? "Each page's content is editable when you open it."
-      : `${rebuilt} rebuilt, ${failed} left as annotated PDF${failed === 1 ? "" : "s"}.`,
-    failed === 0 ? "ok" : "warn",
-  );
-}
-
-function pmCopy() {
-  const note = getActiveNote();
-  if (!pageManagerSelection.size) return;
-  const indices = Array.from(pageManagerSelection).sort((a, b) => a - b);
-  pageClipboard = indices.map((i) => clonePageData(note.pages[i]));
-  updatePageManagerSelectionUI();
-}
-
-async function pmCut() {
-  const note = getActiveNote();
-  if (note.pages.length <= 1 || !pageManagerSelection.size) return;
-  const indices = Array.from(pageManagerSelection).sort((a, b) => b - a);
-  const clones = [];
-  for (const i of indices) {
-    if (note.pages.length <= 1) break;
-    clones.unshift(clonePageData(note.pages[i]));
-    const [removed] = note.pages.splice(i, 1);
-    forgetPageCaches(removed);
-  }
-  pageClipboard = clones;
-  if (note.currentPageIndex >= note.pages.length)
-    note.currentPageIndex = note.pages.length - 1;
-  pageManagerSelection = new Set();
-  saveNotes();
-  await regeneratePageManagerThumbs();
-  zoomRestoreTarget = pageManagerPriorZoom;
-  render();
-}
-
-async function pmPaste() {
-  const note = getActiveNote();
-  if (!pageClipboard.length) return;
-  const clones = pageClipboard.map((p) => clonePageData(p));
-  const target = pageManagerSelection.size
-    ? Math.max(...pageManagerSelection)
-    : note.pages.length - 1;
-  note.pages.splice(target + 1, 0, ...clones);
-  pageManagerSelection = new Set();
-  saveNotes();
-  await regeneratePageManagerThumbs();
-  zoomRestoreTarget = pageManagerPriorZoom;
-  render();
-}
-
-async function pmTag() {
-  const note = getActiveNote();
-  if (!pageManagerSelection.size) return;
-  const tag = (await showPrompt("Tag the selected pages (single tag):", ""))?.trim();
-  if (!tag) return;
-  for (const i of pageManagerSelection) {
-    const p = note.pages[i];
-    p.tags = Array.isArray(p.tags) ? p.tags : [];
-    if (!p.tags.includes(tag)) p.tags.push(tag);
-  }
-  saveNotes();
-  refreshPageManagerGrid();
-}
-
-/**
- * Writes one page's binary assets to IndexedDB and returns the page record with
- * asset ids in place of blobs.
- *
- * Shared by the importer and by single-page promotion, so a promoted page ends
- * up exactly the shape the importer produces. `createdAssetIds` collects
- * everything written, so a failed operation can clean up after itself without
- * touching an asset an existing notebook owns.
- */
-async function persistPageAssets(page, createdAssetIds) {
-  const ids = {};
-
-  // When the only unrecovered content is the page's own backdrop, the extracted
-  // backdrop image replaces the whole-page render. The render also contains the
-  // content we recovered, so using it would paint everything twice — visibly,
-  // because the raster's substituted font and the text object's font do not
-  // share advance widths.
-  let fallbackBlob = page.backgroundBlob;
-  let fallbackFromImage = false;
-
-  if (page.fallbackImage?.blob) {
-    const composed = await composePageSizedFallback(
-      page.fallbackImage.blob,
-      page.fallbackImage,
-      page.width,
-      page.height,
-    );
-    if (composed) {
-      fallbackBlob = composed;
-      fallbackFromImage = true;
-    }
-  }
-
-  if (fallbackBlob) {
-    ids.backgroundAssetId = `bg-${crypto.randomUUID()}`;
-    await putAsset(ids.backgroundAssetId, fallbackBlob);
-    createdAssetIds.push(ids.backgroundAssetId);
-  }
-
-  if (page.thumbnailBlob) {
-    ids.thumbnailAssetId = `thumb-${crypto.randomUUID()}`;
-    await putAsset(ids.thumbnailAssetId, page.thumbnailBlob);
-    createdAssetIds.push(ids.thumbnailAssetId);
-  }
-
-  // Embedded images are often the heaviest part of an export, so they go to the
-  // asset store as real blobs rather than inline base64.
-  for (const obj of page.objects || []) {
-    if (obj.omniType === "image" && obj.blob) {
-      const assetId = `img-${crypto.randomUUID()}`;
-      await putAsset(assetId, obj.blob);
-      createdAssetIds.push(assetId);
-      obj.assetId = assetId;
-      // The blob is binary and must never reach localStorage.
-      delete obj.blob;
-    }
-  }
-
-  // Drop the page-level blobs so nothing binary ends up persisted.
-  return {
-    ...page,
-    ...ids,
-    fallbackFromImage,
-    backgroundBlob: undefined,
-    thumbnailBlob: undefined,
-  };
-}
-
-/**
- * True when an asset id is still the background of some *other* page, in any
- * notebook. Promotion replaces a page's raster, and deleting the old one
- * without this check would blank the pages that share it — a page copy shares
- * its source's asset ids by design.
- */
-function isBackgroundAssetShared(assetId, exceptPage) {
-  if (!assetId) return false;
-  for (const note of notes) {
-    for (const page of note.pages || []) {
-      // A lazy page has not rendered its background yet; its null id is not a
-      // shareable reference and must not pin anything.
-      if (page === exceptPage) continue;
-      if (page.backgroundAssetId === assetId) return true;
-    }
-  }
-  return false;
-}
-
-/** Deletes a raster a promoted page no longer uses, unless a page copy needs it. */
-function releaseReplacedBackground(previousAssetId, page) {
-  if (!previousAssetId || previousAssetId === page.backgroundAssetId) return;
-  if (isBackgroundAssetShared(previousAssetId, page)) return;
-  deleteAssets([previousAssetId]).catch(() => {});
-}
-
-/** True when a page still has an annotate-mode raster that could be rebuilt. */
-function isPromotablePage(page, note) {
-  return Boolean(
-    note?.pdfAssetId &&
-      page &&
-      Number.isInteger(page.pdfPageIndex) &&
-      page.editMode !== "notes",
-  );
-}
-
-/**
- * Promotion controls for the floating status pill.
- *
- * "Make editable" rebuilds the current page's content as native objects.
- * "Make all" is deliberately the cheap half only: it extracts the remaining
- * pages and stores the handoff, and each page's objects appear when it is
- * opened. Instantiating every page up front would stall a long notebook for no
- * benefit, since only the pages near the viewport are ever shown.
- */
-function promoteControlsHtml(note, page) {
-  const promotable = (note?.pages || []).filter((p) => isPromotablePage(p, note));
-  if (promotable.length === 0) return "";
-
-  const busy = page?.conversionState === "converting";
-  const currentIndex = note.currentPageIndex || 0;
-
-  const pageButton = isPromotablePage(page, note)
-    ? `<button class="page-promote-btn" id="make-editable-btn" data-promote-page="${currentIndex}" title="Rebuild this page's content as native objects you can select, move and edit. Anything that cannot be recovered stays visible underneath." ${busy ? "disabled" : ""}>${icon("sparkle", 13)}<span>${busy ? "Rebuilding…" : "Make editable"}</span></button>`
-    : "";
-
-  const allButton =
-    promotable.length > 1
-      ? `<button class="page-promote-btn is-quiet" id="make-all-editable-btn" data-promote-all="1" title="Rebuild all ${promotable.length} remaining annotated pages. Each page's content appears when you open it." ${busy ? "disabled" : ""}>${icon("sparkle", 13)}<span>All ${promotable.length}</span></button>`
-      : "";
-
-  return `<span class="promote-controls" id="promote-controls">${pageButton}${allButton}</span>`;
-}
-
-/**
- * Repaints the promotion controls in place.
- *
- * Deliberately not `render()`: rendering rebuilds every canvas engine and
- * resets the zoom, which is both wasteful and destructive mid-promotion.
- */
-function refreshPromoteControls(note) {
-  const host = document.querySelector("#promote-controls");
-  if (!host) return;
-
-  const page = note?.pages?.[note.currentPageIndex || 0];
-  const html = promoteControlsHtml(note, page);
-  if (html) host.outerHTML = html;
-  else host.remove();
-}
-
-/**
- * The extraction half of promotion for one page: rebuild its content, store the
- * binaries, and record the result on the page record.
- *
- * `instantiate` additionally swaps the live canvas over now, which is what the
- * single-page action does — the user asked for this page specifically and should
- * see it happen. Batch leaves it off: instantiation is already lazy, so forcing
- * it for pages nobody is looking at would only stall a long notebook.
- *
- * @returns {Promise<{status: "rebuilt"|"failed", restored: number}>}
- */
-async function rebuildPageAsEditable(note, page, { instantiate = false } = {}) {
-  const createdAssetIds = [];
-
-  try {
-    const record = await decomposeStoredPdfPage(
-      note.pdfAssetId,
-      page.pdfPageIndex,
-      PDF_IMPORT_SCALE,
-    );
-
-    // A scan or a flattened export decomposes to nothing. Replacing a perfectly
-    // good raster with an empty page would be a visible regression, so this is
-    // reported and the page stays in annotate mode.
-    if (!record || !(record.objects || []).length) return { status: "failed", restored: 0 };
-
-    const persisted = await persistPageAssets(record, createdAssetIds);
-    const previousBackgroundId = page.backgroundAssetId;
-    const engine = instantiate ? canvasEngines[note.pages.indexOf(page)] : null;
-    // Capture the page's own content before the reload replaces the canvas.
-    const inkObjects = engine ? engine.serialize().objects || [] : null;
-
-    page.backgroundAssetId = persisted.backgroundAssetId || null;
-    page.thumbnailAssetId = persisted.thumbnailAssetId || page.thumbnailAssetId;
-    page.fallbackVisible = persisted.fallbackVisible !== false;
-    page.fallbackFromImage = persisted.fallbackFromImage === true;
-    page.importReport = persisted.report || page.importReport;
-    page.pendingImportData = {
-      objects: persisted.objects || [],
-      report: persisted.report || null,
-    };
-    page.pendingDecomposedData = null;
-    page.editMode = "notes";
-    page.decomposedObjects = true;
-
-    let restored = 0;
-
-    if (engine) {
-      await engine.loadPage(page);
-      restored = await engine.addObjectsFromJson(inkObjects);
-      // The live canvas is the authority from here on. Leaving the handoff in
-      // place would make the next open prefer it and drop the restored ink.
-      page.pendingImportData = null;
-      page.canvasJson = engine.toJSON();
-      engine.recordHistory();
-    }
-
-    page.conversionState = "idle";
-    releaseReplacedBackground(previousBackgroundId, page);
-    return { status: "rebuilt", restored };
-  } catch (err) {
-    await deleteAssets(createdAssetIds).catch(() => {});
-    throw err;
-  }
-}
-
-/**
- * Promotes one annotate-mode page to native objects — the "Make editable"
- * action.
- *
- * The page keeps its source PDF, so this re-runs extraction for that single page
- * and swaps the locked raster for real objects. Whatever the user already drew
- * on the raster is captured first and put back afterwards: promoting a page must
- * never cost the user their own annotations.
- */
-async function promotePageToEditable(pageIndex) {
-  const note = getActiveNote();
-  const page = note?.pages?.[pageIndex];
-  if (!note || !page || page.conversionState === "converting") return;
-  if (!isPromotablePage(page, note)) return;
-  if (!canvasEngines[pageIndex]) return;
-
-  page.conversionState = "converting";
-  refreshPromoteControls(note);
-
-  try {
-    const { status, restored } = await rebuildPageAsEditable(note, page, {
-      instantiate: true,
-    });
-
-    if (status === "failed") {
-      page.conversionState = "failed";
-      refreshPromoteControls(note);
-      showToast(
-        "This page could not be rebuilt",
-        "Its content is a scan or a flattened image, so it stays as an annotated PDF — you can still write on it.",
-        "warn",
-      );
-      return;
-    }
-
-    saveNotes();
-    refreshPromoteControls(note);
-    showToast(
-      "Page rebuilt",
-      restored > 0
-        ? `Its content is editable now, and the ${restored} object${restored === 1 ? "" : "s"} you had drawn are still here.`
-        : "Its content is editable now — pick the Select tool to move things around.",
-      "ok",
-    );
-  } catch (err) {
-    page.conversionState = "failed";
-    refreshPromoteControls(note);
-    console.error("Could not make this page editable:", err);
-    showToast("Could not rebuild this page", String(err?.message || err), "error");
-  }
-}
-
-/**
- * Rebuilds every remaining annotated page.
- *
- * Sequential on purpose: pdf.js decoding is not free, and the app should stay
- * responsive through a long notebook. The page on screen is instantiated now so
- * the user sees the result; the rest are stored as handoffs and materialise when
- * opened.
- */
-async function makeAllPagesEditable() {
-  const note = getActiveNote();
-  if (!note) return;
-
-  // Flush ALL live engines before the conversion loop so no engine is left
-  // holding stale annotate-mode canvas data that would race with the handoff.
-  for (const engine of canvasEngines) {
-    if (engine) saveEngineToPage(engine);
-  }
-  saveNotes();
-
-  const targets = (note.pages || [])
-    .map((page, index) => ({ page, index }))
-    .filter(({ page }) => isPromotablePage(page, note));
-
-  if (targets.length === 0) return;
-
-  let rebuilt = 0;
-  let failed = 0;
-
-  for (const { page, index } of targets) {
-    page.conversionState = "converting";
-    refreshPromoteControls(note);
-
-    try {
-      const { status } = await rebuildPageAsEditable(note, page, {
-        instantiate: !!canvasEngines[index],
-      });
-      if (status === "rebuilt") {
-        rebuilt++;
-      } else {
-        // Nothing recoverable (a scan, a flattened export): leave the raster
-        // in place and say so, instead of leaving the page marked converting.
-        page.conversionState = "failed";
-        failed++;
-      }
-    } catch (err) {
-      page.conversionState = "failed";
-      failed++;
-      console.error("Could not make a page editable:", err);
-    }
-  }
-
-  saveNotes();
-  refreshPromoteControls(note);
-  showToast(
-    failed === 0
-      ? `${rebuilt} page${rebuilt === 1 ? "" : "s"} rebuilt`
-      : "Some pages could not be rebuilt",
-    failed === 0
-      ? "Each page's content becomes editable when you open it."
-      : `${rebuilt} rebuilt, ${failed} left as annotated PDF${failed === 1 ? "" : "s"}.`,
-    failed === 0 ? "ok" : "warn",
-  );
 }
 
 /**
@@ -2271,6 +980,7 @@ function saveEngineToPage(engine) {
   page.paperStyle = json.paperStyle;
   // The page changed, so its cached off-window preview is stale.
   staticThumbCache.delete(page.id);
+  engine.dirty = false;
 }
 
 /** Drops the per-page caches for a page that is leaving the notebook. */
@@ -2300,11 +1010,9 @@ async function initEditor(note) {
   // When returning from the Page Manager we want to keep the zoom the user had,
   // rather than snapping back to fit-width. The flag is only set across those
   // two transitions, so normal note opens still fit to width.
-  const restoreZoom = zoomRestoreTarget != null;
-  if (restoreZoom) {
-    setCurrentZoom(zoomRestoreTarget);
-    zoomRestoreTarget = null;
-  }
+  const restoreZoom = consumeZoomRestoreTarget();
+  if (restoreZoom != null) setCurrentZoom(restoreZoom);
+  const applyDefaultOnOpen = restoreZoom == null;
 
   let needsSave = false;
 
@@ -2378,7 +1086,8 @@ async function initEditor(note) {
   if (token !== editorInitToken) return;
 
   // Wide imported pages are the common case, so open pulled back to fit width.
-  applyDefaultZoom();
+  // Skip this when restoring a user's zoom across a Page Manager round-trip.
+  if (applyDefaultOnOpen) applyDefaultZoom();
   initZoomWindow();
 
   // Set up scroll observer to update active page index
@@ -2458,6 +1167,30 @@ async function initEditor(note) {
       .querySelectorAll(".page-container")
       .forEach((el) => scrollObserver.observe(el));
 
+    // Restore the scroll position the user left this notebook at.
+    if (note.scrollPosition) {
+      const prevBehavior = scrollContainer.style.scrollBehavior;
+      scrollContainer.style.scrollBehavior = "auto";
+      scrollContainer.scrollTop = note.scrollPosition;
+      scrollContainer.style.scrollBehavior = prevBehavior;
+    }
+
+    // Remember where the user leaves this notebook, so reopen lands in the
+    // same place. Debounced so a long scroll does not rewrite on every pixel.
+    let scrollSaveTimer = null;
+    scrollContainer.addEventListener(
+      "scroll",
+      () => {
+        if (scrollSaveTimer) clearTimeout(scrollSaveTimer);
+        scrollSaveTimer = setTimeout(() => {
+          if (!document.contains(scrollContainer)) return;
+          note.scrollPosition = scrollContainer.scrollTop;
+          scheduleSaveNotes();
+        }, 500);
+      },
+      { passive: true },
+    );
+
     // Scroll to the active page on load. This must land instantly: the
     // workspace scrolls smoothly (see `.canvas-wrap`), and a fresh render
     // starts at the top, so a smooth scroll here would animate all the way
@@ -2492,7 +1225,7 @@ async function createPageEngine(canvasEl, page, note, index) {
     height: Math.round(page.height || 1130),
     paperStyle: page.paperStyle || "plain",
     defaultFont: note.defaultFont || "DM Sans",
-    onModified: () => saveActiveCanvasPage(),
+    onModified: () => saveActiveCanvasPage({ immediate: false }),
     onHistoryChange: ({ canUndo, canRedo }) => {
       // Only update buttons if this is the active canvas
       if (note.currentPageIndex === index) {
@@ -2528,6 +1261,7 @@ async function createPageEngine(canvasEl, page, note, index) {
   engine.setColor(currentColor);
   engine.setWidth(currentWidth);
   engine.setTool(currentTool);
+  await hydratePage(page);
   await engine.loadPage(page);
 
   // Restore the previous undo/redo stack if this page had an engine before.
@@ -2550,6 +1284,13 @@ async function createPageEngine(canvasEl, page, note, index) {
   // and those have no engine at all.
   engine.isActivePage = true;
 
+  // Carry the global zoom across so a remounted page matches the others. Apply
+  // it before the background source is set so the first raster is scheduled at
+  // the correct zoom instead of snapping after a 100% preview.
+  if (engine.currentZoom !== getCurrentZoom()) {
+    engine.setZoom(getCurrentZoom(), { force: true });
+  }
+
   if (
     note.pdfAssetId &&
     Number.isInteger(page.pdfPageIndex) &&
@@ -2560,11 +1301,6 @@ async function createPageEngine(canvasEl, page, note, index) {
       assetId: note.pdfAssetId,
       pageIndex: page.pdfPageIndex,
     });
-  }
-
-  // Carry the global zoom across so a remounted page matches the others.
-  if (engine.currentZoom !== getCurrentZoom()) {
-    engine.setZoom(getCurrentZoom(), { force: true });
   }
 
   return { engine, clearedPending };
@@ -2589,6 +1325,7 @@ function pageDisplaySize(page) {
  * re-rasterize every off-window page on every window change.
  */
 async function setStaticPageThumbnail(imgEl, page, note) {
+  await hydratePage(page);
   const { width, height } = pageDisplaySize(page);
   imgEl.style.width = `${width}px`;
   imgEl.style.height = `${height}px`;
@@ -2599,19 +1336,31 @@ async function setStaticPageThumbnail(imgEl, page, note) {
     return;
   }
 
-  try {
-    // `renderPageThumbnail(page, targetWidth, options)` — the second argument
-    // is the preview width in CSS pixels, and the PDF asset has to be passed
-    // through options so lazy annotated pages can still be previewed.
-    const url = await renderPageThumbnail(page, STATIC_THUMB_WIDTH, {
-      pdfAssetId: note?.pdfAssetId,
-    });
-    if (!url) return;
-    staticThumbCache.set(page.id, url);
-    imgEl.src = url;
-  } catch {
-    // A missing preview does not block scrolling; the wrapper keeps its box.
-  }
+  await queueThumbRender(async () => {
+    // Another queued render for the same page may have landed first.
+    const cachedNow = staticThumbCache.get(page.id);
+    if (cachedNow) {
+      if (imgEl.getAttribute("src") !== cachedNow) imgEl.src = cachedNow;
+      return;
+    }
+    try {
+      // `renderPageThumbnail(page, targetWidth, options)` — the second argument
+      // is the preview width in CSS pixels, and the PDF asset has to be passed
+      // through options so lazy annotated pages can still be previewed.
+      const url = await renderPageThumbnail(page, STATIC_THUMB_WIDTH, {
+        pdfAssetId: note?.pdfAssetId,
+      });
+      if (!url) return;
+      staticThumbCache.set(page.id, url);
+      while (staticThumbCache.size > 24) {
+        const oldest = staticThumbCache.keys().next().value;
+        staticThumbCache.delete(oldest);
+      }
+      imgEl.src = url;
+    } catch {
+      // A missing preview does not block scrolling; the wrapper keeps its box.
+    }
+  });
 }
 
 /**
@@ -2675,7 +1424,15 @@ async function updateEngineWindow(note) {
     const engine = canvasEngines[i];
     if (!engine || liveIndexes.has(i)) continue;
     // Keep undo/redo history alive while the engine is off-screen.
-    if (engine.page) pageHistoryCache.set(engine.page.id, engine.getHistoryState());
+    if (engine.page) {
+      const historyId = engine.page.id;
+      pageHistoryCache.delete(historyId);
+      pageHistoryCache.set(historyId, engine.getHistoryState());
+      while (pageHistoryCache.size > PAGE_HISTORY_CACHE_LIMIT) {
+        const oldest = pageHistoryCache.keys().next().value;
+        pageHistoryCache.delete(oldest);
+      }
+    }
     saveEngineToPage(engine);
     engine.destroy();
     canvasEngines[i] = null;
@@ -2724,13 +1481,56 @@ async function updateEngineWindow(note) {
   if (needsSave) saveActiveCanvasPage();
 }
 
-function saveActiveCanvasPage() {
+let saveTimer = null;
+
+function setSaveStatus(text) {
+  const el = document.querySelector("#save-status");
+  if (el) el.textContent = text;
+}
+
+/** Coalesces rapid saves (e.g. while dragging) without losing the final state. */
+function scheduleSaveNotes() {
+  if (saveTimer) return;
+  setSaveStatus("Saving…");
+  saveTimer = setTimeout(() => {
+    saveTimer = null;
+    const ok = saveNotes();
+    setSaveStatus(ok === false ? "Save failed" : "Saved");
+  }, 400);
+}
+
+/** Forces any pending debounced save to land immediately. */
+function flushSaveNotes() {
+  if (saveTimer) {
+    clearTimeout(saveTimer);
+    saveTimer = null;
+  }
+  setSaveStatus("Saving…");
+  const ok = saveNotes();
+  setSaveStatus(ok === false ? "Save failed" : "Saved");
+}
+
+function saveActiveCanvasPage({ immediate = true } = {}) {
   const note = getActiveNote();
   if (!note) return;
 
-  for (const engine of canvasEngines) saveEngineToPage(engine);
+  const scrollContainer = document.querySelector("#canvas-scroll-container");
+  if (scrollContainer) note.scrollPosition = scrollContainer.scrollTop;
 
-  saveNotes();
+  const hadDirty = canvasEngines.some((engine) => engine && engine.dirty);
+  for (const engine of canvasEngines) {
+    if (engine && engine.dirty) saveEngineToPage(engine);
+  }
+
+  if (!hadDirty && !immediate) return;
+
+  if (immediate) {
+    setSaveStatus("Saving…");
+    const ok = saveNotes();
+    setSaveStatus(ok === false ? "Save failed" : "Saved");
+  } else {
+    scheduleSaveNotes();
+  }
   scheduleThumbnailRefresh(note.id);
 }
 
@@ -2771,6 +1571,33 @@ async function refreshNoteThumbnail(noteId) {
     // A missing thumbnail only costs a card preview, never the notebook itself.
   }
 }
+
+  // Surface unexpected errors instead of failing silently.
+  window.addEventListener("error", (e) => {
+    console.error("Unhandled error:", e.error || e.message);
+  });
+  window.addEventListener("unhandledrejection", (e) => {
+    console.error("Unhandled promise rejection:", e.reason);
+  });
+
+  // Last chance to land a payload write. `pagehide` covers close/navigate;
+  // `visibilitychange` covers mobile backgrounding, where `pagehide` may never
+  // arrive while the process is still alive to finish the transaction.
+  window.addEventListener("pagehide", () => {
+    flushSaveNotes();
+    snapshotNotes();
+    flushPayloads();
+  });
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "hidden") {
+      flushSaveNotes();
+      flushPayloads();
+    }
+  });
+
+
+  // Every page's object graph lives in IndexedDB, so the first render has to
+  // wait for it — rendering early would show blank imported pages.
 
 function bindEditorEvents(note) {
   document.querySelector("#back-btn")?.addEventListener("click", () => {
@@ -2902,7 +1729,16 @@ function bindEditorEvents(note) {
       thumbnail: null,
       canvasJson: null,
       pendingDecomposedData: null,
+      pendingImportData: null,
+      importSchemaVersion: 1,
+      fallbackVisible: true,
+      importReport: null,
+      editMode: "notes",
+      conversionState: "idle",
+      decomposedObjects: true,
+      tags: [],
     };
+    normalizedNotes.delete(note);
     note.pages.splice(note.currentPageIndex + 1, 0, newPage);
     note.currentPageIndex++;
     saveNotes();
@@ -2917,12 +1753,17 @@ function bindEditorEvents(note) {
         // Flush first: the page's asset ids are collected from its record right
         // after the splice, and unsaved edits would leave their assets behind.
         saveActiveCanvasPage();
+        normalizedNotes.delete(note);
         const [removed] = note.pages.splice(note.currentPageIndex, 1);
         forgetPageCaches(removed);
-        // Copied pages can share image assets with the page being deleted.
+        // Copied pages (and extracted notebooks) can share image assets with the
+        // page being deleted, so the "still used" set must cover every notebook.
         const stillUsed = new Set();
-        for (const p of note.pages) {
-          for (const id of await collectPageAssetIdsDeep(p)) stillUsed.add(id);
+        for (const otherNote of notes) {
+          for (const p of otherNote.pages || []) {
+            if (otherNote === note && p === removed) continue;
+            for (const id of await collectPageAssetIdsDeep(p)) stillUsed.add(id);
+          }
         }
         await deleteAssets(
           (await collectPageAssetIdsDeep(removed)).filter(
@@ -2989,6 +1830,7 @@ function bindEditorEvents(note) {
       if (page && sizeConfig && engine) {
         page.width = sizeConfig.width;
         page.height = sizeConfig.height;
+        page.pageSize = e.target.value;
         engine.setPageDimensions(sizeConfig.width, sizeConfig.height);
         saveActiveCanvasPage();
         const setupBtn = document.querySelector("#page-setup-toggle-btn span");
@@ -3088,7 +1930,8 @@ function bindEditorEvents(note) {
       renderLoading();
 
       try {
-        await exportNotebookToPdf(
+        await hydrateNote(note);
+        const pdfBytes = await exportNotebookToPdf(
           note,
           getActiveCanvasEngine(),
           (curr, total) => {
@@ -3096,6 +1939,10 @@ function bindEditorEvents(note) {
             renderLoading();
           },
         );
+        const cleanTitle = (note.title || "OmniNote_Document").replace(/[/\\?%*:|"<>]/g, "-");
+        await saveBytes(pdfBytes, `${cleanTitle}.pdf`, [
+          { name: "PDF", extensions: ["pdf"] },
+        ]);
       } catch (err) {
         showToast("Error exporting PDF", String(err?.message || err), "error");
         console.error(err);
@@ -3222,19 +2069,7 @@ function bindEditorEvents(note) {
   // Tool Selection
   document.querySelectorAll("[data-tool]").forEach((btn) => {
     btn.addEventListener("click", () => {
-      currentTool = btn.dataset.tool;
-      canvasEngines.forEach((e) => e?.setTool(currentTool));
-
-      document
-        .querySelectorAll("[data-tool]")
-        .forEach((b) => b.classList.remove("selected"));
-      btn.classList.add("selected");
-
-      // Update font toolbar visibility when switching to/from text tool
-      const engine = getActiveCanvasEngine();
-      if (engine) {
-        updateFontToolbarState(engine.canvas.getActiveObjects());
-      }
+      setActiveTool(btn.dataset.tool);
     });
   });
 
@@ -3456,116 +2291,11 @@ function bindEditorEvents(note) {
 
   // Page Manager (Noteful-style "Select" page grid)
   document.querySelector("#page-manager-btn")?.addEventListener("click", () => {
-    if (showPageManager) closePageManager();
+    if (isPageManagerOpen()) closePageManager();
     else openPageManager();
   });
   bindPageManagerControls();
   bindPageManagerGrid();
-
-  // Keyboard Shortcuts: Cmd+Z, Cmd+Shift+Z, Delete, Cmd+C, Cmd+V
-  let clipboard = null;
-
-  const onKeyDown = (e) => {
-    // While the Page Manager is open, swallow everything except Escape (which
-    // closes it) so shortcuts can't mutate the hidden editor behind the overlay.
-    if (showPageManager) {
-      if (e.key === "Escape") {
-        e.preventDefault();
-        closePageManager();
-      }
-      return;
-    }
-
-    // Never steal keys from a focused form field. On macOS the key labelled
-    // "Delete" reports `Backspace`, so correcting a digit in the zoom field
-    // would otherwise delete the selected object and swallow the keystroke.
-    if (isTypingTarget(e.target)) return;
-
-    const engine = getActiveCanvasEngine();
-    const isEditingText = engine?.canvas.getActiveObject()?.isEditing;
-
-    // Undo: Cmd+Z / Ctrl+Z
-    if (
-      (e.metaKey || e.ctrlKey) &&
-      e.key.toLowerCase() === "z" &&
-      !e.shiftKey
-    ) {
-      if (!isEditingText) {
-        e.preventDefault();
-        engine?.undo();
-      }
-    }
-    // Redo: Cmd+Shift+Z / Ctrl+Y
-    else if (
-      ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "z" && e.shiftKey) ||
-      ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "y")
-    ) {
-      if (!isEditingText) {
-        e.preventDefault();
-        engine?.redo();
-      }
-    }
-    // Copy: Cmd+C / Ctrl+C
-    else if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "c") {
-      if (!isEditingText && engine) {
-        const active = engine.canvas.getActiveObject();
-        if (active) {
-          active.clone().then((cloned) => {
-            clipboard = cloned;
-          });
-        }
-      }
-    }
-    // Paste: Cmd+V / Ctrl+V
-    else if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "v") {
-      if (!isEditingText && engine && clipboard) {
-        clipboard.clone().then((cloned) => {
-          cloned.set({
-            left: (cloned.left || 0) + 20,
-            top: (cloned.top || 0) + 20,
-            evented: true,
-          });
-          if (cloned.type === "activeselection") {
-            cloned.canvas = engine.canvas;
-            cloned.forEachObject((obj) => {
-              engine.canvas.add(obj);
-            });
-            cloned.setCoords();
-          } else {
-            engine.canvas.add(cloned);
-          }
-          engine.canvas.setActiveObject(cloned);
-          engine.canvas.requestRenderAll();
-          engine.recordHistory();
-        });
-      }
-    }
-    // Delete
-    else if (e.key === "Delete" || e.key === "Backspace") {
-      if (!isEditingText && engine?.canvas.getActiveObject()) {
-        e.preventDefault();
-        engine?.deleteSelected();
-      }
-    }
-    // Zoom shortcuts. Keep active even while editing text — typing into a
-    // textbox never needs +, -, or 0 from the host keyboard.
-    else if ((e.metaKey || e.ctrlKey) && (e.key === "=" || e.key === "+")) {
-      e.preventDefault();
-      zoomIn();
-    } else if ((e.metaKey || e.ctrlKey) && e.key === "-") {
-      e.preventDefault();
-      zoomOut();
-    } else if ((e.metaKey || e.ctrlKey) && e.key === "0") {
-      e.preventDefault();
-      zoomReset();
-    } else if ((e.metaKey || e.ctrlKey) && e.key === "9") {
-      e.preventDefault();
-      zoomFit("width");
-    } else if ((e.metaKey || e.ctrlKey) && e.key === "8") {
-      e.preventDefault();
-      zoomFit("page");
-    }
-  };
 
   // The previous render's handler must go before this one is added: without
   // this, every render stacks another window-level listener and one Cmd+Z
@@ -3573,545 +2303,9 @@ function bindEditorEvents(note) {
   if (editorKeyHandler) {
     window.removeEventListener("keydown", editorKeyHandler);
   }
-  editorKeyHandler = onKeyDown;
-  window.addEventListener("keydown", onKeyDown);
+  editorKeyHandler = editorShortcuts.onKeyDown;
+  window.addEventListener("keydown", editorKeyHandler);
 }
-
-/** Fills library card previews from IndexedDB once the grid is in the DOM. */
-async function hydrateThumbnails() {
-  const nodes = document.querySelectorAll("img[data-thumb]");
-  for (const node of nodes) {
-    const assetId = node.dataset.thumb;
-    if (!assetId) continue;
-    try {
-      const url = await getAssetUrl(assetId);
-      if (url) node.src = url;
-    } catch {
-      // Leave the placeholder in place if the asset is missing.
-    }
-  }
-}
-
-function bindLibraryEvents() {
-  hydrateThumbnails();
-
-  // Manual update check (sidebar footer). Silent no-op outside the Mac app.
-  document
-    .querySelector("#check-updates-btn")
-    ?.addEventListener("click", () => checkForUpdates());
-
-  // TEMP-DIAG: one-click diagnostics for the white-page investigation.
-  // Downloads per-page record flags + asset byte sizes (no pixels).
-  // Remove together with the #diag-btn in libraryView.js.
-  document.querySelector("#diag-btn")?.addEventListener("click", async () => {
-    const diag = { exportedAt: Date.now(), activeId, mountErrors, notes: [] };
-    for (const n of notes) {
-      const entry = {
-        id: n.id,
-        title: n.title,
-        pages: n.pages.length,
-        currentPageIndex: n.currentPageIndex,
-        pdfAssetBytes: await getAsset(n.pdfAssetId)
-          .then((b) => (b ? b.size : null))
-          .catch(() => null),
-        pagesDetail: [],
-      };
-      for (const p of n.pages || []) {
-        const graph = p.canvasJson?.canvasData || p.canvasJson;
-        const handoff = p.pendingImportData || p.pendingDecomposedData;
-        let canvasPayloadBytes = null;
-        try {
-          const raw = await getPagePayload(canvasKeyForPage(p));
-          canvasPayloadBytes = typeof raw === "string" ? raw.length : raw ? -1 : null;
-        } catch {
-          canvasPayloadBytes = null;
-        }
-        let pendingPayloadBytes = null;
-        try {
-          const raw = await getPagePayload(pendingKeyForPage(p));
-          pendingPayloadBytes = typeof raw === "string" ? raw.length : raw ? -1 : null;
-        } catch {
-          pendingPayloadBytes = null;
-        }
-        entry.pagesDetail.push({
-          pageId: p.id,
-          pageNumber: p.pageNumber,
-          pdfPageIndex: p.pdfPageIndex,
-          editMode: p.editMode,
-          conversionState: p.conversionState,
-          fallbackVisible: p.fallbackVisible,
-          bgBytes: await getAsset(p.backgroundAssetId)
-            .then((b) => (b ? b.size : null))
-            .catch(() => null),
-          thumbBytes: await getAsset(p.thumbnailAssetId)
-            .then((b) => (b ? b.size : null))
-            .catch(() => null),
-          graphObjects: Array.isArray(graph?.objects) ? graph.objects.length : null,
-          graphLocked: Array.isArray(graph?.objects)
-            ? graph.objects.filter((o) => o.omniLocked).length
-            : null,
-          canvasPayloadBytes,
-          handoffObjects: Array.isArray(handoff?.objects) ? handoff.objects.length : null,
-          pendingPayloadBytes,
-          reportStatus: p.importReport?.status ?? null,
-        });
-      }
-      diag.notes.push(entry);
-    }
-    const blob = new Blob([JSON.stringify(diag, null, 1)], { type: "application/json" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = `omninote-diag-${Date.now()}.json`;
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 4000);
-  });
-
-  document.querySelectorAll("[data-open]").forEach((card) => {
-    card.addEventListener("click", () => {
-      activeId = card.dataset.open;
-      render();
-    });
-  });
-
-  // Sidebar destinations: Unfiled / Pinned / Trash / individual folders.
-  document.querySelectorAll(".side[data-folder]").forEach((btn) => {
-    btn.addEventListener("click", (e) => {
-      // Folder rows have a small × button to delete the folder; ignore those.
-      if (e.target.closest("[data-remove-folder]")) return;
-      const target = btn.dataset.folder;
-      // If the folder it points to was deleted, fall back to Unfiled.
-      if (target && target.startsWith(FOLDER_PREFIX)) {
-        const id = target.slice(FOLDER_PREFIX.length);
-        if (!folderById(id)) {
-          activeFolder = "unfiled";
-          render();
-          return;
-        }
-      }
-      activeFolder = target;
-      render();
-    });
-  });
-
-  // "+ New folder" button — prompts for a name and creates the folder.
-  document.querySelector("#new-folder-btn")?.addEventListener("click", async () => {
-    const name = (await showPrompt("Folder name:", ""))?.trim();
-    if (!name) return;
-    const folder = { id: crypto.randomUUID(), name, createdAt: Date.now() };
-    folders = [...folders, folder];
-    saveFolders();
-    activeFolder = FOLDER_PREFIX + folder.id;
-    render();
-  });
-
-  // Per-folder × to remove (notes inside the folder become Unfiled).
-  document.querySelectorAll("[data-remove-folder]").forEach((btn) => {
-    btn.addEventListener("click", async (e) => {
-      e.stopPropagation();
-      const id = btn.dataset.removeFolder;
-      const folder = folderById(id);
-      if (!folder) return;
-      if (!(await showConfirm(`Delete folder "${folder.name}"? Notes inside will move to Unfiled.`, "Delete", "Cancel"))) return;
-      const moved = notes.filter((n) => n.folderId === id).length;
-      for (const n of notes) if (n.folderId === id) n.folderId = null;
-      folders = folders.filter((f) => f.id !== id);
-      saveFolders();
-      saveNotes();
-      if (activeFolder === FOLDER_PREFIX + id) activeFolder = "unfiled";
-      console.warn(`Removed folder "${folder.name}" (${moved} notes moved to Unfiled)`);
-      render();
-    });
-  });
-
-  // Pin toggle on a card.
-  document.querySelectorAll("[data-pin]").forEach((btn) => {
-    btn.addEventListener("click", (e) => {
-      e.stopPropagation();
-      const n = notes.find((x) => x.id === btn.dataset.pin);
-      if (!n) return;
-      n.pinned = !n.pinned;
-      saveNotes();
-      render();
-    });
-  });
-
-  // Restore from Trash.
-  document.querySelectorAll("[data-restore]").forEach((btn) => {
-    btn.addEventListener("click", (e) => {
-      e.stopPropagation();
-      const n = notes.find((x) => x.id === btn.dataset.restore);
-      if (!n) return;
-      n.trashed = false;
-      saveNotes();
-      render();
-    });
-  });
-
-  // Per-card folder select.
-  document.querySelectorAll("[data-folder-select]").forEach((sel) => {
-    sel.addEventListener("change", (e) => {
-      e.stopPropagation();
-      const n = notes.find((x) => x.id === sel.dataset.folderSelect);
-      if (!n) return;
-      const v = sel.value;
-      n.folderId = v === "__none__" ? null : v;
-      saveNotes();
-      // If the note just left the current view, re-render to hide it.
-      const stillVisible = notesInCurrentView().some((x) => x.id === n.id);
-      if (!stillVisible) render();
-    });
-    // The card's <button> would otherwise intercept the click; stop bubbling
-    // so a click on the select opens the dropdown instead of opening the card.
-    sel.addEventListener("click", (e) => e.stopPropagation());
-  });
-
-  // Card trash button — move to trash outside trash, delete forever inside.
-  document.querySelectorAll("[data-delete-note]").forEach((btn) => {
-    btn.addEventListener("click", async (e) => {
-      e.stopPropagation();
-      const noteId = btn.dataset.deleteNote;
-      const targetNote = notes.find((n) => n.id === noteId);
-      if (!targetNote) return;
-      if (activeFolder === "trashed") {
-        if (!(await showConfirm(`Delete "${targetNote.title}" forever? This cannot be undone.`, "Delete forever", "Cancel"))) return;
-        // A duplicated page or a shared source PDF can still be referenced by
-        // another notebook, so only the ids nothing else points at are removed.
-        const stillUsed = new Set();
-        for (const other of notes) {
-          if (other.id === noteId) continue;
-          for (const id of await collectNoteAssetIdsDeep(other)) stillUsed.add(id);
-        }
-        const orphaned = (await collectNoteAssetIdsDeep(targetNote)).filter(
-          (id) => id && !stillUsed.has(id),
-        );
-        await deleteAssets(orphaned);
-        invalidatePdfDoc(targetNote?.pdfAssetId);
-        notes = notes.filter((n) => n.id !== noteId);
-        if (activeId === noteId) activeId = notes[0]?.id || null;
-        saveNotes();
-        render();
-        return;
-      }
-      // Move to trash (no confirm — undoable via Restore).
-      targetNote.trashed = true;
-      // Leaving a folder for trash clears the folder pin.
-      saveNotes();
-      render();
-    });
-  });
-
-  // Search filter
-  document.querySelector("#search-input")?.addEventListener("input", (e) => {
-    const query = e.target.value.toLowerCase().trim();
-    document.querySelectorAll(".note-card-wrapper").forEach((cardWrapper) => {
-      const titleEl = cardWrapper.querySelector("strong");
-      const title = titleEl ? titleEl.textContent.toLowerCase() : "";
-      if (title.includes(query)) {
-        cardWrapper.style.display = "flex";
-      } else {
-        cardWrapper.style.display = "none";
-      }
-    });
-  });
-
-  const handleNewNote = () => {
-    const newNote = {
-      id: crypto.randomUUID(),
-      title: "Untitled Notebook",
-      createdAt: Date.now(),
-      isPdf: false,
-      currentPageIndex: 0,
-      pages: [
-        {
-          id: crypto.randomUUID(),
-          pageNumber: 1,
-          width: 800,
-          height: 1130,
-          paperStyle: "lined",
-          pageSize: "a4",
-          thumbnail: null,
-          canvasJson: null,
-          pendingDecomposedData: null,
-          tags: [],
-        },
-      ],
-    };
-    notes.unshift(newNote);
-    activeId = newNote.id;
-    saveNotes();
-    render();
-  };
-
-  document
-    .querySelector("#new-note-btn")
-    ?.addEventListener("click", handleNewNote);
-  document
-    .querySelector("#fab-new-note")
-    ?.addEventListener("click", handleNewNote);
-
-  // Import PDF into a single multi-page notebook
-  document
-    .querySelector("#pdf-input")
-    ?.addEventListener("change", async (e) => {
-      const file = e.target.files?.[0];
-      if (!file) return;
-
-      // Read the mode once, before any await, so a change mid-import cannot
-      // produce a notebook that is half one thing and half the other.
-      const modeValue = document.querySelector("#import-mode")?.value;
-      const importMode =
-        modeValue === "editable"
-          ? "editable"
-          : modeValue === "choose"
-            ? "choose"
-            : "annotations";
-
-      // "Choose pages…" first asks which pages to decompose, then imports as
-      // annotate-first and promotes only the chosen subset. Everything else
-      // imports straight away.
-      if (importMode === "choose") {
-        await importPdfChoosePages(file);
-        e.target.value = "";
-        return;
-      }
-
-      await importPdfFile(file, importMode);
-      e.target.value = "";
-    });
-}
-
-/**
- * Imports a PDF as a notebook. Shared by the annotate and editable paths; the
- * "choose pages" flow routes here with `promoteIndices` once the user has
- * picked a subset.
- *
- * @param {File} file
- * @param {"annotations"|"editable"} importMode
- * @param {number[]|null} [promoteIndices]  Zero-based pages to decompose on
- *   import; the rest stay annotate-mode and promote on demand.
- */
-async function importPdfFile(file, importMode, promoteIndices = null) {
-  isLoading = true;
-  loadingMessage = `Reading '${file.name}'...`;
-  renderLoading();
-
-  // Every asset this import creates, so a failure can clean up after itself
-  // without touching anything an existing notebook owns.
-  const createdAssetIds = [];
-
-  try {
-    const buffer = await file.arrayBuffer();
-
-    // Persist each page's binary assets as soon as it is decomposed instead of
-    // holding every page's background in memory until the document finishes.
-    const pages = await decomposePdf(
-      buffer,
-      PDF_IMPORT_SCALE,
-      async (page, index) => {
-        loadingMessage =
-          importMode === "annotations"
-            ? `Rendering page ${index + 1}...`
-            : `Recovering page ${index + 1}...`;
-        renderLoading();
-
-        return persistPageAssets(page, createdAssetIds);
-      },
-      {
-        mode: importMode,
-        // Annotate-first import is the default, and the per-page snapshot is
-        // the expensive half of it. Page 1 keeps its snapshot so the notebook
-        // opens instantly; the rest are rendered from the source PDF by the
-        // canvas engine the first time each page is opened.
-        lazyBackgrounds: importMode === "annotations",
-      },
-    );
-
-    if (pages.length === 0) {
-      throw new Error("No pages found in this PDF.");
-    }
-
-    const baseName = file.name.replace(/\.pdf$/i, "");
-
-    // Keep the original file. The per-page snapshot taken at import is only
-    // ~1600px, which turns to mush once you zoom in; holding on to the source
-    // lets the visible page be re-rendered at the current zoom.
-    const pdfAssetId = `pdf-${crypto.randomUUID()}`;
-    await putAsset(pdfAssetId, file);
-    createdAssetIds.push(pdfAssetId);
-
-    const report = summarizeImport(pages);
-
-    // Built in memory first and committed only once every page succeeded.
-    const newNotebook = {
-      id: crypto.randomUUID(),
-      title: baseName,
-      createdAt: Date.now(),
-      isPdf: true,
-      pdfAssetId,
-      importSchemaVersion: IMPORT_SCHEMA_VERSION,
-      importReport: report,
-      defaultFont: pages.mostUsedFont || "DM Sans",
-      detectedFonts: pages.detectedFonts || [],
-      currentPageIndex: 0,
-      pages: pages.map((page, idx) => ({
-        id: crypto.randomUUID(),
-        pageNumber: idx + 1,
-        pdfPageIndex: idx,
-        width: page.width, // Exact native PDF page dimensions
-        height: page.height,
-        paperStyle: "plain",
-        pageSize: "custom",
-        thumbnail: null,
-        backgroundAssetId: page.backgroundAssetId || null,
-        thumbnailAssetId: page.thumbnailAssetId || null,
-        canvasJson: null,
-        importSchemaVersion: IMPORT_SCHEMA_VERSION,
-        importedObjectVersion: page.importedObjectVersion ?? IMPORTED_OBJECT_VERSION,
-        importReport: page.report || null,
-        fallbackVisible: page.fallbackVisible !== false,
-        // The fallback is the extracted backdrop, not a page render, so it must
-        // not be replaced by a full-page re-rasterization on zoom — that would
-        // reintroduce the very doubling it exists to avoid.
-        fallbackFromImage: page.fallbackFromImage === true,
-        // "Make editable" has already run for every page, so the notebook opens
-        // with native objects. The annotate path leaves each page as a locked
-        // raster the user promotes one at a time.
-        editMode: importMode === "annotations" ? "annotate" : "notes",
-        decomposedObjects: importMode !== "annotations",
-        conversionState: "idle",
-        // An annotate page carries no native objects, so there is nothing to
-        // hand off — the locked raster loads straight from its asset id.
-        pendingImportData:
-          importMode === "annotations"
-            ? null
-            : {
-                objects: page.objects || [],
-                report: page.report || null,
-              },
-        tags: [],
-      })),
-    };
-
-    notes.unshift(newNotebook);
-    activeId = newNotebook.id;
-    saveNotes();
-
-    // A subset import promotes only the pages the user chose; the rest stay
-    // annotate-mode and are rebuilt on demand.
-    if (Array.isArray(promoteIndices) && promoteIndices.length > 0) {
-      await promotePagesByIndex(newNotebook, promoteIndices);
-    }
-
-    showImportReport(report);
-  } catch (err) {
-    // Nothing was committed, so delete only what this attempt created and leave
-    // every existing notebook exactly as it was.
-    await deleteAssets(createdAssetIds).catch(() => {});
-    showToast("Could not import this PDF", String(err?.message || err), "error");
-    console.error(err);
-  } finally {
-    isLoading = false;
-    render();
-  }
-}
-
-/**
- * The "Choose pages…" flow: render thumbnails, ask which pages to decompose,
- * then import annotate-first and promote only that subset.
- */
-async function importPdfChoosePages(file) {
-  isLoading = true;
-  loadingMessage = `Preparing pages from '${file.name}'...`;
-  renderLoading();
-
-  let thumbnails = [];
-  try {
-    const buffer = await file.arrayBuffer();
-    thumbnails = await renderPdfPageThumbnails(buffer);
-  } catch (err) {
-    isLoading = false;
-    render();
-    showToast("Could not read this PDF", String(err?.message || err), "error");
-    console.error(err);
-    return;
-  } finally {
-    isLoading = false;
-    render();
-  }
-
-  showImportPagePicker({
-    fileName: file.name,
-    thumbnails,
-    onDone: (indices) => {
-      for (const url of thumbnails) {
-        if (url) URL.revokeObjectURL(url);
-      }
-      // null = the user chose "Annotate only" (or closed the picker): import
-      // without promoting anything. An array promotes exactly those pages.
-      importPdfFile(file, "annotations", indices);
-    },
-  });
-}
-
-/**
- * Decomposes a chosen subset of pages right after an annotate-first import.
- * Reuses the same single-page extraction as "Make editable", but runs while the
- * notebook is still closed, so the recovered objects are stored as a handoff
- * and materialise when each page is first opened.
- */
-async function promotePagesByIndex(note, indices) {
-  const targets = (note.pages || [])
-    .map((page, index) => ({ page, index }))
-    .filter(({ index }) => indices.includes(index))
-    .filter(({ page }) => isPromotablePage(page, note));
-
-  if (targets.length === 0) return;
-
-  let rebuilt = 0;
-  let failed = 0;
-
-  for (const { page } of targets) {
-    page.conversionState = "converting";
-    try {
-      const { status } = await rebuildPageAsEditable(note, page, {
-        instantiate: false,
-      });
-      if (status === "rebuilt") rebuilt++;
-      else failed++;
-    } catch (err) {
-      page.conversionState = "failed";
-      failed++;
-      console.error("Could not make a page editable:", err);
-    }
-  }
-
-  saveNotes();
-  if (failed > 0) {
-    showToast(
-      "Some pages could not be rebuilt",
-      `${rebuilt} rebuilt, ${failed} left as annotated PDF${failed === 1 ? "" : "s"}.`,
-      "warn",
-    );
-  }
-}
-
-/**
- * True when a keystroke belongs to a field the user is typing into.
- *
- * Global shortcuts must not fire for these: on macOS the key labelled "Delete"
- * reports `Backspace`, so without this guard correcting a digit in the zoom
- * percentage field would also delete the selected object on the canvas.
- */
-function isTypingTarget(el) {
-  if (!el || typeof el !== "object") return false;
-  if (el.isContentEditable) return true;
-  const tag = el.tagName;
-  return tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT";
-}
-
 
 // Dev-only inspection hook for the browser regression harness. Vite replaces
 // `import.meta.env.DEV` with `false` in a production build, so this whole
@@ -4122,7 +2316,7 @@ if (import.meta.env.DEV) {
     getActiveId: () => activeId,
     getEngines: () => canvasEngines,
     /** IndexedDB payload writes still in flight; tests drain these before a reload. */
-    pendingWrites: () => inFlightPayloads.size,
+    pendingWrites,
     /** Snapshot of every object on a page, for assertions. */
     inspectPage: (index) => {
       const engine = canvasEngines[index];
@@ -4154,20 +2348,26 @@ if (import.meta.env.DEV) {
 
 disableBrowserZoom();
 
-// Last chance to land a payload write. `pagehide` covers close/navigate;
-// `visibilitychange` covers mobile backgrounding, where `pagehide` may never
-// arrive while the process is still alive to finish the transaction.
-window.addEventListener("pagehide", flushPayloads);
-document.addEventListener("visibilitychange", () => {
-  if (document.visibilityState === "hidden") flushPayloads();
-});
+async function initApp() {
+  let loaded = loadNotes();
+  if (!loaded || !loaded.length) {
+    const restored = await restoreFromSnapshot();
+    loaded = restored && restored.length ? restored : [normalizeNote(sampleNote)];
+  }
+  notes = loaded;
+  activeId = notes[0]?.id || null;
+  lastRenderedNoteId = null;
 
-// Every page's object graph lives in IndexedDB, so the first render has to
-// wait for it — rendering early would show blank imported pages.
-hydrateNotes()
-  .catch((err) => console.warn("Could not restore page data:", err))
-  .finally(() => {
-    render();
-    // Silent daily update check (Mac app only; no-op in a browser).
-    autoCheckForUpdates();
-  });
+  try {
+    await hydrateNotes();
+  } catch (err) {
+    console.warn("Could not restore page data:", err);
+  }
+
+  render();
+  // Silent daily update check (Mac app only; no-op in a browser).
+  autoCheckForUpdates();
+  scheduleSnapshot();
+}
+
+initApp();

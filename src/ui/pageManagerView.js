@@ -10,7 +10,7 @@ export function pageManagerTilesHtml(note, selection, thumbs) {
       const selected = selection.has(i);
       const thumb = thumbs[i] || "";
       const thumbEl = thumb
-        ? `<img class="pm-thumb" src="${thumb}" alt="Page ${i + 1}" draggable="false" />`
+        ? `<img class="pm-thumb" src="${escapeHtml(thumb)}" alt="Page ${i + 1}" draggable="false" />`
         : `<div class="pm-thumb pm-thumb-empty"></div>`;
       const tags =
         Array.isArray(p.tags) && p.tags.length
