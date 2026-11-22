@@ -144,10 +144,19 @@ export class OmniCanvas {
     // another.
     this.page = null;
 
+    // Tracks whether this engine has unsaved changes since the last save.
+    this.dirty = false;
+
     // Undo / Redo history tracking
     this.history = [];
     this.historyIndex = -1;
     this.isHistoryProcessing = false;
+
+    // An erase drag fires pointermove many times, and each tick adds and
+    // removes objects. Recording per tick would burn through the capped undo
+    // stack in a single stroke, so history is deferred until the gesture ends.
+    this.isErasing = false;
+    this.eraseHistoryPending = false;
 
     this.initCanvas();
     this.setupEvents();
@@ -175,12 +184,12 @@ export class OmniCanvas {
   setupEvents() {
     this.canvas.on("object:modified", () => this.recordHistory());
     this.canvas.on("object:added", (e) => {
-      if (!this.isHistoryProcessing && !e.target?.__skipHistory) {
+      if (!this.isHistoryProcessing && !this.isErasing && !e.target?.__skipHistory) {
         this.recordHistory();
       }
     });
     this.canvas.on("object:removed", () => {
-      if (!this.isHistoryProcessing) {
+      if (!this.isHistoryProcessing && !this.isErasing) {
         this.recordHistory();
       }
     });
@@ -223,25 +232,296 @@ export class OmniCanvas {
   }
 
   performErase(e) {
+    if (this._previewActive) return;
+    this.canvas.discardActiveObject();
+    const active = this.canvas.getActiveObject();
+    if (active && typeof active.exitEditing === "function" && active.isEditing) {
+      active.exitEditing();
+    }
     const pointer = this.canvas.getScenePoint(e);
     const objects = this.canvas.getObjects();
+    const radius = 12 / Math.max(0.01, this.currentZoom || 1);
+
     for (let i = objects.length - 1; i >= 0; i--) {
       const obj = objects[i];
       if (obj === this.canvas.backgroundImage) continue;
       // Locked page furniture is not erasable either.
       if (obj.omniLocked) continue;
-      const bound = obj.getBoundingRect();
+
+      // Partial erase for freehand strokes: split the stroke into the runs that
+      // fall outside the eraser and rebuild them as separate paths, instead of
+      // deleting the whole stroke.
+      // Transforms (rotation/scale/skew/translation) are handled through
+      // toScene()/localPointer(), so rotated or scaled strokes are still
+      // partially erasable. Filled/closed shapes fall through to the
+      // whole-object delete so we never turn a solid shape into an open polyline.
       if (
-        pointer.x >= bound.left &&
-        pointer.x <= bound.left + bound.width &&
-        pointer.y >= bound.top &&
-        pointer.y <= bound.top + bound.height
+        obj.type === "path" &&
+        Array.isArray(obj.path) &&
+        !obj.path.some((c) => Array.isArray(c) && (c[0] === "Z" || c[0] === "z")) &&
+        !(obj.fill && obj.fill !== "transparent" && obj.fill !== "none")
       ) {
+        // `obj.path` is stored in the path's own coordinate space, offset from
+        // scene space by `pathOffset` and the object's placement (left/top).
+        // Brush strokes start out in scene coordinates, but every path this
+        // method rebuilds — and any path the user has since dragged — no longer
+        // is. So both directions are derived from the transform instead of
+        // assuming the raw commands are scene coordinates.
+        const m = obj.calcTransformMatrix();
+        const off = obj.pathOffset;
+        const toScene = (p) => ({
+          x: m[0] * (p.x - off.x) + m[2] * (p.y - off.y) + m[4],
+          y: m[1] * (p.x - off.x) + m[3] * (p.y - off.y) + m[5],
+        });
+        // Pointer expressed in the same space as the path commands, so the hit
+        // test below compares like with like.
+        const det = m[0] * m[3] - m[1] * m[2];
+        const localPointer = det
+          ? {
+              x: ((pointer.x - m[4]) * m[3] - (pointer.y - m[5]) * m[2]) / det + off.x,
+              y: ((pointer.y - m[5]) * m[0] - (pointer.x - m[4]) * m[1]) / det + off.y,
+            }
+          : pointer;
+
+        const samples = [];
+        let current = { x: 0, y: 0 };
+        for (const cmd of obj.path) {
+          if (!Array.isArray(cmd) || cmd.length < 3) {
+            samples.push(null);
+            continue;
+          }
+          const type = cmd[0];
+          if (type === "M") {
+            const x = Number(cmd[1]);
+            const y = Number(cmd[2]);
+            if (!Number.isFinite(x) || !Number.isFinite(y)) {
+              samples.push(null);
+              continue;
+            }
+            current = { x, y };
+            samples.push([{ x, y }]);
+          } else if (type === "L") {
+            const x = Number(cmd[1]);
+            const y = Number(cmd[2]);
+            if (!Number.isFinite(x) || !Number.isFinite(y)) {
+              samples.push(null);
+              continue;
+            }
+            const pts = [];
+            const steps = 8;
+            for (let t = 1; t <= steps; t++) {
+              const k = t / steps;
+              const ix = current.x + (x - current.x) * k;
+              const iy = current.y + (y - current.y) * k;
+              pts.push({ x: ix, y: iy });
+            }
+            current = { x, y };
+            samples.push(pts);
+          } else if (type === "Q") {
+            const cx = Number(cmd[1]);
+            const cy = Number(cmd[2]);
+            const x = Number(cmd[3]);
+            const y = Number(cmd[4]);
+            if (![cx, cy, x, y].every(Number.isFinite)) {
+              samples.push(null);
+              continue;
+            }
+            const start = current;
+            const pts = [];
+            const steps = 8;
+            for (let t = 1; t <= steps; t++) {
+              const k = t / steps;
+              const ix = (1 - k) * (1 - k) * start.x + 2 * (1 - k) * k * cx + k * k * x;
+              const iy = (1 - k) * (1 - k) * start.y + 2 * (1 - k) * k * cy + k * k * y;
+              pts.push({ x: ix, y: iy });
+            }
+            current = { x, y };
+            samples.push(pts);
+          } else if (type === "C") {
+            const cx1 = Number(cmd[1]);
+            const cy1 = Number(cmd[2]);
+            const cx2 = Number(cmd[3]);
+            const cy2 = Number(cmd[4]);
+            const x = Number(cmd[5]);
+            const y = Number(cmd[6]);
+            if (![cx1, cy1, cx2, cy2, x, y].every(Number.isFinite)) {
+              samples.push(null);
+              continue;
+            }
+            const start = current;
+            const pts = [];
+            const steps = 8;
+            for (let t = 1; t <= steps; t++) {
+              const k = t / steps;
+              const ix =
+                (1 - k) ** 3 * start.x +
+                3 * (1 - k) ** 2 * k * cx1 +
+                3 * (1 - k) * k ** 2 * cx2 +
+                k ** 3 * x;
+              const iy =
+                (1 - k) ** 3 * start.y +
+                3 * (1 - k) ** 2 * k * cy1 +
+                3 * (1 - k) * k ** 2 * cy2 +
+                k ** 3 * y;
+              pts.push({ x: ix, y: iy });
+            }
+            current = { x, y };
+            samples.push(pts);
+          } else {
+            samples.push(null);
+          }
+        }
+
+        const hitRadius = radius + (obj.strokeWidth || 0) / 2;
+
+        const hit = samples.map((pts) =>
+          Array.isArray(pts)
+            ? pts.some((p) => Math.hypot(p.x - localPointer.x, p.y - localPointer.y) <= hitRadius)
+            : false,
+        );
+        if (!hit.some(Boolean)) continue;
+
+        // Surviving runs, tracked as command indices so the rebuild can replay
+        // the original command types (L/Q/C) and keep curves, instead of
+        // flattening every run to a straight polyline.
+        const runs = [];
+        let runIdx = [];
+        for (let j = 0; j < obj.path.length; j++) {
+          const cmd = obj.path[j];
+          if (!Array.isArray(cmd) || cmd.length < 3) {
+            if (runIdx.length) {
+              runs.push(runIdx);
+              runIdx = [];
+            }
+            continue;
+          }
+          if (hit[j]) {
+            if (runIdx.length) {
+              runs.push(runIdx);
+              runIdx = [];
+            }
+          } else {
+            runIdx.push(j);
+          }
+        }
+        if (runIdx.length) runs.push(runIdx);
+
         this.canvas.remove(obj);
+        for (const run of runs) {
+          if (run.length < 2) continue;
+          const cmds = run.map((j) => obj.path[j]);
+
+          // Replay the surviving commands, converting each coordinate through
+          // toScene so curves (Q/C) keep their control points. The first
+          // command of a run crosses the erased boundary, so it is dropped and
+          // the run starts at its endpoint (matching the prior polyline behaviour).
+          const first = cmds[0];
+          const firstEndX = Number(first[first.length - 2]);
+          const firstEndY = Number(first[first.length - 1]);
+          if (!Number.isFinite(firstEndX) || !Number.isFinite(firstEndY)) continue;
+          const start = toScene({ x: firstEndX, y: firstEndY });
+          let d = `M ${start.x} ${start.y}`;
+
+          for (let k = 1; k < cmds.length; k++) {
+            const cmd = cmds[k];
+            const type = cmd[0];
+            if (type === "M" || type === "m") {
+              const x = Number(cmd[1]);
+              const y = Number(cmd[2]);
+              if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
+              const s = toScene({ x, y });
+              d += ` M ${s.x} ${s.y}`;
+            } else if (type === "L" || type === "l") {
+              const x = Number(cmd[1]);
+              const y = Number(cmd[2]);
+              if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
+              const s = toScene({ x, y });
+              d += ` L ${s.x} ${s.y}`;
+            } else if (type === "Q" || type === "q") {
+              const cx = Number(cmd[1]);
+              const cy = Number(cmd[2]);
+              const x = Number(cmd[3]);
+              const y = Number(cmd[4]);
+              if (![cx, cy, x, y].every(Number.isFinite)) continue;
+              const c = toScene({ x: cx, y: cy });
+              const e = toScene({ x, y });
+              d += ` Q ${c.x} ${c.y} ${e.x} ${e.y}`;
+            } else if (type === "C" || type === "c") {
+              const cx1 = Number(cmd[1]);
+              const cy1 = Number(cmd[2]);
+              const cx2 = Number(cmd[3]);
+              const cy2 = Number(cmd[4]);
+              const x = Number(cmd[5]);
+              const y = Number(cmd[6]);
+              if (![cx1, cy1, cx2, cy2, x, y].every(Number.isFinite)) continue;
+              const c1 = toScene({ x: cx1, y: cy1 });
+              const c2 = toScene({ x: cx2, y: cy2 });
+              const e = toScene({ x, y });
+              d += ` C ${c1.x} ${c1.y} ${c2.x} ${c2.y} ${e.x} ${e.y}`;
+            }
+          }
+
+          if (!/[LQC]/.test(d)) continue;
+
+          const newPath = new Path(d, {
+            stroke: obj.stroke,
+            strokeWidth: obj.strokeWidth,
+            fill: obj.fill,
+            strokeLineCap: obj.strokeLineCap,
+            strokeLineJoin: obj.strokeLineJoin,
+            strokeDashArray: obj.strokeDashArray,
+            strokeDashOffset: obj.strokeDashOffset,
+            opacity: obj.opacity,
+            selectable: obj.selectable,
+            evented: obj.evented,
+            omniId: obj.omniId,
+            omniType: obj.omniType,
+            omniLocked: obj.omniLocked,
+            sourceType: obj.sourceType,
+            importConfidence: obj.importConfidence,
+          });
+          this.canvas.add(newPath);
+        }
+
         this.canvas.requestRenderAll();
-        this.recordHistory();
+        this.markErased();
         return;
       }
+
+      // Fallback: delete the whole object when the pointer lands on it.
+      const bound = obj.getBoundingRect();
+      const nearestX = Math.max(bound.left, Math.min(pointer.x, bound.left + bound.width));
+      const nearestY = Math.max(bound.top, Math.min(pointer.y, bound.top + bound.height));
+      const fallbackRadius = 10 / Math.max(0.01, this.currentZoom || 1);
+      if (Math.hypot(pointer.x - nearestX, pointer.y - nearestY) <= fallbackRadius) {
+        this.canvas.remove(obj);
+        this.canvas.requestRenderAll();
+        this.markErased();
+        return;
+      }
+    }
+  }
+
+  /**
+   * Note that the erase gesture changed the page. While the gesture is running
+   * this only sets a flag — one history entry is written when it ends, instead
+   * of one per pointermove tick. Called outside a gesture (programmatic erase),
+   * it records immediately.
+   */
+  markErased() {
+    if (this.isErasing) {
+      this.eraseHistoryPending = true;
+    } else {
+      this.recordHistory();
+    }
+  }
+
+  /** End the erase gesture and flush its single history entry. */
+  endEraseGesture() {
+    this.isErasing = false;
+    if (this.eraseHistoryPending) {
+      this.eraseHistoryPending = false;
+      this.recordHistory();
     }
   }
 
@@ -328,7 +608,20 @@ export class OmniCanvas {
 
     el.addEventListener("pointerdown", (e) => {
       if (this.currentTool === "eraser") {
+        if (this.isEraserDown) return; // ignore secondary pointers
+        if (this._previewActive) return;
         this.isEraserDown = true;
+        this.isErasing = true;
+        this.eraseHistoryPending = false;
+        // Capture so pointerup is still delivered if the drag leaves the
+        // canvas — otherwise isEraserDown can stay true and ghost-erase later.
+        try {
+          el.setPointerCapture(e.pointerId);
+        } catch {
+          // Some browsers reject capture on this element; fall back to
+          // element-bound events (pre-existing behaviour).
+        }
+        this._erasePointerId = e.pointerId;
         this.performErase(e);
       } else if (e.button === 1 || (e.button === 0 && this.isSpaceDown)) {
         // Middle mouse OR space+drag to pan.
@@ -351,13 +644,28 @@ export class OmniCanvas {
     });
 
     const finishStroke = () => {
+      if (this._erasePointerId != null) {
+        try {
+          el.releasePointerCapture(this._erasePointerId);
+        } catch {
+          /* ignore */
+        }
+        this._erasePointerId = null;
+      }
       this.isEraserDown = false;
       this.isPanning = false;
+      // Writes the single history entry for the erase gesture, if any.
+      this.endEraseGesture();
     };
 
     el.addEventListener("pointerup", finishStroke);
     el.addEventListener("pointercancel", finishStroke);
-    el.addEventListener("pointerleave", finishStroke);
+    // While an erase drag is in flight, keep it alive even if the cursor
+    // leaves the canvas — the captured pointerup will end it.
+    el.addEventListener("pointerleave", () => {
+      if (this.isErasing) return;
+      finishStroke();
+    });
   }
 
   /**
@@ -371,10 +679,11 @@ export class OmniCanvas {
     // scrub both have to happen here.
     const json = this.canvas.toObject(IMPORT_OBJECT_PROPS);
     delete json.backgroundImage;
-    // Fabric may record the canvas dimensions; they are render state, not
-    // document state, so they are pinned back to the page size.
-    if ("width" in json) json.width = this.width;
-    if ("height" in json) json.height = this.height;
+    // Persist the page size and paper style alongside the object graph so that
+    // undo/redo can restore them — Fabric does not carry these on `this`.
+    json.width = this.width;
+    json.height = this.height;
+    json.paperStyle = this.paperStyle;
     // Order matters: scrub the dead object URLs first, then drop the default
     // property boilerplate that otherwise blows the localStorage quota.
     return compactCanvasJson(stripVolatileSources(json));
@@ -385,6 +694,8 @@ export class OmniCanvas {
 
     const state = JSON.stringify(this.serialize());
     if (this.history[this.historyIndex] === state) return;
+
+    this.dirty = true;
 
     this.historyIndex++;
     this.history = this.history.slice(0, this.historyIndex);
@@ -444,8 +755,16 @@ export class OmniCanvas {
     this.historyIndex--;
     const state = JSON.parse(this.history[this.historyIndex]);
     await this.canvas.loadFromJSON(state);
+    // Restore page geometry and paper style, which Fabric does not carry on
+    // `this` even though they are part of the serialized state.
+    if (Number.isFinite(state?.width)) this.width = Math.round(state.width);
+    if (Number.isFinite(state?.height)) this.height = Math.round(state.height);
+    if (typeof state?.paperStyle === "string") this.paperStyle = state.paperStyle;
+    this.canvas.setDimensions({ width: this.width, height: this.height });
+    this.setPaperStyle(this.paperStyle);
     this.reapplyFurnitureLocks();
     this.applyBackground();
+    this.applyTransform();
     this.canvas.requestRenderAll();
     this.isHistoryProcessing = false;
     this.notifyHistory();
@@ -458,8 +777,14 @@ export class OmniCanvas {
     this.historyIndex++;
     const state = JSON.parse(this.history[this.historyIndex]);
     await this.canvas.loadFromJSON(state);
+    if (Number.isFinite(state?.width)) this.width = Math.round(state.width);
+    if (Number.isFinite(state?.height)) this.height = Math.round(state.height);
+    if (typeof state?.paperStyle === "string") this.paperStyle = state.paperStyle;
+    this.canvas.setDimensions({ width: this.width, height: this.height });
+    this.setPaperStyle(this.paperStyle);
     this.reapplyFurnitureLocks();
     this.applyBackground();
+    this.applyTransform();
     this.canvas.requestRenderAll();
     this.isHistoryProcessing = false;
     this.notifyHistory();
@@ -467,8 +792,19 @@ export class OmniCanvas {
   }
 
   setTool(tool) {
+    // Flush any pending erase history before switching away from the eraser.
+    if (this.eraseHistoryPending) {
+      this.eraseHistoryPending = false;
+      this.recordHistory();
+    }
+
     this.currentTool = tool;
     this.canvas.isDrawingMode = false;
+
+    // An interrupted erase gesture must not leak state across tool switches.
+    this.isEraserDown = false;
+    this.isErasing = false;
+    this._erasePointerId = null;
 
     if (tool === "select") {
       this.canvas.selection = true;
@@ -511,6 +847,11 @@ export class OmniCanvas {
       this.canvas.defaultCursor = "crosshair";
       this.setObjectsSelectable(false);
     } else if (tool === "eraser") {
+      this.canvas.discardActiveObject();
+      const active = this.canvas.getActiveObject();
+      if (active && typeof active.exitEditing === "function" && active.isEditing) {
+        active.exitEditing();
+      }
       this.canvas.selection = false;
       this.canvas.defaultCursor = "crosshair";
       this.setObjectsSelectable(false);
@@ -664,6 +1005,7 @@ export class OmniCanvas {
       if (obj.omniLocked) {
         obj.selectable = false;
         obj.evented = false;
+        obj.hoverCursor = "default";
         return;
       }
       obj.selectable = selectable;
@@ -687,7 +1029,14 @@ export class OmniCanvas {
         obj.selectable = false;
         obj.evented = false;
         obj.hoverCursor = "default";
+        return;
       }
+      // Fabric revives every object as selectable=true after loadFromJSON.
+      // Re-apply the current tool's selectability rule so strokes stay
+      // unselectable (and eraser-hittable) across undo/redo/page load.
+      const selectable = this.currentTool === "select";
+      obj.selectable = selectable;
+      obj.evented = selectable || this.currentTool === "eraser";
     });
   }
 
@@ -779,15 +1128,24 @@ export class OmniCanvas {
     this.paperStyle = style;
     const container = this.canvasEl.closest(".canvas-container") || this.canvasEl.parentElement;
     if (container) {
-      container.classList.remove("paper-plain", "paper-lined", "paper-grid", "paper-dotted");
+      container.classList.remove(
+        "paper-plain",
+        "paper-lined",
+        "paper-grid",
+        "paper-dotted",
+        "paper-cornell",
+        "paper-music",
+      );
       container.classList.add(`paper-${style}`);
     }
-    this.onModified();
+    // Record a history entry (which also saves) so paper-style changes are
+    // undoable. Skipped during construction and page load.
+    if (this.page && !this.isHistoryProcessing) this.recordHistory();
   }
 
   setPageDimensions(width, height) {
-    this.width = Math.round(width);
-    this.height = Math.round(height);
+    this.width = Math.max(1, Math.min(10000, Math.round(width)));
+    this.height = Math.max(1, Math.min(10000, Math.round(height)));
     this.canvas.setDimensions({ width: this.width, height: this.height });
     this.applyTransform();
     this.recordHistory();
@@ -830,9 +1188,12 @@ export class OmniCanvas {
   deleteSelected() {
     const activeObjects = this.canvas.getActiveObjects();
     if (activeObjects.length > 0) {
+      this.isHistoryProcessing = true;
       activeObjects.forEach((obj) => this.canvas.remove(obj));
       this.canvas.discardActiveObject();
       this.canvas.requestRenderAll();
+      this.isHistoryProcessing = false;
+      this.recordHistory();
     }
   }
 
@@ -845,8 +1206,8 @@ export class OmniCanvas {
     this.isHistoryProcessing = true;
     this.canvas.clear();
 
-    this.width = Math.round(page.width || 800);
-    this.height = Math.round(page.height || 1130);
+    this.width = Math.max(1, Math.min(10000, Math.round(page.width || 800)));
+    this.height = Math.max(1, Math.min(10000, Math.round(page.height || 1130)));
     this.canvas.setDimensions({ width: this.width, height: this.height });
     this.setPaperStyle(page.paperStyle || "plain");
 
@@ -1019,6 +1380,7 @@ export class OmniCanvas {
       angle: candidate.angle || 0,
       originX: "left",
       originY: "top",
+      objectCaching: false,
       cornerColor: "#6366f1",
       cornerStyle: "circle",
       cornerSize: 8,
